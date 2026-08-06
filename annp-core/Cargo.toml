@@ -1,0 +1,6 @@
+[package]
+name = "annp-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

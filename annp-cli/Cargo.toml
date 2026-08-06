@@ -1,0 +1,13 @@
+[package]
+name = "annp-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "annp"
+path = "src/main.rs"
+
+[dependencies]
+annp-core.workspace = true
+clap.workspace = true
+rayon.workspace = true

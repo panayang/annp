@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["annp-core", "annp-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+annp-core = { path = "annp-core" }
+clap = { version = "4", features = ["derive"] }
+rayon = "1.10"
+
+# Experiments are measurements. Debug builds are not a supported configuration.
+[profile.release]
+debug = true
