@@ -156,6 +156,54 @@ pub fn linear_fit(x: &[f64], y: &[f64]) -> (f64, f64) {
     (slope, my - slope * mx)
 }
 
+/// Solves `min_c ||A c - y||^2` via the normal equations with partial pivoting.
+///
+/// Sized for the diagnostics in this crate: a handful of basis columns over a
+/// few dozen observations, where conditioning is not a concern. Returns `None`
+/// if the design is rank deficient rather than emitting a garbage fit.
+pub fn least_squares(design: &[Vec<f64>], y: &[f64]) -> Option<Vec<f64>> {
+    assert_eq!(design.len(), y.len(), "least_squares: row count mismatch");
+    let k = design.first()?.len();
+    assert!(design.iter().all(|r| r.len() == k), "least_squares: ragged design");
+    if design.len() < k {
+        return None;
+    }
+
+    // Augmented normal equations: [A^T A | A^T y].
+    let mut m = vec![vec![0.0; k + 1]; k];
+    for (row, &yi) in design.iter().zip(y) {
+        for i in 0..k {
+            for j in 0..k {
+                m[i][j] += row[i] * row[j];
+            }
+            m[i][k] += row[i] * yi;
+        }
+    }
+
+    for col in 0..k {
+        let pivot = (col..k).max_by(|&a, &b| m[a][col].abs().total_cmp(&m[b][col].abs()))?;
+        if m[pivot][col].abs() < 1e-12 {
+            return None;
+        }
+        m.swap(col, pivot);
+        let d = m[col][col];
+        for v in m[col].iter_mut() {
+            *v /= d;
+        }
+        for row in 0..k {
+            if row != col {
+                let f = m[row][col];
+                if f != 0.0 {
+                    for j in col..=k {
+                        m[row][j] -= f * m[col][j];
+                    }
+                }
+            }
+        }
+    }
+    Some((0..k).map(|i| m[i][k]).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +297,31 @@ mod tests {
         let (slope, intercept) = linear_fit(&x, &y);
         assert!((slope + 1.5).abs() < 1e-12);
         assert!((intercept - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn least_squares_recovers_exact_coefficients() {
+        // y = 2 - 3x + 0.5x^2 + 4cos(x) - 1.5sin(x), sampled off the grid so no
+        // basis column is accidentally orthogonalised into agreement.
+        let want = [2.0, -3.0, 0.5, 4.0, -1.5];
+        let xs: Vec<f64> = (0..40).map(|i| 0.13 * i as f64).collect();
+        let design: Vec<Vec<f64>> =
+            xs.iter().map(|&x| vec![1.0, x, x * x, x.cos(), x.sin()]).collect();
+        let y: Vec<f64> =
+            design.iter().map(|r| r.iter().zip(want).map(|(a, b)| a * b).sum()).collect();
+        let got = least_squares(&design, &y).expect("well-conditioned design");
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-8, "{got:?} != {want:?}");
+        }
+    }
+
+    #[test]
+    fn least_squares_rejects_a_rank_deficient_design() {
+        // Second column is a multiple of the first.
+        let design: Vec<Vec<f64>> = (0..10).map(|i| vec![i as f64, 2.0 * i as f64]).collect();
+        assert!(least_squares(&design, &vec![1.0; 10]).is_none());
+        // Fewer observations than unknowns.
+        assert!(least_squares(&[vec![1.0, 2.0]], &[1.0]).is_none());
     }
 
     #[test]

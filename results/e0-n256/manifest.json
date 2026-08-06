@@ -1,0 +1,16 @@
+{
+  "experiment": "E0",
+  "git": "399113ec6c00-dirty",
+  "d": 64,
+  "horizon": 30000,
+  "warmup": 4000,
+  "trials": 256,
+  "decoys": 128,
+  "eta": 1,
+  "patterns": 2000,
+  "zipf_exponent": 1,
+  "g_uniform": 0.25,
+  "g1_geometric": 0.5,
+  "seed": 20260806,
+  "schemes": ["plain", "exp/tau=30", "exp/tau=100", "exp/tau=300", "exp/tau=1000", "exp/tau=3000", "exp/tau=10000", "exp/tau=30000", "uniform/g=0.25/m=8", "geo/r=2/m=8", "geo/r=4/m=4", "geo/r=8/m=3"]
+}

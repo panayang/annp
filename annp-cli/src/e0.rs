@@ -14,11 +14,12 @@
 //!   frequencies and ask what is still recallable at the end, resolved by rank.
 //!   This is the practically useful metric: do rare patterns survive.
 //! * **E0-c power spectrum** — drive the ladder with white noise and measure
-//!   `||U_k - U_{k+1}||^2` against `tau_k`. Under a white-noise input the null
-//!   model is exact: the variance of a mean over `tau` samples goes as
-//!   `1/tau`, so the log-log slope must be `-1`. This validates the instrument
-//!   that DESIGN.md §1.8.3 uses to place the gradient's injection depth, before
-//!   anything is allowed to depend on it.
+//!   `||U_k - U_{k+1}||^2` against `tau_k`. The null model is
+//!   `Var(U_k) ~ sigma^2 tau_k / C_k^2`: charge arriving in a rung's band is a
+//!   random walk over `tau_k`, spread across capacity `C_k`. For the geometric
+//!   schedule those cancel, so the spectrum is *flat*. This validates the
+//!   instrument DESIGN.md §1.8.3 uses to place the gradient's injection depth,
+//!   before anything is allowed to depend on it.
 //!
 //! Every number here is produced from an explicit seed, and trials are paired:
 //! all consolidation schemes see the identical stream of keys and values, so
@@ -28,7 +29,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use annp_core::ladder::{AssocMemory, Schedule};
-use annp_core::linalg::{linear_fit, mean_std};
+use annp_core::linalg::{least_squares, linear_fit, mean_std};
 use annp_core::rng::Rng;
 use rayon::prelude::*;
 
@@ -80,6 +81,9 @@ pub struct Config {
     pub horizon: u64,
     pub warmup: u64,
     pub trials: u64,
+    /// Log-spaced ages at which retention is measured. Must be dense enough to
+    /// resolve a ripple of period `ln r`, which needs several points per period.
+    pub age_samples: usize,
     pub decoys: usize,
     pub eta: f64,
     pub patterns: usize,
@@ -191,6 +195,47 @@ fn measurement_floor(ages: &[u64], mean: &[f64], stderr: &[f64]) -> u64 {
     *ages.last().expect("ages is never empty")
 }
 
+/// A log-periodic component detected in the retention curve.
+struct Ripple {
+    amplitude: f64,
+    stderr: f64,
+}
+
+/// Fits `y = a0 + a1 x + a2 x^2 + a3 cos(w x) + a4 sin(w x)` and returns the
+/// amplitude of the oscillatory part.
+///
+/// The quadratic terms matter: these curves have real curvature in log-log
+/// (a plateau while the fresh trace is still intact, then a steepening), and
+/// without absorbing it into the smooth part any single arc masquerades as half
+/// an oscillation. DESIGN.md §1.8.2 predicts a ripple of period `ln r` for a
+/// geometric ladder, so the honest test is this amplitude at `w = 2 pi / ln r`
+/// against the same amplitude at a period where nothing is predicted.
+fn ripple_at(x: &[f64], y: &[f64], omega: f64) -> Option<Ripple> {
+    const K: usize = 5;
+    if x.len() <= K + 2 {
+        return None;
+    }
+    let design: Vec<Vec<f64>> = x
+        .iter()
+        .map(|&t| vec![1.0, t, t * t, (omega * t).cos(), (omega * t).sin()])
+        .collect();
+    let c = least_squares(&design, y)?;
+    let rss: f64 = design
+        .iter()
+        .zip(y)
+        .map(|(row, &yi)| {
+            let fit: f64 = row.iter().zip(&c).map(|(a, b)| a * b).sum();
+            (yi - fit) * (yi - fit)
+        })
+        .sum();
+    let s2 = rss / (x.len() - K) as f64;
+    // Across a window spanning several periods sum(cos^2) ~ n/2, so each
+    // sinusoid coefficient carries variance ~2 s2/n. Good enough for a
+    // detection threshold, not for a published error bar.
+    let stderr = (2.0 * s2 / x.len() as f64).sqrt();
+    Some(Ripple { amplitude: (c[3] * c[3] + c[4] * c[4]).sqrt(), stderr })
+}
+
 /// Age at which SNR first falls through `threshold`, interpolated in log-log.
 /// `None` means it never did within the horizon.
 fn lifetime(ages: &[u64], snr: &[f64], threshold: f64) -> Option<f64> {
@@ -252,6 +297,7 @@ fn retention_trial(spec: MemSpec, cfg: &Config, ages: &[u64], seed: u64) -> Vec<
 }
 
 struct RetentionResult {
+    spec: MemSpec,
     label: String,
     ages: Vec<u64>,
     snr_mean: Vec<f64>,
@@ -259,7 +305,7 @@ struct RetentionResult {
 }
 
 fn run_retention(cfg: &Config, specs: &[MemSpec]) -> Vec<RetentionResult> {
-    let ages = log_spaced(cfg.horizon, 48);
+    let ages = log_spaced(cfg.horizon, cfg.age_samples);
     specs
         .par_iter()
         .map(|spec| {
@@ -275,7 +321,13 @@ fn run_retention(cfg: &Config, specs: &[MemSpec]) -> Vec<RetentionResult> {
                 snr_mean.push(m);
                 snr_stderr.push(s / (cfg.trials as f64).sqrt());
             }
-            RetentionResult { label: spec.label(), ages: ages.clone(), snr_mean, snr_stderr }
+            RetentionResult {
+                spec: *spec,
+                label: spec.label(),
+                ages: ages.clone(),
+                snr_mean,
+                snr_stderr,
+            }
         })
         .collect()
 }
@@ -514,6 +566,50 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     println!("  slope: local log-log slope inside [10, floor]. A power-law ladder sits near -0.5.");
     println!();
 
+    // --- E0-a, log-periodic ripple ---------------------------------------
+    // DESIGN.md §1.8.2: a geometric ladder is only discretely scale invariant,
+    // so its t^-1/2 decay should carry a ripple of period ln r. The decoy
+    // column fits the same model at an unpredicted period; without a clear
+    // separation between the two there is no detection, only curvature.
+    println!("E0-a  log-periodic ripple (predicted period ln r)");
+    println!("  {:<20} {:>10} {:>18} {:>18}", "scheme", "pts/period", "amp @ ln r", "amp @ decoy");
+    for r in &retention {
+        let MemSpec::Ladder { schedule: Schedule::Geometric { r: ratio, .. }, .. } = r.spec else {
+            continue;
+        };
+        let floor = measurement_floor(&r.ages, &r.snr_mean, &r.snr_stderr);
+        let (x, y): (Vec<f64>, Vec<f64>) = r
+            .ages
+            .iter()
+            .zip(&r.snr_mean)
+            .filter(|(a, s)| **a >= 10 && **a <= floor && **s > 0.3)
+            .map(|(a, s)| ((*a as f64).ln(), s.ln()))
+            .unzip();
+        if x.len() < 8 {
+            println!("  {:<20} {:>10}", r.label, "too few pts");
+            continue;
+        }
+        let span = x.last().unwrap() - x.first().unwrap();
+        let per_period = x.len() as f64 * ratio.ln() / span;
+        // sqrt(2) is irrational, so the decoy period cannot alias onto the
+        // predicted one or any of its harmonics.
+        let fits = [ripple_at(&x, &y, std::f64::consts::TAU / ratio.ln()),
+                    ripple_at(&x, &y, std::f64::consts::TAU / (ratio.ln() * std::f64::consts::SQRT_2))];
+        let show = |f: &Option<Ripple>| {
+            f.as_ref()
+                .map(|r| format!("{:.4} +/- {:.4}", r.amplitude, r.stderr))
+                .unwrap_or_else(|| "n/a".to_string())
+        };
+        println!(
+            "  {:<20} {per_period:>10.1} {:>18} {:>18}",
+            r.label,
+            show(&fits[0]),
+            show(&fits[1])
+        );
+    }
+    println!("  a ripple needs >=4 pts/period to be resolvable at all, and must beat the decoy.");
+    println!();
+
     // --- E0-c summary -----------------------------------------------------
     // Null model, corrected. The variance a white-noise drive leaves in rung k
     // is ~ sigma^2 * tau_k / C_k^2: charge arriving in that rung's band is a
@@ -604,6 +700,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             "  \"horizon\": {horizon},\n",
             "  \"warmup\": {warmup},\n",
             "  \"trials\": {trials},\n",
+            "  \"age_samples\": {age_samples},\n",
             "  \"decoys\": {decoys},\n",
             "  \"eta\": {eta},\n",
             "  \"patterns\": {patterns},\n",
@@ -619,6 +716,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         horizon = cfg.horizon,
         warmup = cfg.warmup,
         trials = cfg.trials,
+        age_samples = cfg.age_samples,
         decoys = cfg.decoys,
         eta = cfg.eta,
         patterns = cfg.patterns,
@@ -642,6 +740,7 @@ mod tests {
             horizon: 400,
             warmup: 100,
             trials: 2,
+            age_samples: 16,
             decoys: 32,
             eta: 1.0,
             patterns: 64,

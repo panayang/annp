@@ -37,6 +37,10 @@ enum Command {
         /// Independent paired trials averaged per scheme.
         #[arg(long, default_value_t = 8)]
         trials: u64,
+        /// Log-spaced ages at which retention is sampled. Resolving the
+        /// predicted ripple of period ln r needs several points per period.
+        #[arg(long, default_value_t = 48)]
+        age_samples: usize,
         /// Never-written keys used to estimate the noise distribution.
         #[arg(long, default_value_t = 128)]
         decoys: usize,
@@ -69,6 +73,7 @@ fn main() -> std::io::Result<()> {
             horizon,
             warmup,
             trials,
+            age_samples,
             decoys,
             eta,
             patterns,
@@ -84,6 +89,7 @@ fn main() -> std::io::Result<()> {
                 horizon,
                 warmup,
                 trials,
+                age_samples,
                 decoys,
                 eta,
                 patterns,
