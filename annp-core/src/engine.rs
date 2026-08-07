@@ -106,6 +106,10 @@ pub struct TokenOutput {
     pub absorbed_mass: f64,
     /// Mass-weighted hop count, for the compute-budget measurement.
     pub hop_mass: f64,
+    /// Node visits charged to this token. This is the compute it actually
+    /// cost, and the quantity DESIGN.md §1.6 claims is independent of how far
+    /// into the sequence the token sits.
+    pub visits: u64,
     injected_tick: u64,
 }
 
@@ -205,6 +209,13 @@ impl Engine {
         &self.visits
     }
 
+    /// Tokens whose particles have all been absorbed, in ascending order.
+    /// Their output is complete and will not change.
+    pub fn settled(&self) -> Vec<u32> {
+        let live: std::collections::BTreeSet<u32> = self.current.token.iter().copied().collect();
+        self.outputs.keys().copied().filter(|t| !live.contains(t)).collect()
+    }
+
     pub fn take_output(&mut self, token: u32) -> Option<TokenOutput> {
         self.outputs.remove(&token)
     }
@@ -221,6 +232,7 @@ impl Engine {
                 accumulated: vec![0.0; self.params.slots * self.d_head],
                 absorbed_mass: 0.0,
                 hop_mass: 0.0,
+                visits: 0,
                 injected_tick: self.tick,
             },
         );
@@ -237,6 +249,13 @@ impl Engine {
         if self.current.is_empty() {
             self.tick += 1;
             return TickStats { tick: self.tick, ..Default::default() };
+        }
+
+        // Charge this tick's work to the tokens that caused it.
+        for &token in &self.current.token {
+            if let Some(out) = self.outputs.get_mut(&token) {
+                out.visits += 1;
+            }
         }
 
         // 1. Deterministic order: by node, then by creation rank.

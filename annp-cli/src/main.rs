@@ -5,6 +5,7 @@
 //! so any result in the paper can be regenerated from one line.
 
 mod e0;
+mod run;
 mod topology;
 
 use std::path::PathBuf;
@@ -68,6 +69,51 @@ enum Command {
         #[arg(long, default_value = "results/e0")]
         out: PathBuf,
     },
+    /// End-to-end run on a synthetic Markov source with a known entropy rate.
+    Run {
+        #[arg(long, default_value_t = 20_000)]
+        tokens: usize,
+        #[arg(long, default_value_t = 64)]
+        vocab: usize,
+        /// Successors per state. Lower means a more predictable source.
+        #[arg(long, default_value_t = 3)]
+        fanout: usize,
+        #[arg(long, default_value_t = 16)]
+        d_head: usize,
+        /// Particles per token. d_model = slots * d_head must be a power of two.
+        #[arg(long, default_value_t = 8)]
+        slots: usize,
+        #[arg(long, default_value_t = 24)]
+        grid_side: usize,
+        #[arg(long, default_value_t = 4)]
+        long_range: usize,
+        #[arg(long, default_value_t = 4)]
+        rungs: usize,
+        /// Rungs behind the tied table; 1 means a plain matrix.
+        #[arg(long, default_value_t = 3)]
+        embed_rungs: usize,
+        #[arg(long, default_value_t = 2)]
+        top_k: usize,
+        #[arg(long, default_value_t = 1e-3)]
+        mass_floor: f64,
+        #[arg(long, default_value_t = 1.0)]
+        eta: f64,
+        #[arg(long, default_value_t = 0.05)]
+        homeostasis: f64,
+        #[arg(long, default_value_t = 0.05)]
+        learning_rate: f64,
+        /// Ladder ratio r. E0-d measured the usable range as 2..=8.
+        #[arg(long, default_value_t = 4.0)]
+        ladder_ratio: f64,
+        #[arg(long, default_value_t = 20_260_807)]
+        seed: u64,
+        /// Control run: score the input embedding instead of the network's
+        /// output, with everything else identical.
+        #[arg(long, default_value_t = false)]
+        bypass: bool,
+        #[arg(long, default_value = "results/run")]
+        out: PathBuf,
+    },
     /// Topology bench — does the long-range exponent follow the lattice
     /// dimension, as DESIGN.md §1.9 claims, or was 2 just asserted?
     Topology {
@@ -125,6 +171,47 @@ fn main() -> std::io::Result<()> {
                 g1_geometric,
             };
             e0::run(&cfg, &out)
+        }
+        Command::Run {
+            tokens,
+            vocab,
+            fanout,
+            d_head,
+            slots,
+            grid_side,
+            long_range,
+            rungs,
+            embed_rungs,
+            top_k,
+            mass_floor,
+            eta,
+            homeostasis,
+            learning_rate,
+            ladder_ratio,
+            seed,
+            bypass,
+            out,
+        } => {
+            let cfg = run::Config {
+                tokens,
+                vocab,
+                fanout,
+                d_head,
+                slots,
+                grid_side,
+                long_range,
+                rungs,
+                embed_rungs,
+                top_k,
+                mass_floor,
+                eta,
+                homeostasis,
+                learning_rate,
+                ladder_ratio,
+                seed,
+                bypass,
+            };
+            run::run(&cfg, &out)
         }
         Command::Topology { sides, exponents, contacts, pairs, seed, out } => {
             assert!(sides.len() >= 3, "the hops ~ N^beta fit needs at least three grid sizes");
