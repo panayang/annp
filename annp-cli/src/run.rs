@@ -183,6 +183,91 @@ impl CountingCoder {
     }
 }
 
+/// Log-linear coder: `logits(next) = A[current] + B[previous]`.
+///
+/// The ceiling on any model whose two sources of evidence combine *additively*
+/// in log space. That is the shape this architecture has: the reassembled
+/// vector is a sum of particle contributions and the output head is linear, so
+/// whatever the network retrieves about earlier tokens enters the logits as a
+/// separate term rather than as an interaction with the current token.
+///
+/// A random order-k chain needs interactions — `P(next | cur, prev)` is a
+/// general function of the pair, not a product of marginals — so if the network
+/// lands near this coder rather than near the order-k coder, the gap is
+/// structural and no additional mechanism of the same kind will close it.
+///
+/// Several learning rates run in parallel and the best is reported, because the
+/// point is what additive models *can* do, not what one optimiser run does.
+struct AdditiveCoder {
+    vocab: usize,
+    rates: Vec<f64>,
+    /// `[rate][current * vocab + next]` and `[rate][previous * vocab + next]`.
+    current: Vec<Vec<f64>>,
+    previous: Vec<Vec<f64>>,
+    nats: Vec<f64>,
+    tail: Vec<f64>,
+    last: Option<u32>,
+    scratch: Vec<f64>,
+}
+
+impl AdditiveCoder {
+    fn new(vocab: usize) -> Self {
+        let rates = vec![0.02, 0.05, 0.1, 0.3];
+        let n = rates.len();
+        Self {
+            vocab,
+            current: vec![vec![0.0; vocab * vocab]; n],
+            previous: vec![vec![0.0; vocab * vocab]; n],
+            nats: vec![0.0; n],
+            tail: vec![0.0; n],
+            rates,
+            last: None,
+            scratch: vec![0.0; vocab],
+        }
+    }
+
+    fn observe(&mut self, current: u32, next: u32, in_tail: bool) {
+        let Some(previous) = self.last else {
+            self.last = Some(current);
+            return;
+        };
+        let v = self.vocab;
+        for r in 0..self.rates.len() {
+            let (ci, pi) = (current as usize * v, previous as usize * v);
+            for n in 0..v {
+                self.scratch[n] = self.current[r][ci + n] + self.previous[r][pi + n];
+            }
+            let peak = self.scratch.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mut total = 0.0;
+            for x in self.scratch.iter_mut() {
+                *x = (*x - peak).exp();
+                total += *x;
+            }
+            for x in self.scratch.iter_mut() {
+                *x /= total;
+            }
+            let nats = -self.scratch[next as usize].max(f64::MIN_POSITIVE).ln();
+            self.nats[r] += nats;
+            if in_tail {
+                self.tail[r] += nats;
+            }
+            self.scratch[next as usize] -= 1.0;
+            let lr = self.rates[r];
+            for n in 0..v {
+                let g = lr * self.scratch[n];
+                self.current[r][ci + n] -= g;
+                self.previous[r][pi + n] -= g;
+            }
+        }
+        self.last = Some(current);
+    }
+
+    /// Best tail loss across the learning rates, in nats.
+    fn best_tail(&self) -> f64 {
+        self.tail.iter().copied().fold(f64::INFINITY, f64::min)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub tokens: usize,
@@ -287,12 +372,18 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let started = std::time::Instant::now();
     let mut scored: Vec<Scored> = Vec::with_capacity(cfg.tokens);
     let mut stream_rng = Rng::new(cfg.seed ^ 0x5EED);
+    let mut additive = AdditiveCoder::new(cfg.vocab);
+    let mut previous_token: Option<u32> = None;
     let mut coders =
         [CountingCoder::new(cfg.vocab, 1), CountingCoder::new(cfg.vocab, cfg.order)];
     let mut coder_nats = [0.0f64; 2];
     let mut coder_tail = [0.0f64; 2];
     for i in 0..cfg.tokens {
         let token = source.next(&mut stream_rng);
+        if let Some(prev) = previous_token {
+            additive.observe(prev, token, i * 10 >= cfg.tokens * 9);
+        }
+        previous_token = Some(token);
         for (k, coder) in coders.iter_mut().enumerate() {
             let nats = coder.observe(token);
             coder_nats[k] += nats;
@@ -361,6 +452,11 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         "  {:<26} {:>8.4}   <- ceiling on anything",
         format!("order-{} counting coder", source.order()),
         coder_tail[1] / tail_count * nats_to_bits
+    );
+    println!(
+        "  {:<26} {:>8.4}   <- ceiling on additive (non-interacting) models",
+        "log-linear order-2",
+        additive.best_tail() / tail_count * nats_to_bits
     );
     println!("  {:<26} {:>8.4}", "source entropy rate", entropy_rate * nats_to_bits);
     println!(
