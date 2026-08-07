@@ -190,13 +190,15 @@ pub fn least_squares(design: &[Vec<f64>], y: &[f64]) -> Option<Vec<f64>> {
         for v in m[col].iter_mut() {
             *v /= d;
         }
-        for row in 0..k {
-            if row != col {
-                let f = m[row][col];
-                if f != 0.0 {
-                    for j in col..=k {
-                        m[row][j] -= f * m[col][j];
-                    }
+        let pivot_row: Vec<f64> = m[col][col..=k].to_vec();
+        for (row, r) in m.iter_mut().enumerate() {
+            if row == col {
+                continue;
+            }
+            let f = r[col];
+            if f != 0.0 {
+                for (dst, &p) in r[col..=k].iter_mut().zip(&pivot_row) {
+                    *dst -= f * p;
                 }
             }
         }
@@ -319,7 +321,7 @@ mod tests {
     fn least_squares_rejects_a_rank_deficient_design() {
         // Second column is a multiple of the first.
         let design: Vec<Vec<f64>> = (0..10).map(|i| vec![i as f64, 2.0 * i as f64]).collect();
-        assert!(least_squares(&design, &vec![1.0; 10]).is_none());
+        assert!(least_squares(&design, &[1.0; 10]).is_none());
         // Fewer observations than unknowns.
         assert!(least_squares(&[vec![1.0, 2.0]], &[1.0]).is_none());
     }

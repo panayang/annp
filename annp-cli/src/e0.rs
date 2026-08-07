@@ -84,6 +84,8 @@ pub struct Config {
     /// Log-spaced ages at which retention is measured. Must be dense enough to
     /// resolve a ripple of period `ln r`, which needs several points per period.
     pub age_samples: usize,
+    /// Events to follow the bare impulse response for in E0-d.
+    pub impulse_horizon: u64,
     pub decoys: usize,
     pub eta: f64,
     pub patterns: usize,
@@ -493,6 +495,97 @@ fn run_spectrum(cfg: &Config, specs: &[MemSpec]) -> Vec<SpectrumResult> {
 }
 
 // ---------------------------------------------------------------------------
+// E0-d: bare impulse response
+// ---------------------------------------------------------------------------
+
+/// The Green's function of the ladder itself, with no memory task attached.
+///
+/// E0-a measures the ripple through a composite observable — the SNR of a
+/// delta-rule memory under a continuously refreshed interference process — and
+/// that process can smear a discrete scale invariance that is nonetheless
+/// present in the ladder. §1.8.2 predicts the ripple for the ladder's *response*,
+/// so this measures exactly that: inject one unit impulse into rung 1 and watch
+/// it decay.
+///
+/// The dynamics are linear and elementwise decoupled, so a 1x1 matrix carries
+/// the whole answer, and there is no sampling noise at all — the only
+/// uncertainty is fit residual. Anything not visible here is not in the ladder.
+struct ImpulseResult {
+    label: String,
+    times: Vec<u64>,
+    value: Vec<f64>,
+    /// Window actually fitted: the decade range where the chain is still
+    /// relaxing rather than equilibrated.
+    window: (u64, u64),
+    slope: f64,
+    ripple_pred: Option<Ripple>,
+    ripple_decoy: Option<Ripple>,
+}
+
+fn run_impulse(cfg: &Config) -> Vec<ImpulseResult> {
+    let horizon = cfg.impulse_horizon;
+    // Size each chain to cover ten times the horizon so the measurement never
+    // runs into the plateau where the finite chain has equilibrated.
+    // Ratios well past anything we would deploy: if the discrete scale
+    // invariance leaves a log-periodic signature at all, its amplitude must
+    // grow with the coarseness of the ladder, so a null that persists out to
+    // r = 32 is a null everywhere.
+    let mut schedules: Vec<Schedule> = vec![Schedule::Uniform { g: cfg.g_uniform }];
+    for r in [2.0, 4.0, 8.0, 16.0, 32.0] {
+        schedules.push(Schedule::Geometric { r, g1: cfg.g1_geometric });
+    }
+
+    schedules
+        .par_iter()
+        .map(|&schedule| {
+            let rungs = schedule.rungs_for_horizon(10.0 * horizon as f64);
+            let spec = MemSpec::Ladder { schedule, rungs };
+            let mut l = annp_core::ladder::Ladder::new(schedule, rungs, 1, 1);
+            l.inject(&[1.0], &[1.0], 1.0);
+
+            let times = log_spaced(horizon, cfg.age_samples);
+            let mut value = Vec::with_capacity(times.len());
+            let mut next = 0usize;
+            for t in 1..=horizon {
+                l.relax();
+                while next < times.len() && times[next] == t {
+                    value.push(l.rung(0).get(0, 0));
+                    next += 1;
+                }
+            }
+
+            // Fit where the response is a decaying power law: past the first
+            // rung's own relaxation, before the chain equilibrates.
+            let lo = (l.relaxation_time(0) * 10.0).ceil() as u64;
+            let hi = horizon;
+            let (x, y): (Vec<f64>, Vec<f64>) = times
+                .iter()
+                .zip(&value)
+                .filter(|(t, v)| **t >= lo && **t <= hi && **v > 0.0)
+                .map(|(t, v)| ((*t as f64).ln(), v.ln()))
+                .unzip();
+            let slope = if x.len() >= 5 { linear_fit(&x, &y).0 } else { f64::NAN };
+            let (pred, decoy) = match schedule {
+                Schedule::Geometric { r, .. } => (
+                    ripple_at(&x, &y, std::f64::consts::TAU / r.ln()),
+                    ripple_at(&x, &y, std::f64::consts::TAU / (r.ln() * std::f64::consts::SQRT_2)),
+                ),
+                Schedule::Uniform { .. } => (None, None),
+            };
+            ImpulseResult {
+                label: spec.label(),
+                times,
+                value,
+                window: (lo, hi),
+                slope,
+                ripple_pred: pred,
+                ripple_decoy: decoy,
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Driver and output
 // ---------------------------------------------------------------------------
 
@@ -523,6 +616,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     println!("  seed={} schemes={}", cfg.seed, specs.len());
     println!();
 
+    let impulse = run_impulse(cfg);
     let retention = run_retention(cfg, &specs);
     let zipf = run_zipf(cfg, &specs);
     let spectrum = run_spectrum(cfg, &specs);
@@ -610,6 +704,32 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     println!("  a ripple needs >=4 pts/period to be resolvable at all, and must beat the decoy.");
     println!();
 
+    // --- E0-d summary -----------------------------------------------------
+    // No sampling noise here at all: the chain is linear, deterministic, and
+    // measured on a 1x1 matrix. If the ripple is not in this table it is not in
+    // the ladder, and E0-a's null result is not an artefact of the memory task.
+    println!("E0-d  bare impulse response (no memory task, no sampling noise)");
+    println!(
+        "  {:<20} {:>9} {:>18} {:>18} {:>16}",
+        "schedule", "slope", "amp @ ln r", "amp @ decoy", "window"
+    );
+    for r in &impulse {
+        let show = |f: &Option<Ripple>| {
+            f.as_ref()
+                .map(|r| format!("{:.5} +/- {:.5}", r.amplitude, r.stderr))
+                .unwrap_or_else(|| "n/a".to_string())
+        };
+        println!(
+            "  {:<20} {:>9.4} {:>18} {:>18} {:>16}",
+            r.label,
+            r.slope,
+            show(&r.ripple_pred),
+            show(&r.ripple_decoy),
+            format!("{}..{}", r.window.0, r.window.1)
+        );
+    }
+    println!();
+
     // --- E0-c summary -----------------------------------------------------
     // Null model, corrected. The variance a white-noise drive leaves in rung k
     // is ~ sigma^2 * tau_k / C_k^2: charge arriving in that rung's band is a
@@ -683,6 +803,14 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     }
     write_csv(out_dir, "e0b_zipf.csv", csv)?;
 
+    let mut csv = String::from("schedule,t,value\n");
+    for r in &impulse {
+        for i in 0..r.times.len() {
+            let _ = writeln!(csv, "{},{},{:.12e}", r.label, r.times[i], r.value[i]);
+        }
+    }
+    write_csv(out_dir, "e0d_impulse.csv", csv)?;
+
     let mut csv = String::from("scheme,rung,tau,power\n");
     for s in &spectrum {
         for k in 0..s.tau.len() {
@@ -701,6 +829,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             "  \"warmup\": {warmup},\n",
             "  \"trials\": {trials},\n",
             "  \"age_samples\": {age_samples},\n",
+            "  \"impulse_horizon\": {impulse_horizon},\n",
             "  \"decoys\": {decoys},\n",
             "  \"eta\": {eta},\n",
             "  \"patterns\": {patterns},\n",
@@ -717,6 +846,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         warmup = cfg.warmup,
         trials = cfg.trials,
         age_samples = cfg.age_samples,
+        impulse_horizon = cfg.impulse_horizon,
         decoys = cfg.decoys,
         eta = cfg.eta,
         patterns = cfg.patterns,
@@ -741,6 +871,7 @@ mod tests {
             warmup: 100,
             trials: 2,
             age_samples: 16,
+            impulse_horizon: 2_000,
             decoys: 32,
             eta: 1.0,
             patterns: 64,

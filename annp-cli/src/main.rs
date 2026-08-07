@@ -41,6 +41,9 @@ enum Command {
         /// predicted ripple of period ln r needs several points per period.
         #[arg(long, default_value_t = 48)]
         age_samples: usize,
+        /// Events to follow the bare impulse response for in E0-d.
+        #[arg(long, default_value_t = 1_000_000)]
+        impulse_horizon: u64,
         /// Never-written keys used to estimate the noise distribution.
         #[arg(long, default_value_t = 128)]
         decoys: usize,
@@ -74,6 +77,7 @@ fn main() -> std::io::Result<()> {
             warmup,
             trials,
             age_samples,
+            impulse_horizon,
             decoys,
             eta,
             patterns,
@@ -90,6 +94,7 @@ fn main() -> std::io::Result<()> {
                 warmup,
                 trials,
                 age_samples,
+                impulse_horizon,
                 decoys,
                 eta,
                 patterns,
