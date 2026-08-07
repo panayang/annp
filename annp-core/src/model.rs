@@ -291,6 +291,25 @@ impl Ingress {
     }
 }
 
+/// How the assembled vector becomes a distribution over the vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadKind {
+    /// A single matrix. Whatever the network retrieves about earlier tokens
+    /// enters the logits as a separate additive term, which caps it at the
+    /// log-linear ceiling.
+    Linear,
+    /// A soft lookup over `slots` stored (key, distribution) pairs, mixed in
+    /// **probability** space.
+    ///
+    /// §23 measured that what the readout lacks is a lookup, not a
+    /// nonlinearity: a one-hidden-layer probe recovered 3.6% of the gap where
+    /// decoding the context and indexing a table recovered 62%. Mixing
+    /// distributions rather than logits is what makes the combination
+    /// non-additive in log space, and matching a query against stored keys is
+    /// the same operation routing already performs against node expectations.
+    Lookup { slots: usize },
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ModelParams {
     pub vocab: usize,
@@ -305,8 +324,10 @@ pub struct ModelParams {
     /// reference point for what consolidation costs the output head.
     pub embed_rungs: usize,
     pub learning_rate: f64,
-    /// Whether the output head is the embedding table itself.
+    /// Whether the output head is the embedding table itself. Ignored for
+    /// `HeadKind::Lookup`, which has weights of its own.
     pub tied: bool,
+    pub head_kind: HeadKind,
 }
 
 impl ModelParams {
@@ -331,6 +352,7 @@ pub struct Model {
     embedding: AssocMemory,
     /// Separate output head when untied; `None` when tied.
     head: Option<AssocMemory>,
+    lookup: Option<LookupHead>,
     rotation: Rotation,
     ingress: Ingress,
     embed_buf: Vec<f64>,
@@ -363,12 +385,18 @@ impl Model {
             }
         });
 
+        let lookup = match params.head_kind {
+            HeadKind::Lookup { slots } => Some(LookupHead::new(params.vocab, d_model, slots, rng)),
+            HeadKind::Linear => None,
+        };
+
         let rotation = Rotation::new(d_model, rng);
         let ingress = Ingress::new(params.grid_side, d_model, params.slots, params.vocab, rng);
         Self {
             params,
             embedding,
             head,
+            lookup,
             rotation,
             ingress,
             embed_buf: vec![0.0; d_model],
@@ -458,6 +486,11 @@ impl Model {
     /// consolidation ladder already accepts, so the output head needs no
     /// machinery of its own. This is the only backward pass in the system.
     pub fn learn(&mut self, assembled: &[f64], target: u32) -> f64 {
+        if let Some(lookup) = self.lookup.as_mut() {
+            let loss = lookup.learn(assembled, target, self.params.learning_rate);
+            self.logit_buf.copy_from_slice(lookup.last_mixture());
+            return loss;
+        }
         let loss = self.cross_entropy(assembled, target);
         // `logit_buf` holds the softmax after `cross_entropy`; turn it into the
         // error signal in place.
@@ -475,6 +508,11 @@ impl Model {
     pub fn cross_entropy(&mut self, assembled: &[f64], target: u32) -> f64 {
         assert_eq!(assembled.len(), self.params.d_model(), "assembled width mismatch");
         assert!((target as usize) < self.params.vocab, "target out of vocabulary");
+        if let Some(lookup) = self.lookup.as_mut() {
+            let loss = lookup.score(assembled, target);
+            self.logit_buf.copy_from_slice(lookup.last_mixture());
+            return loss;
+        }
         let mut logits = std::mem::take(&mut self.logit_buf);
         let head = self.head.as_ref().unwrap_or(&self.embedding);
         head.read().mul_vec(assembled, &mut logits);
@@ -514,6 +552,7 @@ mod tests {
             embed_rungs: 4,
             learning_rate: 0.05,
             tied: true,
+            head_kind: HeadKind::Linear,
         }
     }
 
@@ -756,6 +795,103 @@ mod tests {
     }
 
     #[test]
+    fn the_lookup_gate_starts_with_a_clear_winner_at_every_size() {
+        // The property the initialisation is derived for: the largest gate
+        // weight must be O(1) rather than O(1/M), or responsibilities are
+        // uniform, every component learns M times too slowly, and the gate can
+        // never differentiate. It must hold across sizes without touching the
+        // learning rate.
+        for slots in [8usize, 64, 256, 1024] {
+            let mut rng = Rng::new(1_000 + slots as u64);
+            let mut p = params();
+            p.head_kind = HeadKind::Lookup { slots };
+            p.tied = false;
+            let mut model = Model::new(p, &mut rng);
+            let x = model.embedding_of(2).to_vec();
+            model.cross_entropy(&x, 0);
+            let head = model.lookup.as_ref().expect("lookup head");
+            let peak = head.gate.iter().copied().fold(0.0, f64::max);
+            assert!(
+                peak > 0.1,
+                "M = {slots}: top gate weight {peak} is near 1/M = {}",
+                1.0 / slots as f64
+            );
+        }
+    }
+
+    #[test]
+    fn a_lookup_head_mixes_distributions_not_logits() {
+        // The property the whole change rests on. Two components, one favouring
+        // token 0 and the other token 1: mixing their *distributions* puts mass
+        // on both, where mixing their logits and then normalising would not
+        // reproduce that mixture. Checked against the explicit mixture.
+        let mut rng = Rng::new(91);
+        let mut p = params();
+        p.head_kind = HeadKind::Lookup { slots: 2 };
+        p.tied = false;
+        let mut model = Model::new(p, &mut rng);
+        let x = model.embedding_of(3).to_vec();
+
+        // Teach the two components apart by alternating targets.
+        for i in 0..2_000 {
+            model.learn(&x, if i % 2 == 0 { 0 } else { 1 });
+        }
+        model.cross_entropy(&x, 0);
+        let mixed = model.last_probabilities().to_vec();
+        let total: f64 = mixed.iter().sum();
+        assert!((total - 1.0).abs() < 1e-12, "mixture is not a distribution: {total}");
+        assert!(mixed[0] > 0.2 && mixed[1] > 0.2, "mixture collapsed: {:?}", &mixed[..4]);
+    }
+
+    #[test]
+    fn a_lookup_head_can_separate_what_a_linear_head_cannot() {
+        // An XOR-shaped target: the same input feature must map to different
+        // answers depending on a second feature, which is exactly the
+        // interaction a linear head cannot express.
+        let build = |kind: HeadKind| {
+            let mut q = params();
+            q.head_kind = kind;
+            q.tied = false;
+            q.learning_rate = 0.2;
+            Model::new(q, &mut Rng::new(92))
+        };
+        let mut rng = Rng::new(93);
+        let d = params().d_model();
+        let axis: Vec<Vec<f64>> = (0..2)
+            .map(|_| {
+                let mut v = vec![0.0; d];
+                rng.fill_unit_vector(&mut v);
+                v
+            })
+            .collect();
+        let sample = |a: usize, b: usize| -> Vec<f64> {
+            let s = |i: usize| if i == 0 { -1.0 } else { 1.0 };
+            axis[0].iter().zip(&axis[1]).map(|(x, y)| s(a) * x + s(b) * y).collect()
+        };
+
+        let mut losses = Vec::new();
+        for kind in [HeadKind::Linear, HeadKind::Lookup { slots: 8 }] {
+            let mut model = build(kind);
+            let mut tail = 0.0;
+            for i in 0..8_000 {
+                let (a, b) = (i % 2, (i / 2) % 2);
+                let target = (a ^ b) as u32;
+                let loss = model.learn(&sample(a, b), target);
+                if i >= 7_000 {
+                    tail += loss;
+                }
+            }
+            losses.push(tail / 1_000.0);
+        }
+        assert!(
+            losses[1] < 0.5 * losses[0],
+            "lookup {} did not beat linear {} on an interaction",
+            losses[1],
+            losses[0]
+        );
+    }
+
+    #[test]
     fn probabilities_are_a_distribution() {
         let mut rng = Rng::new(8);
         let mut model = Model::new(params(), &mut rng);
@@ -782,5 +918,146 @@ mod tests {
             assert_eq!(s.seeds.len(), slots);
             assert!(s.seeds.iter().all(|(_, _, _, v)| v.len() == 8));
         }
+    }
+}
+
+
+/// A soft lookup readout: stored `(key, distribution)` pairs, mixed in
+/// probability space.
+///
+/// `p(next) = sum_m w_m p_m(next)` with `w = softmax(<x_hat, key_m>)` and
+/// `p_m = softmax(value_m)`. The mixture is over distributions rather than
+/// logits, so the combination is not additive in log space and the readout can
+/// express interactions between whatever the assembled vector encodes.
+///
+/// Keys are left unnormalised on purpose: their magnitude is a learned inverse
+/// temperature, so the gate can sharpen without a temperature parameter.
+///
+/// Their *initial* magnitude is derived rather than chosen. Scores are
+/// `<x_hat, key_m>`, so with key entries drawn iid from `N(0, sigma^2)` the
+/// scores are iid `N(0, sigma^2)` whatever the width. The largest of `M` such
+/// scores sits about `sigma*sqrt(2 ln M)` above zero while the normaliser is
+/// about `M exp(sigma^2/2)`, and requiring the winner to hold `O(1)` of the
+/// mass gives `sigma*sqrt(2 ln M) - sigma^2/2 = ln M`, whose root is
+///
+/// ```text
+///     sigma = sqrt(2 ln M)
+/// ```
+///
+/// This matters because responsibilities scale the updates. Starting from a
+/// flat gate every component has `r_m ~ 1/M`, so both keys and values learn `M`
+/// times too slowly and the gate can never differentiate — a self-locking
+/// state. Measured: at `M = 64` and a rate that works for `M = 8`, the head
+/// scored 3.95 against a linear head's 3.42, and got monotonically worse with
+/// more slots. Scaling the initialisation instead of the rate keeps `M` and the
+/// learning rate independent, rather than tying two knobs together.
+#[derive(Clone, Debug)]
+pub struct LookupHead {
+    vocab: usize,
+    width: usize,
+    slots: usize,
+    keys: Vec<f64>,
+    values: Vec<f64>,
+    query: Vec<f64>,
+    gate: Vec<f64>,
+    component: Vec<f64>,
+    mixture: Vec<f64>,
+    responsibility: Vec<f64>,
+}
+
+impl LookupHead {
+    fn new(vocab: usize, width: usize, slots: usize, rng: &mut Rng) -> Self {
+        assert!(slots >= 1, "a lookup head needs at least one slot");
+        let sigma = (2.0 * (slots as f64).max(2.0).ln()).sqrt();
+        Self {
+            vocab,
+            width,
+            slots,
+            keys: (0..slots * width).map(|_| rng.next_normal() * sigma).collect(),
+            // Zero values start every component at the uniform distribution, so
+            // the head begins by predicting uniformly rather than arbitrarily.
+            values: vec![0.0; slots * vocab],
+            query: vec![0.0; width],
+            gate: vec![0.0; slots],
+            component: vec![0.0; slots * vocab],
+            mixture: vec![0.0; vocab],
+            responsibility: vec![0.0; slots],
+        }
+    }
+
+    /// The mixture from the last `score` or `learn`.
+    pub fn last_mixture(&self) -> &[f64] {
+        &self.mixture
+    }
+
+    fn forward(&mut self, x: &[f64]) {
+        debug_assert_eq!(x.len(), self.width);
+        let len = norm(x);
+        let scale = if len > 1e-12 { 1.0 / len } else { 0.0 };
+        for (q, &v) in self.query.iter_mut().zip(x) {
+            *q = v * scale;
+        }
+        for m in 0..self.slots {
+            let key = &self.keys[m * self.width..(m + 1) * self.width];
+            self.gate[m] = crate::linalg::dot(&self.query, key);
+        }
+        softmax(&mut self.gate);
+        self.mixture.fill(0.0);
+        for m in 0..self.slots {
+            let lo = m * self.vocab;
+            let slice = &mut self.component[lo..lo + self.vocab];
+            slice.copy_from_slice(&self.values[lo..lo + self.vocab]);
+            softmax(slice);
+            let w = self.gate[m];
+            for (mix, &p) in self.mixture.iter_mut().zip(slice.iter()) {
+                *mix += w * p;
+            }
+        }
+    }
+
+    fn score(&mut self, x: &[f64], target: u32) -> f64 {
+        self.forward(x);
+        -self.mixture[target as usize].max(f64::MIN_POSITIVE).ln()
+    }
+
+    fn learn(&mut self, x: &[f64], target: u32, lr: f64) -> f64 {
+        let loss = self.score(x, target);
+        let y = target as usize;
+        let total = self.mixture[y].max(f64::MIN_POSITIVE);
+        // Posterior responsibility of each component for the observed target;
+        // these sum to one.
+        for m in 0..self.slots {
+            self.responsibility[m] = self.gate[m] * self.component[m * self.vocab + y] / total;
+        }
+        for m in 0..self.slots {
+            let r = self.responsibility[m];
+            let lo = m * self.vocab;
+            for v in 0..self.vocab {
+                let g = r * (self.component[lo + v] - if v == y { 1.0 } else { 0.0 });
+                self.values[lo + v] -= lr * g;
+            }
+            // Raise the score of components that explain the target better than
+            // their own gate weight already assumed.
+            let g = self.gate[m] - r;
+            if g != 0.0 {
+                let key = &mut self.keys[m * self.width..(m + 1) * self.width];
+                for (k, &q) in key.iter_mut().zip(&self.query) {
+                    *k -= lr * g * q;
+                }
+            }
+        }
+        loss
+    }
+}
+
+fn softmax(v: &mut [f64]) {
+    let peak = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut total = 0.0;
+    for x in v.iter_mut() {
+        *x = (*x - peak).exp();
+        total += *x;
+    }
+    for x in v.iter_mut() {
+        *x /= total;
     }
 }

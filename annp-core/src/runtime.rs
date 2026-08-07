@@ -59,8 +59,24 @@ pub enum Mode {
     Overlapped,
 }
 
+/// Representations captured along one token's path, for diagnostics.
+///
+/// Enabled with `Runtime::capture_representations`; `None` otherwise, so the
+/// vectors cost nothing when nobody is probing.
+#[derive(Clone, Debug)]
+pub struct Representations {
+    /// The token's embedding, before anything happened to it. Contains no
+    /// information about earlier tokens by construction, so a probe on it is
+    /// the chance-level control.
+    pub ingress: Vec<f64>,
+    /// Reassembly as it would have been after exactly one hop.
+    pub after_one_hop: Vec<f64>,
+    /// The reassembly the output head actually sees.
+    pub assembled: Vec<f64>,
+}
+
 /// One token, after its particles have all come home.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Scored {
     pub position: u32,
     pub token: u32,
@@ -78,6 +94,7 @@ pub struct Scored {
     /// recorded. A map that is forming has this decaying; one that is merely
     /// jittering does not.
     pub anchor_move: usize,
+    pub reps: Option<Representations>,
 }
 
 pub struct Runtime {
@@ -105,6 +122,8 @@ pub struct Runtime {
     turnover_rng: crate::rng::Rng,
     /// Rewirings applied so far.
     rewirings: u64,
+    /// Capture representations along each token's path for probing.
+    capture: bool,
     /// Score the token's own embedding instead of what came back from the
     /// network, while leaving every other timing identical.
     ///
@@ -155,6 +174,7 @@ impl Runtime {
             blind_turnover: false,
             turnover_rng: crate::rng::Rng::new(0x7C_9E_2B_41_A0_53_D6_18),
             rewirings: 0,
+            capture: false,
             bypass: false,
         }
     }
@@ -167,6 +187,10 @@ impl Runtime {
 
     pub fn set_ingress_mode(&mut self, mode: crate::model::IngressMode) {
         self.model.set_ingress_mode(mode);
+    }
+
+    pub fn capture_representations(&mut self, capture: bool) {
+        self.capture = capture;
     }
 
     pub fn set_turnover(&mut self, turnover: bool) {
@@ -345,6 +369,11 @@ impl Runtime {
                 None => 0,
             };
 
+            let reps = self.capture.then(|| Representations {
+                ingress: self.model.embedding_of(token).to_vec(),
+                after_one_hop: self.model.assemble(&output.after_one_hop, scale),
+                assembled: assembled.clone(),
+            });
             scored.push(Scored {
                 position,
                 token,
@@ -355,6 +384,7 @@ impl Runtime {
                 mean_hops: output.mean_hops(),
                 absorbed_mass: output.absorbed_mass,
                 anchor_move,
+                reps,
             });
             self.next_to_score += 1;
         }
@@ -390,6 +420,7 @@ mod tests {
                 embed_rungs: 3,
                 learning_rate: 0.05,
                 tied: true,
+                head_kind: crate::model::HeadKind::Linear,
             },
             NodeParams {
                 absorb: AbsorbRule::RelativeSurprise,

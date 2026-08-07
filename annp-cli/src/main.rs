@@ -146,6 +146,9 @@ enum Command {
         /// which is exactly the behaviour before this existed.
         #[arg(long, default_value_t = 1)]
         context_scales: usize,
+        /// Run linear probes along the path and report where context lives.
+        #[arg(long, default_value_t = false)]
+        probe: bool,
         /// Rungs behind the tied table; 1 means a plain matrix.
         #[arg(long, default_value_t = 3)]
         embed_rungs: usize,
@@ -176,6 +179,11 @@ enum Command {
         /// bigram at all.
         #[arg(long, default_value_t = false)]
         untied: bool,
+        /// Slots in the lookup readout. Zero selects the linear head. This is a
+        /// genuine new hyperparameter — the capacity of the readout — with no
+        /// derivation behind it yet (DESIGN.md §23.5).
+        #[arg(long, default_value_t = 0)]
+        head_slots: usize,
 
         /// Admit one token per tick regardless of what is still in flight.
         /// Leaks future tokens into earlier predictions; the difference against
@@ -260,6 +268,7 @@ fn main() -> std::io::Result<()> {
             long_range,
             rungs,
             context_scales,
+            probe,
             embed_rungs,
             mass_floor,
             eta,
@@ -270,6 +279,7 @@ fn main() -> std::io::Result<()> {
             frozen_topology,
             blind_turnover,
             untied,
+            head_slots,
             overlapped,
             ingress,
             absorb,
@@ -286,6 +296,7 @@ fn main() -> std::io::Result<()> {
                 long_range,
                 rungs,
                 context_scales,
+                probe,
                 embed_rungs,
                 mass_floor,
                 eta,
@@ -296,7 +307,12 @@ fn main() -> std::io::Result<()> {
                 frozen_topology,
                 blind_turnover,
                 untied,
-                    overlapped,
+                head_kind: if head_slots == 0 {
+                    annp_core::model::HeadKind::Linear
+                } else {
+                    annp_core::model::HeadKind::Lookup { slots: head_slots }
+                },
+                overlapped,
                 ingress: ingress.into(),
                 absorb: absorb.into(),
             };

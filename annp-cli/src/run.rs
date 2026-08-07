@@ -24,7 +24,7 @@ use std::path::Path;
 use annp_core::engine::EngineParams;
 use annp_core::graph::{Grid, SmallWorld, Topology};
 use annp_core::ladder::Schedule;
-use annp_core::model::{IngressMode, ModelParams};
+use annp_core::model::{HeadKind, IngressMode, ModelParams};
 use annp_core::node::{AbsorbRule, NodeParams};
 use annp_core::rng::Rng;
 use annp_core::runtime::{Mode, Runtime, Scored};
@@ -268,6 +268,269 @@ impl AdditiveCoder {
     }
 }
 
+/// Online linear probe: how well does a representation linearly predict a
+/// discrete target, scored prequentially like everything else here.
+///
+/// The point is localisation, not performance. Probing for the **previous**
+/// token says where context information exists along the path; probing for the
+/// **current** token in parallel is the control that separates "context never
+/// arrives" from "the path is destroying information indiscriminately", which
+/// have completely different fixes.
+///
+/// Several learning rates run at once and the best is reported, because the
+/// question is what is linearly present, not what one optimiser run recovers.
+struct Probe {
+    vocab: usize,
+    width: usize,
+    rates: Vec<f64>,
+    weights: Vec<Vec<f64>>,
+    tail: Vec<f64>,
+    scratch: Vec<f64>,
+}
+
+impl Probe {
+    fn new(vocab: usize, width: usize) -> Self {
+        let rates = vec![0.01, 0.03, 0.1];
+        let n = rates.len();
+        Self {
+            vocab,
+            width,
+            weights: vec![vec![0.0; vocab * width]; n],
+            tail: vec![0.0; n],
+            rates,
+            scratch: vec![0.0; vocab],
+        }
+    }
+
+    fn observe(&mut self, x: &[f64], target: u32, in_tail: bool) {
+        debug_assert_eq!(x.len(), self.width);
+        for r in 0..self.rates.len() {
+            for n in 0..self.vocab {
+                let row = &self.weights[r][n * self.width..(n + 1) * self.width];
+                self.scratch[n] = row.iter().zip(x).map(|(w, v)| w * v).sum();
+            }
+            let peak = self.scratch.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mut total = 0.0;
+            for v in self.scratch.iter_mut() {
+                *v = (*v - peak).exp();
+                total += *v;
+            }
+            for v in self.scratch.iter_mut() {
+                *v /= total;
+            }
+            if in_tail {
+                self.tail[r] += -self.scratch[target as usize].max(f64::MIN_POSITIVE).ln();
+            }
+            self.scratch[target as usize] -= 1.0;
+            let lr = self.rates[r];
+            for n in 0..self.vocab {
+                let g = lr * self.scratch[n];
+                if g != 0.0 {
+                    let row = &mut self.weights[r][n * self.width..(n + 1) * self.width];
+                    for (w, v) in row.iter_mut().zip(x) {
+                        *w -= g * v;
+                    }
+                }
+            }
+        }
+    }
+
+    fn best_tail(&self) -> f64 {
+        self.tail.iter().copied().fold(f64::INFINITY, f64::min)
+    }
+
+    /// Most likely target under one of the rates. Used to read a symbol back
+    /// out of a representation rather than to score it.
+    fn argmax(&self, x: &[f64], rate: usize) -> u32 {
+        let mut best = (0usize, f64::NEG_INFINITY);
+        for n in 0..self.vocab {
+            let row = &self.weights[rate][n * self.width..(n + 1) * self.width];
+            let score: f64 = row.iter().zip(x).map(|(w, v)| w * v).sum();
+            if score > best.1 {
+                best = (n, score);
+            }
+        }
+        best.0 as u32
+    }
+
+    fn rate_count(&self) -> usize {
+        self.rates.len()
+    }
+}
+
+/// Counting coder over `(current, decoded previous)`, where the previous token
+/// is read back out of the assembled vector by a linear probe.
+///
+/// The measurement the trained probes cannot give. A one-hidden-layer probe
+/// scored on 100k samples in a single online pass is just another weak learner,
+/// so its loss is a *lower* bound on what a readout could reach, not a ceiling —
+/// which is why a 1.95-bit improvement in how well the assembled vector encodes
+/// the previous token moved it by 0.05 bits.
+///
+/// This has nothing to train. It decodes the pair from the representation and
+/// then looks the answer up. If it approaches the order-k coder, everything the
+/// prediction needs is already in the representation and only the readout is at
+/// fault; if it does not, "linearly decodable" and "usable" are different things
+/// and the problem is upstream.
+struct OracleCoder {
+    vocab: usize,
+    counts: Vec<Vec<f64>>,
+    totals: Vec<Vec<f64>>,
+    tail: Vec<f64>,
+    hits: Vec<u64>,
+    seen: u64,
+    scratch: Vec<f64>,
+}
+
+impl OracleCoder {
+    fn new(vocab: usize, rates: usize) -> Self {
+        Self {
+            vocab,
+            counts: vec![vec![0.0; vocab * vocab * vocab]; rates],
+            totals: vec![vec![0.0; vocab * vocab]; rates],
+            tail: vec![0.0; rates],
+            hits: vec![0; rates],
+            seen: 0,
+            scratch: vec![0.0; vocab],
+        }
+    }
+
+    fn observe(&mut self, current: u32, decoded: &[u32], truth: u32, next: u32, in_tail: bool) {
+        let v = self.vocab;
+        self.seen += 1;
+        for (r, &prev) in decoded.iter().enumerate() {
+            if prev == truth {
+                self.hits[r] += 1;
+            }
+            let ctx = current as usize * v + prev as usize;
+            let alpha = 0.5;
+            let p = (self.counts[r][ctx * v + next as usize] + alpha)
+                / (self.totals[r][ctx] + alpha * v as f64);
+            if in_tail {
+                self.tail[r] += -p.ln();
+            }
+            self.counts[r][ctx * v + next as usize] += 1.0;
+            self.totals[r][ctx] += 1.0;
+        }
+        let _ = &self.scratch;
+    }
+
+    /// Best tail loss, and the decoding accuracy of the rate that achieved it.
+    fn best(&self) -> (f64, f64) {
+        let (r, tail) = self
+            .tail
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(r, t)| (r, *t))
+            .expect("at least one rate");
+        (tail, self.hits[r] as f64 / self.seen.max(1) as f64)
+    }
+}
+
+/// One-hidden-layer probe, for measuring what a *nonlinear* readout of a
+/// representation could achieve.
+///
+/// Paired with the linear `Probe` on the same representation and the same
+/// target, it splits the gap between the model's actual loss and what its
+/// input allows into two parts that need opposite fixes: the linear probe minus
+/// the model is what better *optimisation* of the existing head would recover,
+/// and the nonlinear probe minus the linear probe is what only a different
+/// *shape* of readout can reach.
+struct NonlinearProbe {
+    vocab: usize,
+    width: usize,
+    hidden: usize,
+    rates: Vec<f64>,
+    w1: Vec<Vec<f64>>,
+    w2: Vec<Vec<f64>>,
+    tail: Vec<f64>,
+    z: Vec<f64>,
+    h: Vec<f64>,
+    o: Vec<f64>,
+    gh: Vec<f64>,
+}
+
+impl NonlinearProbe {
+    fn new(vocab: usize, width: usize, hidden: usize, rng: &mut Rng) -> Self {
+        let rates = vec![0.003, 0.01, 0.03, 0.1];
+        let n = rates.len();
+        // One shared initialisation across rates so they differ only in step
+        // size; zero second layer so the probe starts at the uniform prediction.
+        let sigma = 1.0 / (width as f64).sqrt();
+        let init: Vec<f64> = (0..hidden * width).map(|_| rng.next_normal() * sigma).collect();
+        Self {
+            vocab,
+            width,
+            hidden,
+            w1: vec![init; n],
+            w2: vec![vec![0.0; vocab * hidden]; n],
+            tail: vec![0.0; n],
+            rates,
+            z: vec![0.0; hidden],
+            h: vec![0.0; hidden],
+            o: vec![0.0; vocab],
+            gh: vec![0.0; hidden],
+        }
+    }
+
+    fn observe(&mut self, x: &[f64], target: u32, in_tail: bool) {
+        debug_assert_eq!(x.len(), self.width);
+        for r in 0..self.rates.len() {
+            for j in 0..self.hidden {
+                let row = &self.w1[r][j * self.width..(j + 1) * self.width];
+                self.z[j] = row.iter().zip(x).map(|(w, v)| w * v).sum();
+                self.h[j] = self.z[j].tanh();
+            }
+            for n in 0..self.vocab {
+                let row = &self.w2[r][n * self.hidden..(n + 1) * self.hidden];
+                self.o[n] = row.iter().zip(&self.h).map(|(w, v)| w * v).sum();
+            }
+            let peak = self.o.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mut total = 0.0;
+            for v in self.o.iter_mut() {
+                *v = (*v - peak).exp();
+                total += *v;
+            }
+            for v in self.o.iter_mut() {
+                *v /= total;
+            }
+            if in_tail {
+                self.tail[r] += -self.o[target as usize].max(f64::MIN_POSITIVE).ln();
+            }
+            self.o[target as usize] -= 1.0;
+
+            let lr = self.rates[r];
+            self.gh.fill(0.0);
+            for n in 0..self.vocab {
+                let g = self.o[n];
+                if g == 0.0 {
+                    continue;
+                }
+                let row = &mut self.w2[r][n * self.hidden..(n + 1) * self.hidden];
+                for (j, (w, hv)) in row.iter_mut().zip(&self.h).enumerate() {
+                    self.gh[j] += g * *w;
+                    *w -= lr * g * hv;
+                }
+            }
+            for j in 0..self.hidden {
+                let gz = self.gh[j] * (1.0 - self.h[j] * self.h[j]);
+                if gz == 0.0 {
+                    continue;
+                }
+                let row = &mut self.w1[r][j * self.width..(j + 1) * self.width];
+                for (w, v) in row.iter_mut().zip(x) {
+                    *w -= lr * gz * v;
+                }
+            }
+        }
+    }
+
+    fn best_tail(&self) -> f64 {
+        self.tail.iter().copied().fold(f64::INFINITY, f64::min)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub tokens: usize,
@@ -280,6 +543,8 @@ pub struct Config {
     pub long_range: usize,
     pub rungs: usize,
     pub context_scales: usize,
+    /// Run linear probes along the path and report where context lives.
+    pub probe: bool,
     pub embed_rungs: usize,
     pub mass_floor: f64,
     pub eta: f64,
@@ -296,6 +561,7 @@ pub struct Config {
     /// Give the output head its own weights instead of reusing the embedding
     /// table. Removes the symmetry the tied head imposes.
     pub untied: bool,
+    pub head_kind: HeadKind,
     pub ingress: IngressMode,
     /// Send every token to the same anchor, ignoring content.
     /// Admit tokens one per tick regardless of what is in flight. Leaks the
@@ -341,6 +607,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             embed_rungs: cfg.embed_rungs,
             learning_rate: cfg.learning_rate,
             tied: !cfg.untied,
+            head_kind: cfg.head_kind,
         },
         NodeParams {
             absorb: cfg.absorb,
@@ -359,6 +626,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     runtime.set_blind_turnover(cfg.blind_turnover);
     runtime.set_mode(if cfg.overlapped { Mode::Overlapped } else { Mode::Serial });
     runtime.set_ingress_mode(cfg.ingress);
+    runtime.capture_representations(cfg.probe);
 
     // The source gets its own generator. Drawing it from the one the model
     // construction just used would make the data depend on the architecture:
@@ -372,6 +640,15 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let started = std::time::Instant::now();
     let mut scored: Vec<Scored> = Vec::with_capacity(cfg.tokens);
     let mut stream_rng = Rng::new(cfg.seed ^ 0x5EED);
+    let d_model = cfg.slots * cfg.d_head;
+    let mut probes_prev: Vec<Probe> = (0..3).map(|_| Probe::new(cfg.vocab, d_model)).collect();
+    let mut probes_cur: Vec<Probe> = (0..3).map(|_| Probe::new(cfg.vocab, d_model)).collect();
+    let mut probe_previous: std::collections::BTreeMap<u32, u32> = Default::default();
+    let mut readout_linear = Probe::new(cfg.vocab, d_model);
+    let mut oracle = OracleCoder::new(cfg.vocab, Probe::new(cfg.vocab, 1).rate_count());
+    let mut decoded: Vec<u32> = Vec::new();
+    let mut readout_nonlinear =
+        NonlinearProbe::new(cfg.vocab, d_model, d_model, &mut Rng::new(cfg.seed ^ 0x9A_7C_11_05));
     let mut additive = AdditiveCoder::new(cfg.vocab);
     let mut previous_token: Option<u32> = None;
     let mut coders =
@@ -391,7 +668,42 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
                 coder_tail[k] += nats;
             }
         }
-        scored.extend(runtime.advance(Some(token)));
+        for mut s in runtime.advance(Some(token)) {
+            if let Some(reps) = s.reps.take() {
+                let in_tail = s.position as usize * 10 >= cfg.tokens * 9;
+                if let Some(prev) = probe_previous.get(&s.position) {
+                    for (probe, x) in probes_prev.iter_mut().zip([
+                        &reps.ingress,
+                        &reps.after_one_hop,
+                        &reps.assembled,
+                    ]) {
+                        probe.observe(x, *prev, in_tail);
+                    }
+                }
+                for (probe, x) in probes_cur.iter_mut().zip([
+                    &reps.ingress,
+                    &reps.after_one_hop,
+                    &reps.assembled,
+                ]) {
+                    probe.observe(x, s.token, in_tail);
+                }
+                // What any readout of the assembled vector could reach, split
+                // into the part better optimisation would recover and the part
+                // only a different shape can.
+                readout_linear.observe(&reps.assembled, s.target, in_tail);
+                readout_nonlinear.observe(&reps.assembled, s.target, in_tail);
+                if let Some(prev) = probe_previous.get(&s.position) {
+                    decoded.clear();
+                    for r in 0..probes_prev[2].rate_count() {
+                        decoded.push(probes_prev[2].argmax(&reps.assembled, r));
+                    }
+                    oracle.observe(s.token, &decoded, *prev, s.target, in_tail);
+                }
+            }
+            probe_previous.insert(s.position + 1, s.token);
+            probe_previous.remove(&s.position);
+            scored.push(s);
+        }
     }
     let tail_count = (cfg.tokens - cfg.tokens * 9 / 10).max(1) as f64;
     scored.extend(runtime.drain(100_000));
@@ -486,6 +798,41 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         );
     }
     println!();
+
+    if cfg.probe {
+        println!("linear probes, bits to name a token from a representation");
+        println!("  chance is {:.4}; lower means the information is linearly present", (cfg.vocab as f64).ln() * nats_to_bits);
+        println!("  {:<20} {:>12} {:>12}", "representation", "previous", "current");
+        for (i, label) in ["ingress embedding", "after one hop", "assembled"].iter().enumerate() {
+            println!(
+                "  {:<20} {:>12.4} {:>12.4}",
+                label,
+                probes_prev[i].best_tail() / tail_count * nats_to_bits,
+                probes_cur[i].best_tail() / tail_count * nats_to_bits
+            );
+        }
+        println!();
+        println!("readout ceiling on the assembled vector, bits per token");
+        println!("  {:<26} {:>8.4}", "the model itself", window(&scored, 0.9, 1.0, |s| s.loss) * nats_to_bits);
+        println!(
+            "  {:<26} {:>8.4}   <- what the existing linear head could reach",
+            "linear probe",
+            readout_linear.best_tail() / tail_count * nats_to_bits
+        );
+        println!(
+            "  {:<26} {:>8.4}   <- what a nonlinear readout could reach",
+            "one-hidden-layer probe",
+            readout_nonlinear.best_tail() / tail_count * nats_to_bits
+        );
+        let (oracle_tail, accuracy) = oracle.best();
+        println!(
+            "  {:<26} {:>8.4}   <- lookup on (current, previous decoded from it)",
+            "decode-then-look-up",
+            oracle_tail / tail_count * nats_to_bits
+        );
+        println!("  previous token decoded correctly {:.1}% of the time", 100.0 * accuracy);
+        println!();
+    }
 
     let mut visits = runtime.engine().visits().to_vec();
     let total: u64 = visits.iter().sum();

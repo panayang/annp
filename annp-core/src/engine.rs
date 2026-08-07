@@ -114,6 +114,12 @@ pub struct TokenOutput {
     /// cost, and the quantity DESIGN.md §1.6 claims is independent of how far
     /// into the sequence the token sits.
     pub visits: u64,
+    /// `sum_i mass_i * payload_i` over the children created on the token's
+    /// very first tick, laid out like `accumulated`. Diagnostic only: it is
+    /// what the reassembly would have been after exactly one hop, and comparing
+    /// probes on it against probes on `accumulated` localises where context
+    /// enters or is lost.
+    pub after_one_hop: Vec<f64>,
     /// Mass-weighted **circular** sums of the grid coordinates where this
     /// token's mass came to rest, `[x, y]`.
     ///
@@ -261,6 +267,7 @@ impl Engine {
             token,
             TokenOutput {
                 accumulated: vec![0.0; self.params.slots * self.d_head],
+                after_one_hop: vec![0.0; self.params.slots * self.d_head],
                 absorbed_mass: 0.0,
                 hop_mass: 0.0,
                 visits: 0,
@@ -393,10 +400,19 @@ impl Engine {
         };
         let mut surprise_sum = 0.0;
         let side = topology.grid().side();
+        let d_head = self.d_head;
         for g in &groups {
             self.visits[g.node as usize] += g.visits;
             surprise_sum += g.surprise_sum;
             for (target, token, slot, mass, payload) in &g.children {
+                if let Some(out) =
+                    self.outputs.get_mut(token).filter(|o| self.tick == o.injected_tick)
+                {
+                    let lo = *slot as usize * d_head;
+                    for (a, &p) in out.after_one_hop[lo..lo + d_head].iter_mut().zip(payload) {
+                        *a += mass * p;
+                    }
+                }
                 self.next.push(*target, *token, *slot, *mass, payload, self.next_serial);
                 self.next_serial += 1;
                 stats.forwarded_mass += mass;
@@ -535,6 +551,7 @@ mod tests {
         let side = 8usize;
         let mut out = TokenOutput {
             accumulated: vec![0.0; D * SLOTS],
+            after_one_hop: vec![0.0; D * SLOTS],
             absorbed_mass: 0.0,
             hop_mass: 0.0,
             visits: 0,
@@ -564,6 +581,7 @@ mod tests {
         let side = 8usize;
         let mut out = TokenOutput {
             accumulated: vec![0.0; D * SLOTS],
+            after_one_hop: vec![0.0; D * SLOTS],
             absorbed_mass: 0.0,
             hop_mass: 0.0,
             visits: 0,
