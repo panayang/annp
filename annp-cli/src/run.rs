@@ -129,6 +129,10 @@ pub struct Config {
     /// Run the control: score the input embedding instead of the network's
     /// output, everything else identical.
     pub bypass: bool,
+    /// Freeze the topology instead of rewiring long-range contacts.
+    pub frozen_topology: bool,
+    /// Rewire to the first candidate drawn rather than the least-visited.
+    pub blind_turnover: bool,
     /// Admit tokens one per tick regardless of what is in flight. Leaks the
     /// future into earlier predictions; only for measuring by how much.
     pub overlapped: bool,
@@ -185,6 +189,8 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     );
 
     runtime.set_bypass(cfg.bypass);
+    runtime.set_turnover(!cfg.frozen_topology);
+    runtime.set_blind_turnover(cfg.blind_turnover);
     runtime.set_mode(if cfg.overlapped { Mode::Overlapped } else { Mode::Serial });
     runtime.set_adaptive_ingress(!cfg.fixed_ingress);
 
@@ -285,6 +291,13 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         100.0 * visits[decile..].iter().sum::<u64>() as f64 / total as f64
     );
     println!("  busiest single     {:.2}% of all visits", 100.0 * visits[visits.len() - 1] as f64 / total as f64);
+    println!();
+
+    println!("topology");
+    println!(
+        "  {}",
+        if cfg.frozen_topology { "frozen".to_string() } else { format!("{} rewirings", runtime.rewirings()) }
+    );
     println!();
 
     let (known, distinct, mean_move) = runtime.model().ingress().drift();

@@ -159,6 +159,13 @@ pub struct Node {
     /// Most recent payload, the delta rule's key.
     last_input: Vec<f64>,
     has_fired: bool,
+    /// Mass forwarded through each plastic out-edge since the last rewiring.
+    /// Structural bookkeeping only — it plays no part in routing, which is a
+    /// plain content softmax.
+    plastic_usage: Vec<f64>,
+    /// Visits since the last rewiring, and the surprise accumulated over them.
+    turnover_visits: u64,
+    turnover_surprise: f64,
 }
 
 impl Node {
@@ -170,6 +177,7 @@ impl Node {
     /// written here, so a tick's routing cannot depend on processing order.
     pub fn step(&mut self, ctx: &Context<'_>, q: &[f64], scratch: &mut Scratch) -> Outcome {
         let params = ctx.params;
+        let degree = ctx.out_edges.len();
         let d = params.d_head;
         assert_eq!(q.len(), d, "payload width must match d_head");
         debug_assert!((norm(q) - 1.0).abs() < 1e-9, "payloads are unit norm by construction");
@@ -208,6 +216,14 @@ impl Node {
         }
 
         let weights = self.route(ctx, &emitted, surprise, scratch);
+
+        self.turnover_visits += 1;
+        self.turnover_surprise += surprise;
+        let lattice = degree - self.plastic_usage.len();
+        for (used, w) in self.plastic_usage.iter_mut().zip(&weights[lattice..degree]) {
+            *used += w;
+        }
+
         Outcome { emitted, surprise, weights }
     }
 
@@ -318,7 +334,7 @@ impl NodeBank {
         let n = topology.grid().len();
         let d = params.d_head;
         let nodes = (0..n)
-            .map(|_| Node {
+            .map(|i| Node {
                 // One rung means no consolidation at all, matching what
                 // `embed_rungs` already accepts. Without this the node ladder
                 // cannot be ablated, which is how it went unmeasured.
@@ -329,6 +345,9 @@ impl NodeBank {
                 },
                 last_input: vec![0.0; d],
                 has_fired: false,
+                plastic_usage: vec![0.0; topology.plastic_slots(i as u32).len()],
+                turnover_visits: 0,
+                turnover_surprise: 0.0,
             })
             .collect();
         Self {
@@ -391,6 +410,36 @@ impl NodeBank {
         let out = self.nodes[node as usize].step(&ctx, q, &mut scratch);
         self.scratch = scratch;
         out
+    }
+
+    /// Mean surprise a node has seen since its last rewiring, and how many
+    /// visits that covers. `None` before it has fired at all.
+    pub fn turnover_state(&self, node: u32) -> Option<(u64, f64)> {
+        let n = &self.nodes[node as usize];
+        if n.turnover_visits == 0 {
+            None
+        } else {
+            Some((n.turnover_visits, n.turnover_surprise / n.turnover_visits as f64))
+        }
+    }
+
+    /// Plastic slot that carried the least mass since the last rewiring, as an
+    /// index into the node's out-edges. `None` if the node has no plastic edges.
+    pub fn coldest_plastic_slot(&self, node: u32, lattice_degree: usize) -> Option<usize> {
+        let usage = &self.nodes[node as usize].plastic_usage;
+        let (offset, _) = usage
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(b.1).then(a.0.cmp(&b.0)))?;
+        Some(lattice_degree + offset)
+    }
+
+    /// Clears the turnover counters after a rewiring.
+    pub fn reset_turnover(&mut self, node: u32) {
+        let n = &mut self.nodes[node as usize];
+        n.plastic_usage.fill(0.0);
+        n.turnover_visits = 0;
+        n.turnover_surprise = 0.0;
     }
 
     /// Publishes node `i`'s current expectation for the next tick to route

@@ -159,6 +159,15 @@ pub struct Topology {
     grid: Grid,
     start: Vec<u32>,
     target: Vec<u32>,
+    /// Out-edges `0..lattice_degree` of every node are its axis neighbours and
+    /// are **permanent**. §9 established that greedy routing cannot stall
+    /// precisely because those four always offer a strictly closer step;
+    /// rewiring them away would destroy both that guarantee and connectivity.
+    /// Everything past them is a long-range contact and is plastic.
+    lattice_degree: usize,
+    /// Distance CDF used to draw long-range contacts, kept so rewiring samples
+    /// from the same law the graph was built with.
+    distance_cdf: Vec<f64>,
 }
 
 impl Topology {
@@ -182,6 +191,7 @@ impl Topology {
             *c /= acc;
         }
 
+        let lattice_degree = 4;
         let mut start = Vec::with_capacity(n + 1);
         let mut target = Vec::with_capacity(n * (4 + spec.long_range));
         let mut row: Vec<u32> = Vec::with_capacity(4 + spec.long_range);
@@ -213,7 +223,45 @@ impl Topology {
             target.extend_from_slice(&row);
         }
         start.push(target.len() as u32);
-        Self { grid, start, target }
+        Self { grid, start, target, lattice_degree, distance_cdf: cdf }
+    }
+
+    #[inline]
+    pub fn lattice_degree(&self) -> usize {
+        self.lattice_degree
+    }
+
+    /// Slots of `node` that may be rewired: everything past the lattice.
+    #[inline]
+    pub fn plastic_slots(&self, node: u32) -> std::ops::Range<usize> {
+        self.lattice_degree..self.degree(node)
+    }
+
+    /// Draws a candidate target for `node` from the same distance-decaying law
+    /// the graph was built with, rejecting itself and anything it already
+    /// points at.
+    pub fn sample_contact(&self, node: u32, rng: &mut Rng) -> Option<u32> {
+        for _ in 0..64 {
+            let u = rng.next_f64();
+            let d = self.distance_cdf.partition_point(|&c| c < u).min(self.distance_cdf.len() - 1) + 1;
+            let v = self.grid.random_at_distance(node, d, rng);
+            if v != node && !self.out_edges(node).contains(&v) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// Points one plastic slot somewhere else. Degree is unchanged, so the CSR
+    /// needs no reallocation and per-hop compute is exactly constant.
+    pub fn rewire(&mut self, node: u32, slot: usize, new_target: u32) {
+        assert!(
+            self.plastic_slots(node).contains(&slot),
+            "slot {slot} of node {node} is a lattice edge and is not plastic"
+        );
+        assert_ne!(new_target, node, "rewiring would create a self-loop");
+        let base = self.start[node as usize] as usize;
+        self.target[base + slot] = new_target;
     }
 
     #[inline]

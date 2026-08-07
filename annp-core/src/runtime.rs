@@ -95,6 +95,16 @@ pub struct Runtime {
     next_to_score: u32,
     position: u32,
     mode: Mode,
+    /// Whether long-range contacts are rewired as the run proceeds.
+    turnover: bool,
+    /// Take the first candidate drawn instead of the least-visited of several.
+    /// The control that separates "turnover found useful structure" from
+    /// "turnover randomised the graph, which happens to spread load".
+    blind_turnover: bool,
+    /// Its own generator, so enabling turnover does not shift any other stream.
+    turnover_rng: crate::rng::Rng,
+    /// Rewirings applied so far.
+    rewirings: u64,
     /// Score the token's own embedding instead of what came back from the
     /// network, while leaving every other timing identical.
     ///
@@ -141,6 +151,10 @@ impl Runtime {
             next_to_score: 0,
             position: 0,
             mode: Mode::Serial,
+            turnover: true,
+            blind_turnover: false,
+            turnover_rng: crate::rng::Rng::new(0x7C_9E_2B_41_A0_53_D6_18),
+            rewirings: 0,
             bypass: false,
         }
     }
@@ -153,6 +167,66 @@ impl Runtime {
 
     pub fn set_adaptive_ingress(&mut self, adaptive: bool) {
         self.model.set_adaptive_ingress(adaptive);
+    }
+
+    pub fn set_turnover(&mut self, turnover: bool) {
+        self.turnover = turnover;
+    }
+
+    pub fn set_blind_turnover(&mut self, blind: bool) {
+        self.blind_turnover = blind;
+    }
+
+    #[inline]
+    pub fn rewirings(&self) -> u64 {
+        self.rewirings
+    }
+
+    /// Synaptic turnover: every node periodically repoints its least-used
+    /// long-range contact at an under-used part of the grid.
+    ///
+    /// Three things make this fit rather than bolt on. Degree never changes, so
+    /// the CSR needs no reallocation and per-hop compute is exactly constant —
+    /// this reallocates a fixed budget, it does not grow one. New edges need no
+    /// initialisation, because routing has no per-edge parameters left. And the
+    /// target is chosen by *low traffic* rather than low surprise: an unvisited
+    /// node publishes a zero expectation, which under the surprise rule clears
+    /// the reference exactly when the source node is surprised, so a fresh
+    /// contact opens only for the content its source could not place.
+    ///
+    /// The cadence is not a free parameter: a node rewires once it has been
+    /// visited `d_head` times, which is how many patterns its matrix can hold.
+    /// The number of candidates sampled is its own plastic degree.
+    fn turn_over(&mut self) {
+        let lattice = self.topology.lattice_degree();
+        let cadence = self.bank.params().d_head as u64;
+        let nodes = self.bank.len() as u32;
+        for node in 0..nodes {
+            let Some((visits, _)) = self.bank.turnover_state(node) else { continue };
+            if visits < cadence {
+                continue;
+            }
+            let Some(slot) = self.bank.coldest_plastic_slot(node, lattice) else { continue };
+            let candidates =
+                if self.blind_turnover { 1 } else { self.topology.plastic_slots(node).len().max(1) };
+            let mut best: Option<(u32, u64)> = None;
+            for _ in 0..candidates {
+                let Some(v) = self.topology.sample_contact(node, &mut self.turnover_rng) else {
+                    continue;
+                };
+                // Traffic, not surprise: low surprise means a node is already
+                // satisfied, whereas low traffic means it has room.
+                let load = self.engine.visits().get(v as usize).copied().unwrap_or(0);
+                if best.is_none_or(|(_, b)| load < b) {
+                    best = Some((v, load));
+                }
+            }
+            if let Some((v, _)) = best {
+                self.topology.rewire(node, slot, v);
+            }
+            self.bank.reset_turnover(node);
+            self.rewirings += 1;
+        }
     }
 
     pub fn set_mode(&mut self, mode: Mode) {
@@ -196,6 +270,9 @@ impl Runtime {
             self.position += 1;
         }
         self.engine.step(&self.topology, &mut self.bank);
+        if self.turnover {
+            self.turn_over();
+        }
         if self.mode == Mode::Serial {
             // Settle completely before anything else is admitted. The output
             // being scored is then a function of this token and its
@@ -371,6 +448,48 @@ mod tests {
         let (known, _, mean_move) = rt.model().ingress().drift();
         assert_eq!(known, 0, "nothing should be remembered with the readout off");
         assert_eq!(mean_move, 0.0);
+    }
+
+    #[test]
+    fn turnover_preserves_degree_the_lattice_and_connectivity() {
+        // The three invariants the whole scheme rests on. Degree fixed means
+        // per-hop compute is exactly constant; the lattice intact means §9's
+        // no-stall guarantee survives; reachable means we have not quietly
+        // partitioned the graph, which is the failure this project has hit
+        // before.
+        let mut rt = build(32, 41);
+        let before: Vec<usize> =
+            (0..rt.topology().grid().len() as u32).map(|n| rt.topology().degree(n)).collect();
+        let stream: Vec<u32> = (0..1_500).map(|i| (i * 7 % 32) as u32).collect();
+        feed(&mut rt, &stream);
+        assert!(rt.rewirings() > 0, "no rewiring happened at all");
+
+        let t = rt.topology();
+        for node in 0..t.grid().len() as u32 {
+            assert_eq!(t.degree(node), before[node as usize], "degree changed at {node}");
+            let lattice = t.grid().axis_neighbours(node);
+            assert_eq!(&t.out_edges(node)[..4], &lattice, "lattice edge rewired at {node}");
+            assert!(!t.out_edges(node).contains(&node), "self-loop at {node}");
+            let mut seen = t.out_edges(node).to_vec();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), t.degree(node), "duplicate edge at {node}");
+        }
+        assert_eq!(t.reachable_count(0), t.grid().len(), "turnover partitioned the graph");
+    }
+
+    #[test]
+    fn turnover_can_be_switched_off() {
+        let mut rt = build(32, 41);
+        rt.set_turnover(false);
+        let before: Vec<u32> =
+            (0..rt.topology().grid().len() as u32).flat_map(|n| rt.topology().out_edges(n).to_vec()).collect();
+        let stream: Vec<u32> = (0..1_000).map(|i| (i * 7 % 32) as u32).collect();
+        feed(&mut rt, &stream);
+        let after: Vec<u32> =
+            (0..rt.topology().grid().len() as u32).flat_map(|n| rt.topology().out_edges(n).to_vec()).collect();
+        assert_eq!(before, after);
+        assert_eq!(rt.rewirings(), 0);
     }
 
     #[test]
