@@ -111,6 +111,11 @@ enum Command {
         /// output, with everything else identical.
         #[arg(long, default_value_t = false)]
         bypass: bool,
+        /// Admit one token per tick regardless of what is still in flight.
+        /// Leaks future tokens into earlier predictions; the difference against
+        /// the default serial protocol is the size of that leak.
+        #[arg(long, default_value_t = false)]
+        overlapped: bool,
         #[arg(long, default_value = "results/run")]
         out: PathBuf,
     },
@@ -190,6 +195,7 @@ fn main() -> std::io::Result<()> {
             ladder_ratio,
             seed,
             bypass,
+            overlapped,
             out,
         } => {
             let cfg = run::Config {
@@ -210,6 +216,7 @@ fn main() -> std::io::Result<()> {
                 ladder_ratio,
                 seed,
                 bypass,
+                overlapped,
             };
             run::run(&cfg, &out)
         }

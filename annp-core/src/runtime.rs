@@ -13,10 +13,32 @@
 //! because an architecture with no separation between training and running has
 //! nothing else it could honestly report.
 //!
-//! Tokens overlap. One is injected per tick while earlier ones are still in
-//! flight, so a node's matrix sees fragments of several tokens interleaved and
-//! the arrival order it learns from is the real one. Causality comes from that
-//! order and from nothing else.
+//! **Serialisation is not optional.** Node state is a shared mutable resource:
+//! whichever particles land on a node write to its matrix, regardless of which
+//! token they belong to. If token `p + 3` is injected while `p` is still in
+//! flight, `p`'s output can be transformed by a matrix `p + 3` has already
+//! written to, so the loss for predicting `p + 1` depends on `p + 3`. That is
+//! not bidirectionality, it is reading the answer, and it destroys the
+//! compression bound. `Mode::Serial` injects one token, lets it settle, scores
+//! it, and only then injects the next.
+//!
+//! `Mode::Overlapped` keeps the old behaviour, not because it is defensible but
+//! because the difference between the two *is* the size of the leak, and that
+//! number has to be reported.
+//!
+//! What stays genuinely unordered is the fragment level: a token's `P`
+//! particles diffuse concurrently, arrive in whatever order the routing
+//! produces, and the node state they build imposes no order among them. Token
+//! boundaries are ordered because the prediction task defines them that way —
+//! asking "what follows `p`" is already an assertion that `p` precedes it.
+//!
+//! The arrival order itself is free. Any permutation gives a valid code length,
+//! since the model predicts whatever is next *in arrival order*. Left-to-right
+//! is the order that makes text predictable and a causal Transformer
+//! comparable; an order that walks in from both ends and stops at `q` lets the
+//! model condition on both sides of `q`, which a causal Transformer cannot do
+//! at all. A uniformly random order is equally valid and equally useless — it
+//! makes the next arrival unpredictable for any model, ours included.
 
 use std::collections::BTreeMap;
 
@@ -24,6 +46,18 @@ use crate::engine::{Engine, EngineParams};
 use crate::graph::Topology;
 use crate::model::{Model, ModelParams};
 use crate::node::{NodeBank, NodeParams};
+
+/// How tokens are admitted relative to each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// One token in flight at a time. The only mode whose loss is a valid
+    /// compression bound.
+    Serial,
+    /// One token injected per tick regardless of what is still in flight.
+    /// Leaks future tokens into earlier predictions; kept only to measure by
+    /// how much.
+    Overlapped,
+}
 
 /// One token, after its particles have all come home.
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +90,7 @@ pub struct Runtime {
     /// The next position that may be scored. Scoring is strictly in order.
     next_to_score: u32,
     position: u32,
+    mode: Mode,
     /// Score the token's own embedding instead of what came back from the
     /// network, while leaving every other timing identical.
     ///
@@ -101,6 +136,7 @@ impl Runtime {
             ready: BTreeMap::new(),
             next_to_score: 0,
             position: 0,
+            mode: Mode::Serial,
             bypass: false,
         }
     }
@@ -109,6 +145,15 @@ impl Runtime {
     /// other part of the loop — routing, plasticity, update timing — unchanged.
     pub fn set_bypass(&mut self, bypass: bool) {
         self.bypass = bypass;
+    }
+
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+    }
+
+    #[inline]
+    pub fn mode(&self) -> Mode {
+        self.mode
     }
 
     #[inline]
@@ -143,6 +188,17 @@ impl Runtime {
             self.position += 1;
         }
         self.engine.step(&self.topology, &mut self.bank);
+        if self.mode == Mode::Serial {
+            // Settle completely before anything else is admitted. The output
+            // being scored is then a function of this token and its
+            // predecessors only.
+            let mut ticks = 0u64;
+            while self.live_particles() > 0 {
+                self.engine.step(&self.topology, &mut self.bank);
+                ticks += 1;
+                assert!(ticks < 100_000, "a single token failed to settle");
+            }
+        }
         self.collect()
     }
 
@@ -284,10 +340,23 @@ mod tests {
     }
 
     #[test]
-    fn tokens_overlap_in_flight() {
-        // If they did not, nothing would interleave at a node and arrival order
-        // would carry no cross-token information at all.
+    fn serial_mode_leaves_nothing_in_flight_between_tokens() {
+        // The property the compression bound rests on: when a token is scored,
+        // no later token has touched any node it visited, because no later
+        // token exists yet.
         let mut rt = build(32, 3);
+        assert_eq!(rt.mode(), Mode::Serial, "serial is the default");
+        for i in 0..60u32 {
+            rt.advance(Some(i % 32));
+            assert_eq!(rt.live_particles(), 0, "token {i} was still in flight");
+        }
+    }
+
+    #[test]
+    fn overlapped_mode_really_does_overlap() {
+        // Kept so the leak has something to be measured against.
+        let mut rt = build(32, 3);
+        rt.set_mode(Mode::Overlapped);
         let mut overlapped = false;
         for i in 0..60u32 {
             rt.advance(Some(i % 32));
@@ -295,7 +364,7 @@ mod tests {
                 overlapped = true;
             }
         }
-        assert!(overlapped, "only one token was ever in flight");
+        assert!(overlapped, "overlapped mode kept only one token in flight");
         rt.drain(10_000);
     }
 

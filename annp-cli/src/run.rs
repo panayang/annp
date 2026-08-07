@@ -27,7 +27,7 @@ use annp_core::ladder::Schedule;
 use annp_core::model::ModelParams;
 use annp_core::node::NodeParams;
 use annp_core::rng::Rng;
-use annp_core::runtime::{Runtime, Scored};
+use annp_core::runtime::{Mode, Runtime, Scored};
 
 /// A fixed random Markov chain, sparse enough to have a low entropy rate.
 ///
@@ -131,6 +131,9 @@ pub struct Config {
     /// Run the control: score the input embedding instead of the network's
     /// output, everything else identical.
     pub bypass: bool,
+    /// Admit tokens one per tick regardless of what is in flight. Leaks the
+    /// future into earlier predictions; only for measuring by how much.
+    pub overlapped: bool,
 }
 
 fn mean(xs: &[f64]) -> f64 {
@@ -178,6 +181,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     );
 
     runtime.set_bypass(cfg.bypass);
+    runtime.set_mode(if cfg.overlapped { Mode::Overlapped } else { Mode::Serial });
 
     let mut source = MarkovSource::new(cfg.vocab, cfg.fanout, &mut rng);
     let entropy_rate = source.entropy_rate();
@@ -196,7 +200,12 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let nats_to_bits = 1.0 / std::f64::consts::LN_2;
 
     println!("run — synthetic Markov source, {} tokens{}", scored.len(),
-        if cfg.bypass { "  [BYPASS: network output discarded]" } else { "" });
+        if cfg.bypass { "  [BYPASS]" } else { "" });
+    println!("  protocol: {}", if cfg.overlapped {
+        "OVERLAPPED — leaks future tokens, loss is NOT a compression bound"
+    } else {
+        "serial — one token in flight, loss is a valid compression bound"
+    });
     println!(
         "  vocab={} fanout={} d_head={} slots={} grid={}x{} deg={} top_k={} floor={}",
         cfg.vocab,
