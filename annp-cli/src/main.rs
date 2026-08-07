@@ -5,6 +5,7 @@
 //! so any result in the paper can be regenerated from one line.
 
 mod e0;
+mod topology;
 
 use std::path::PathBuf;
 
@@ -67,6 +68,26 @@ enum Command {
         #[arg(long, default_value = "results/e0")]
         out: PathBuf,
     },
+    /// Topology bench — does the long-range exponent follow the lattice
+    /// dimension, as DESIGN.md §1.9 claims, or was 2 just asserted?
+    Topology {
+        /// Grid sides to sweep; the scaling fit needs at least three.
+        #[arg(long, value_delimiter = ',', default_value = "32,48,64,96,128")]
+        sides: Vec<usize>,
+        /// Long-range exponents to compare against Kleinberg's formulas.
+        #[arg(long, value_delimiter = ',', default_value = "0,1,1.5,2,2.5,3,4")]
+        exponents: Vec<f64>,
+        /// Contact counts to compare at the critical exponent.
+        #[arg(long, value_delimiter = ',', default_value = "1,2,4,8")]
+        contacts: Vec<usize>,
+        /// Random source/target pairs routed per configuration.
+        #[arg(long, default_value_t = 4_000)]
+        pairs: u64,
+        #[arg(long, default_value_t = 20_260_807)]
+        seed: u64,
+        #[arg(long, default_value = "results/topology")]
+        out: PathBuf,
+    },
 }
 
 fn main() -> std::io::Result<()> {
@@ -104,6 +125,11 @@ fn main() -> std::io::Result<()> {
                 g1_geometric,
             };
             e0::run(&cfg, &out)
+        }
+        Command::Topology { sides, exponents, contacts, pairs, seed, out } => {
+            assert!(sides.len() >= 3, "the hops ~ N^beta fit needs at least three grid sizes");
+            let cfg = topology::Config { sides, exponents, contacts, pairs, seed };
+            topology::run(&cfg, &out)
         }
     }
 }

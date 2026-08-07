@@ -14,6 +14,9 @@ dependencies = [
 [[package]]
 name = "annp-core"
 version = "0.1.0"
+dependencies = [
+ "rayon",
+]
 
 [[package]]
 name = "anstream"
