@@ -33,10 +33,18 @@
 //!    nowhere is expecting this content every edge scores at or below the
 //!    reference and the particle is absorbed. Halting needs no threshold.
 //!
-//! Homeostasis stays: a zero-sum redistribution across a node's out-edges, so
-//! it can move mass between neighbours but can never shift the overall
-//! absorption rate. That is the property that lets it prevent routing collapse
-//! without also being a knob on the compute budget.
+//! Homeostasis stays: a zero-sum redistribution across a node's out-edges.
+//!
+//! An earlier version of this comment claimed that being zero-sum meant it
+//! "can never shift the absorption rate". **That is false.** The bias is added
+//! to logits that then compete through a *top-k truncation* against a fixed
+//! absorb reference, and a zero-sum shift can push an edge below the reference
+//! and let absorb into the retained set. Three edges at logits
+//! `(0.5, 0.5, -1.0)` with `top_k = 2` absorb nothing; add the zero-sum bias
+//! `(-0.6, +0.6, 0.0)` and absorb takes 25%. Biases are unbounded and every
+//! losing edge accrues bias every tick, so this is an ordinary state, not a
+//! contrived one. Collapse prevention and the compute budget are therefore
+//! **not** decoupled, and nothing currently bounds the coupling.
 
 use crate::graph::Topology;
 use crate::ladder::{AssocMemory, Schedule};

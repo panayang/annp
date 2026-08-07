@@ -104,7 +104,11 @@ pub struct TokenOutput {
     /// `sum_i mass_i * payload_i`, laid out slot-major.
     pub accumulated: Vec<f64>,
     pub absorbed_mass: f64,
-    /// Mass-weighted hop count, for the compute-budget measurement.
+    /// Mass-weighted **visit** count. Note the units: a fragment absorbed at
+    /// its ingress node without crossing a single edge counts as 1, so this is
+    /// edge traversals **plus one**, and is not directly comparable with
+    /// `Topology::greedy_hops`, which counts edges and returns 0 for a
+    /// zero-length route.
     pub hop_mass: f64,
     /// Node visits charged to this token. This is the compute it actually
     /// cost, and the quantity DESIGN.md §1.6 claims is independent of how far
@@ -114,7 +118,8 @@ pub struct TokenOutput {
 }
 
 impl TokenOutput {
-    /// Mass-weighted mean number of hops before absorption.
+    /// Mass-weighted mean number of node visits before absorption. Subtract
+    /// one to compare against an edge-counting figure.
     pub fn mean_hops(&self) -> f64 {
         if self.absorbed_mass > 0.0 { self.hop_mass / self.absorbed_mass } else { 0.0 }
     }
