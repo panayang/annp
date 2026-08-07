@@ -35,10 +35,19 @@
 //! Its failure mode is collapse (everything migrating to one region), which
 //! routing homeostasis does not guard against, so `Ingress::drift` reports it.
 //!
-//! **The output head is tied to the embedding table.** Not to save parameters:
-//! it is what gives the table a learning signal without a gradient crossing the
-//! graph. The table is read on the way in and is the only thing differentiated
-//! on the way out.
+//! **The output head may be tied to the embedding table or separate.** Tying
+//! was chosen so the table gets a learning signal without a gradient crossing
+//! the graph, but it imposes a structural limit that took a while to notice:
+//! with `logit_v(u) = <E_v, E_u>` the score matrix is `E E^T`, which is
+//! symmetric and positive semi-definite. A Markov transition matrix is neither.
+//! Symmetry forces `P(v|u)/P(u|v)` to factorise as `f(v)/f(u)`, and positive
+//! semi-definiteness makes the diagonal dominate, permanently biasing the model
+//! toward predicting the token it was just shown. A tied bypass therefore
+//! *cannot* represent a bigram model, however much data it sees.
+//!
+//! Untied, the input embedding stays at its random initialisation — a perfectly
+//! good fixed code — and the head is an unconstrained linear map, so any logit
+//! matrix is reachable. `ModelParams::tied` selects between them.
 
 use crate::graph::Grid;
 use crate::ladder::{AssocMemory, Schedule};
@@ -255,6 +264,8 @@ pub struct ModelParams {
     /// reference point for what consolidation costs the output head.
     pub embed_rungs: usize,
     pub learning_rate: f64,
+    /// Whether the output head is the embedding table itself.
+    pub tied: bool,
 }
 
 impl ModelParams {
@@ -274,8 +285,11 @@ pub struct Shattered {
 
 pub struct Model {
     params: ModelParams,
-    /// `vocab x d_model`, tied: read for input, differentiated for output.
+    /// `vocab x d_model`, read for input. Also the output head when tied, in
+    /// which case it is the only thing differentiated.
     embedding: AssocMemory,
+    /// Separate output head when untied; `None` when tied.
+    head: Option<AssocMemory>,
     rotation: Rotation,
     ingress: Ingress,
     embed_buf: Vec<f64>,
@@ -300,11 +314,20 @@ impl Model {
             (0..params.vocab * d_model).map(|_| rng.next_normal() * sigma).collect();
         embedding.initialise(&init);
 
+        let head = (!params.tied).then(|| {
+            if params.embed_rungs <= 1 {
+                AssocMemory::single_rect(params.vocab, d_model, 1.0)
+            } else {
+                AssocMemory::ladder_rect(params.vocab, d_model, params.schedule, params.embed_rungs)
+            }
+        });
+
         let rotation = Rotation::new(d_model, rng);
         let ingress = Ingress::new(params.grid_side, d_model, params.slots, params.vocab, rng);
         Self {
             params,
             embedding,
+            head,
             rotation,
             ingress,
             embed_buf: vec![0.0; d_model],
@@ -399,9 +422,10 @@ impl Model {
         // error signal in place.
         self.logit_buf[target as usize] -= 1.0;
         let grad = std::mem::take(&mut self.logit_buf);
-        self.embedding.inject(&grad, assembled, -self.params.learning_rate);
+        let head = self.head.as_mut().unwrap_or(&mut self.embedding);
+        head.inject(&grad, assembled, -self.params.learning_rate);
+        head.relax();
         self.logit_buf = grad;
-        self.embedding.relax();
         loss
     }
 
@@ -411,7 +435,8 @@ impl Model {
         assert_eq!(assembled.len(), self.params.d_model(), "assembled width mismatch");
         assert!((target as usize) < self.params.vocab, "target out of vocabulary");
         let mut logits = std::mem::take(&mut self.logit_buf);
-        self.embedding.read().mul_vec(assembled, &mut logits);
+        let head = self.head.as_ref().unwrap_or(&self.embedding);
+        head.read().mul_vec(assembled, &mut logits);
 
         let max = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let mut total = 0.0;
@@ -447,6 +472,7 @@ mod tests {
             schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
             embed_rungs: 4,
             learning_rate: 0.05,
+            tied: true,
         }
     }
 
@@ -570,6 +596,50 @@ mod tests {
                 assert!(grid.distance(a, b) <= 8, "slots scattered across the grid");
             }
         }
+    }
+
+    #[test]
+    fn a_tied_head_cannot_express_an_asymmetric_bigram() {
+        // The structural limit, stated as a test rather than an argument. With
+        // ê(u) = E_u the score matrix is E E^T, so the unnormalised scores obey
+        // logit_v(u) == logit_u(v) exactly. No amount of training moves that,
+        // and a Markov transition matrix is not symmetric.
+        let mut rng = Rng::new(77);
+        let mut model = Model::new(params(), &mut rng);
+        for _ in 0..500 {
+            let e = model.embedding_of(3).to_vec();
+            model.learn(&e, 9);
+        }
+        let d_model = model.params().d_model();
+        let score = |u: u32, v: u32| {
+            let (a, b) = (model.embedding_of(u), model.embedding_of(v));
+            (0..d_model).map(|i| a[i] * b[i]).sum::<f64>()
+        };
+        assert!(
+            (score(3, 9) - score(9, 3)).abs() < 1e-12,
+            "tied scores must be symmetric however they were trained"
+        );
+
+        // Untied, the same training breaks the symmetry.
+        let mut p = params();
+        p.tied = false;
+        let mut untied = Model::new(p, &mut Rng::new(77));
+        for _ in 0..500 {
+            let e = untied.embedding_of(3).to_vec();
+            untied.learn(&e, 9);
+        }
+        // The untied head's score matrix is head * E^T, with no reason to be
+        // symmetric: the score it gives 9 after seeing 3 is the one that was
+        // trained, and the reverse was not.
+        let head = untied.head.as_ref().expect("untied").read().clone();
+        let raw = |u: u32, v: u32| {
+            let e = untied.embedding_of(u);
+            (0..d_model).map(|i| head.get(v as usize, i) * e[i]).sum::<f64>()
+        };
+        assert!(
+            (raw(3, 9) - raw(9, 3)).abs() > 1e-6,
+            "an untied head should not be forced into symmetry"
+        );
     }
 
     #[test]

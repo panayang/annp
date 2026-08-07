@@ -110,6 +110,37 @@ impl MarkovSource {
     }
 }
 
+/// Prequential bigram coder: predict the next token from counts of what has
+/// followed the current one so far, then update.
+///
+/// The absolute yardstick every other number in this bench needs. It is the
+/// dumbest thing that models this source at all, it is online and single-pass
+/// exactly like everything else here, and its code length is valid for the
+/// same reason. Krichevsky-Trofimov smoothing (add one half) so an unseen
+/// transition is merely improbable rather than impossible.
+struct BigramCoder {
+    vocab: usize,
+    counts: Vec<f64>,
+    totals: Vec<f64>,
+}
+
+impl BigramCoder {
+    fn new(vocab: usize) -> Self {
+        Self { vocab, counts: vec![0.0; vocab * vocab], totals: vec![0.0; vocab] }
+    }
+
+    /// Nats charged for coding `next` given `current`, before updating.
+    fn observe(&mut self, current: u32, next: u32) -> f64 {
+        let (c, n) = (current as usize, next as usize);
+        let alpha = 0.5;
+        let p = (self.counts[c * self.vocab + n] + alpha)
+            / (self.totals[c] + alpha * self.vocab as f64);
+        self.counts[c * self.vocab + n] += 1.0;
+        self.totals[c] += 1.0;
+        -p.ln()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub tokens: usize,
@@ -133,6 +164,9 @@ pub struct Config {
     pub frozen_topology: bool,
     /// Rewire to the first candidate drawn rather than the least-visited.
     pub blind_turnover: bool,
+    /// Give the output head its own weights instead of reusing the embedding
+    /// table. Removes the symmetry the tied head imposes.
+    pub untied: bool,
     /// Admit tokens one per tick regardless of what is in flight. Leaks the
     /// future into earlier predictions; only for measuring by how much.
     pub overlapped: bool,
@@ -176,6 +210,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             schedule,
             embed_rungs: cfg.embed_rungs,
             learning_rate: cfg.learning_rate,
+            tied: !cfg.untied,
         },
         NodeParams {
             absorb: cfg.absorb,
@@ -206,10 +241,23 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let started = std::time::Instant::now();
     let mut scored: Vec<Scored> = Vec::with_capacity(cfg.tokens);
     let mut stream_rng = Rng::new(cfg.seed ^ 0x5EED);
-    for _ in 0..cfg.tokens {
+    let mut bigram = BigramCoder::new(cfg.vocab);
+    let mut bigram_nats = 0.0;
+    let mut bigram_tail = 0.0;
+    let mut previous: Option<u32> = None;
+    for i in 0..cfg.tokens {
         let token = source.next(&mut stream_rng);
+        if let Some(prev) = previous {
+            let nats = bigram.observe(prev, token);
+            bigram_nats += nats;
+            if i * 10 >= cfg.tokens * 9 {
+                bigram_tail += nats;
+            }
+        }
+        previous = Some(token);
         scored.extend(runtime.advance(Some(token)));
     }
+    let bigram_tail_count = (cfg.tokens - cfg.tokens * 9 / 10).max(1) as f64;
     scored.extend(runtime.drain(100_000));
     let elapsed = started.elapsed();
 
@@ -258,9 +306,18 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             window(&scored, from, to, |s| s.loss) * nats_to_bits
         );
     }
+    println!(
+        "  {:<26} {:>8.4}",
+        "prequential bigram",
+        bigram_tail / bigram_tail_count * nats_to_bits
+    );
     println!("  {:<26} {:>8.4}", "source entropy rate", entropy_rate * nats_to_bits);
-    println!("  prequential total: {:.1} bits over {} tokens",
-        scored.iter().map(|s| s.loss).sum::<f64>() * nats_to_bits, scored.len());
+    println!(
+        "  prequential total: {:.1} bits over {} tokens   (bigram coder: {:.1})",
+        scored.iter().map(|s| s.loss).sum::<f64>() * nats_to_bits,
+        scored.len(),
+        bigram_nats * nats_to_bits
+    );
     println!();
 
     println!("compute per token (DESIGN.md §1.6: must not grow with position)");

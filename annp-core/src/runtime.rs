@@ -389,6 +389,7 @@ mod tests {
                 schedule,
                 embed_rungs: 3,
                 learning_rate: 0.05,
+                tied: true,
             },
             NodeParams {
                 absorb: AbsorbRule::RelativeSurprise,

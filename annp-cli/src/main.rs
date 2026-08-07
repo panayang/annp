@@ -137,6 +137,11 @@ enum Command {
         /// several. Separates found structure from mere randomisation.
         #[arg(long, default_value_t = false)]
         blind_turnover: bool,
+        /// Give the output head its own weights. A tied head's scores are
+        /// E E^T, which is symmetric and PSD and cannot express an asymmetric
+        /// bigram at all.
+        #[arg(long, default_value_t = false)]
+        untied: bool,
         /// Admit one token per tick regardless of what is still in flight.
         /// Leaks future tokens into earlier predictions; the difference against
         /// the default serial protocol is the size of that leak.
@@ -229,6 +234,7 @@ fn main() -> std::io::Result<()> {
             bypass,
             frozen_topology,
             blind_turnover,
+            untied,
             overlapped,
             adaptive_ingress,
             absorb,
@@ -252,6 +258,7 @@ fn main() -> std::io::Result<()> {
                 bypass,
                 frozen_topology,
                 blind_turnover,
+                untied,
                 overlapped,
                 fixed_ingress: !adaptive_ingress,
                 absorb: absorb.into(),
