@@ -74,6 +74,10 @@ pub struct Scored {
     pub visits: u64,
     pub mean_hops: f64,
     pub absorbed_mass: f64,
+    /// How far this token's ingress anchor moved when its resting place was
+    /// recorded. A map that is forming has this decaying; one that is merely
+    /// jittering does not.
+    pub anchor_move: usize,
 }
 
 pub struct Runtime {
@@ -145,6 +149,10 @@ impl Runtime {
     /// other part of the loop — routing, plasticity, update timing — unchanged.
     pub fn set_bypass(&mut self, bypass: bool) {
         self.bypass = bypass;
+    }
+
+    pub fn set_adaptive_ingress(&mut self, adaptive: bool) {
+        self.model.set_adaptive_ingress(adaptive);
     }
 
     pub fn set_mode(&mut self, mode: Mode) {
@@ -252,6 +260,14 @@ impl Runtime {
             };
             let loss = self.model.learn(&assembled, target);
 
+            // The anchor is a readout of the dynamics, not a second learner:
+            // this token next enters wherever its own mass just came to rest.
+            let side = self.topology.grid().side();
+            let anchor_move = match output.resting_place(side) {
+                Some(resting) => self.model.observe_resting_place(token, resting),
+                None => 0,
+            };
+
             scored.push(Scored {
                 position,
                 token,
@@ -261,6 +277,7 @@ impl Runtime {
                 visits: output.visits,
                 mean_hops: output.mean_hops(),
                 absorbed_mass: output.absorbed_mass,
+                anchor_move,
             });
             self.next_to_score += 1;
         }
@@ -323,6 +340,30 @@ mod tests {
             assert_eq!(s.token, stream[i]);
             assert_eq!(s.target, stream[i + 1]);
         }
+    }
+
+    #[test]
+    fn anchors_move_without_collapsing() {
+        // The readout's failure mode is every token migrating to one region;
+        // routing homeostasis does not guard against it, so it is checked here.
+        let mut rt = build(32, 11);
+        let stream: Vec<u32> = (0..400).map(|i| (i * 7 % 32) as u32).collect();
+        feed(&mut rt, &stream);
+        let (known, distinct, mean_move) = rt.model().ingress().drift();
+        assert_eq!(known, 32, "every token should have come to rest somewhere");
+        assert!(distinct >= 8, "anchors collapsed onto {distinct} cells");
+        assert!(mean_move.is_finite());
+    }
+
+    #[test]
+    fn fixed_ingress_anchors_never_move() {
+        let mut rt = build(32, 11);
+        rt.set_adaptive_ingress(false);
+        let stream: Vec<u32> = (0..200).map(|i| (i * 7 % 32) as u32).collect();
+        feed(&mut rt, &stream);
+        let (known, _, mean_move) = rt.model().ingress().drift();
+        assert_eq!(known, 0, "nothing should be remembered with the readout off");
+        assert_eq!(mean_move, 0.0);
     }
 
     #[test]

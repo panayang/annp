@@ -21,9 +21,19 @@
 //! **Ingress is content-addressed, and that is the point.** Uniform ingress is
 //! the maximum-entropy input distribution: no topographic map can form, related
 //! memories end up on unrelated nodes, and particles have to travel to meet.
-//! Here a token's grid position is the phase of its embedding in two fixed
-//! random planes, so similar tokens start near each other. Phases rather than
-//! projections because a phase is scale-free and needs no normalising constant.
+//!
+//! The seed position is the phase of the embedding in two fixed random planes
+//! — scale-free, so no normalising constant. But a *random* projection of
+//! `d_model` onto two angles preserves almost no structure, so on its own that
+//! story is aspirational: the map exists but means nothing.
+//!
+//! So the anchor is **remembered rather than learned**: a token next enters
+//! where its own mass last came to rest. That is a fixed-point iteration on
+//! the dynamics that already exist, not a second learning rule — no rate to
+//! choose, and structurally nothing to resonate with the adaptive topology of
+//! §1.9, because it is a readout rather than an independent dynamical system.
+//! Its failure mode is collapse (everything migrating to one region), which
+//! routing homeostasis does not guard against, so `Ingress::drift` reports it.
 //!
 //! **The output head is tied to the embedding table.** Not to save parameters:
 //! it is what gives the table a learning signal without a gradient crossing the
@@ -109,10 +119,18 @@ pub struct Ingress {
     /// follows from wanting the slots of one token to tile a local patch rather
     /// than pile onto a single node or scatter across the whole grid.
     offsets: Vec<(u32, u32)>,
+    /// Where each token's mass last came to rest, once it has been observed.
+    remembered: Vec<Option<(usize, usize)>>,
+    /// How far anchors have travelled in total, and over how many moves. Rising
+    /// distinct-anchor counts with bounded drift is a map forming; drift that
+    /// never settles, or a collapsing anchor count, is the failure mode.
+    moves: u64,
+    travelled: u64,
+    adaptive: bool,
 }
 
 impl Ingress {
-    pub fn new(side: usize, d_model: usize, slots: usize, rng: &mut Rng) -> Self {
+    pub fn new(side: usize, d_model: usize, slots: usize, vocab: usize, rng: &mut Rng) -> Self {
         let mut planes: [Vec<f64>; 4] = std::array::from_fn(|_| vec![0.0; d_model]);
         for i in 0..4 {
             rng.fill_unit_vector(&mut planes[i]);
@@ -152,11 +170,60 @@ impl Ingress {
                 assert!(tries < 10_000, "cannot place {slots} slots on a side-{side} grid");
             }
         }
-        Self { side, planes, offsets }
+        Self {
+            side,
+            planes,
+            offsets,
+            remembered: vec![None; vocab],
+            moves: 0,
+            travelled: 0,
+            adaptive: true,
+        }
+    }
+
+    /// Turns the readout off, pinning every token to its phase position. The
+    /// control for whether remembering the resting place buys anything.
+    pub fn set_adaptive(&mut self, adaptive: bool) {
+        self.adaptive = adaptive;
+    }
+
+    /// Records where a token's mass came to rest. Returns how far its anchor
+    /// moved on the torus.
+    pub fn observe(&mut self, token: u32, resting: (usize, usize), embedding: &[f64]) -> usize {
+        if !self.adaptive {
+            return 0;
+        }
+        let previous = self.anchor(token, embedding);
+        let gap = |a: usize, b: usize| {
+            let d = (a + self.side - b) % self.side;
+            d.min(self.side - d)
+        };
+        let moved = gap(resting.0, previous.0) + gap(resting.1, previous.1);
+        self.remembered[token as usize] = Some(resting);
+        self.moves += 1;
+        self.travelled += moved as u64;
+        moved
+    }
+
+    /// `(tokens with a remembered anchor, distinct cells occupied, mean move)`.
+    pub fn drift(&self) -> (usize, usize, f64) {
+        let known: Vec<(usize, usize)> = self.remembered.iter().flatten().copied().collect();
+        let distinct: std::collections::HashSet<(usize, usize)> = known.iter().copied().collect();
+        let mean = if self.moves > 0 { self.travelled as f64 / self.moves as f64 } else { 0.0 };
+        (known.len(), distinct.len(), mean)
+    }
+
+    /// Where this token enters: its remembered resting place if it has one,
+    /// otherwise the phase of its embedding.
+    pub fn anchor(&self, token: u32, embedding: &[f64]) -> (usize, usize) {
+        match self.remembered[token as usize] {
+            Some(a) => a,
+            None => self.phase_anchor(embedding),
+        }
     }
 
     /// Torus coordinate of an embedding, as the phase in each fixed plane.
-    fn anchor(&self, embedding: &[f64]) -> (usize, usize) {
+    fn phase_anchor(&self, embedding: &[f64]) -> (usize, usize) {
         let phase = |a: &[f64], b: &[f64]| {
             let angle = crate::linalg::dot(embedding, a).atan2(crate::linalg::dot(embedding, b));
             // atan2 is in (-pi, pi]; shift to [0, 1) then onto the ring.
@@ -167,8 +234,8 @@ impl Ingress {
     }
 
     /// Entry node for one slot of a token with this embedding.
-    pub fn node_for(&self, grid: &Grid, embedding: &[f64], slot: usize) -> u32 {
-        let (x, y) = self.anchor(embedding);
+    pub fn node_for(&self, grid: &Grid, token: u32, embedding: &[f64], slot: usize) -> u32 {
+        let (x, y) = self.anchor(token, embedding);
         let (dx, dy) = self.offsets[slot];
         grid.index((x + dx as usize) % self.side, (y + dy as usize) % self.side)
     }
@@ -234,7 +301,7 @@ impl Model {
         embedding.initialise(&init);
 
         let rotation = Rotation::new(d_model, rng);
-        let ingress = Ingress::new(params.grid_side, d_model, params.slots, rng);
+        let ingress = Ingress::new(params.grid_side, d_model, params.slots, params.vocab, rng);
         Self {
             params,
             embedding,
@@ -248,6 +315,24 @@ impl Model {
     #[inline]
     pub fn params(&self) -> &ModelParams {
         &self.params
+    }
+
+    #[inline]
+    pub fn ingress(&self) -> &Ingress {
+        &self.ingress
+    }
+
+    pub fn set_adaptive_ingress(&mut self, adaptive: bool) {
+        self.ingress.set_adaptive(adaptive);
+    }
+
+    /// Remembers where a token's mass came to rest, for its next entry.
+    /// Returns how far that moved its anchor on the torus.
+    pub fn observe_resting_place(&mut self, token: u32, resting: (usize, usize)) -> usize {
+        let d = self.params.d_model();
+        let lo = token as usize * d;
+        let embedding = self.embedding.read().as_slice()[lo..lo + d].to_vec();
+        self.ingress.observe(token, resting, &embedding)
     }
 
     /// Row `token` of the tied embedding table.
@@ -286,7 +371,7 @@ impl Model {
                     v[0] = 1.0;
                     v
                 };
-                let node = self.ingress.node_for(grid, &anchor_source, s);
+                let node = self.ingress.node_for(grid, token, &anchor_source, s);
                 (node, s as u16, mag / scale, payload)
             })
             .collect();
@@ -457,12 +542,12 @@ mod tests {
         let mut near = base.clone();
         near[0] += 1e-4;
         let far = model.embedding_of(30).to_vec();
-        let node_of = |v: &[f64]| model.ingress.node_for(&grid, v, 0);
-        assert_eq!(node_of(&base), node_of(&near), "a tiny change moved the ingress node");
+        let node_of = |t: u32, v: &[f64]| model.ingress.node_for(&grid, t, v, 0);
+        assert_eq!(node_of(11, &base), node_of(11, &near), "a tiny change moved the ingress node");
         // Not a claim that unrelated tokens are always far, only that ingress is
         // not collapsing every token onto one node.
         let spread: std::collections::HashSet<u32> =
-            (0..64).map(|t| node_of(model.embedding_of(t))).collect();
+            (0..64).map(|t| node_of(t, model.embedding_of(t))).collect();
         assert!(spread.len() > 20, "only {} distinct entry nodes for 64 tokens", spread.len());
         let _ = far;
     }

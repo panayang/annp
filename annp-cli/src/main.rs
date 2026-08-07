@@ -116,6 +116,11 @@ enum Command {
         /// the default serial protocol is the size of that leak.
         #[arg(long, default_value_t = false)]
         overlapped: bool,
+        /// Remember where a token's mass came to rest and enter there next
+        /// time, instead of pinning ingress to the phase position. Measured
+        /// worse — the anchor random-walks and never settles (DESIGN.md §13).
+        #[arg(long, default_value_t = false)]
+        adaptive_ingress: bool,
         #[arg(long, default_value = "results/run")]
         out: PathBuf,
     },
@@ -196,6 +201,7 @@ fn main() -> std::io::Result<()> {
             seed,
             bypass,
             overlapped,
+            adaptive_ingress,
             out,
         } => {
             let cfg = run::Config {
@@ -217,6 +223,7 @@ fn main() -> std::io::Result<()> {
                 seed,
                 bypass,
                 overlapped,
+                fixed_ingress: !adaptive_ingress,
             };
             run::run(&cfg, &out)
         }

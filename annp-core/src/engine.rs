@@ -114,6 +114,15 @@ pub struct TokenOutput {
     /// cost, and the quantity DESIGN.md §1.6 claims is independent of how far
     /// into the sequence the token sits.
     pub visits: u64,
+    /// Mass-weighted **circular** sums of the grid coordinates where this
+    /// token's mass came to rest, `[x, y]`.
+    ///
+    /// Circular because the grid is a torus. Averaging raw coordinates would
+    /// put the mean of `{0, side-1}` in the middle of the grid instead of at
+    /// the seam where it belongs — the classic wraparound bug, and the reason
+    /// `resting_place` exists rather than a plain division.
+    anchor_cos: [f64; 2],
+    anchor_sin: [f64; 2],
     injected_tick: u64,
 }
 
@@ -122,6 +131,26 @@ impl TokenOutput {
     /// one to compare against an edge-counting figure.
     pub fn mean_hops(&self) -> f64 {
         if self.absorbed_mass > 0.0 { self.hop_mass / self.absorbed_mass } else { 0.0 }
+    }
+
+    /// Circular mean of where this token's mass was absorbed.
+    ///
+    /// `None` when the mass is spread evenly enough around either ring that the
+    /// resultant vanishes and no direction is meaningful — a genuine
+    /// degeneracy, not a tuned threshold.
+    pub fn resting_place(&self, side: usize) -> Option<(usize, usize)> {
+        let axis = |cos: f64, sin: f64| -> Option<usize> {
+            if (cos * cos + sin * sin).sqrt() < 1e-12 {
+                return None;
+            }
+            let theta = sin.atan2(cos);
+            let unit = (theta.rem_euclid(std::f64::consts::TAU)) / std::f64::consts::TAU;
+            Some(((unit * side as f64).round() as usize) % side)
+        };
+        Some((
+            axis(self.anchor_cos[0], self.anchor_sin[0])?,
+            axis(self.anchor_cos[1], self.anchor_sin[1])?,
+        ))
     }
 }
 
@@ -238,6 +267,8 @@ impl Engine {
                 absorbed_mass: 0.0,
                 hop_mass: 0.0,
                 visits: 0,
+                anchor_cos: [0.0; 2],
+                anchor_sin: [0.0; 2],
                 injected_tick: self.tick,
             },
         );
@@ -364,6 +395,7 @@ impl Engine {
             ..Default::default()
         };
         let mut surprise_sum = 0.0;
+        let side = topology.grid().side();
         for g in &groups {
             self.visits[g.node as usize] += g.visits;
             surprise_sum += g.surprise_sum;
@@ -373,8 +405,9 @@ impl Engine {
                 stats.forwarded_mass += mass;
                 stats.spawned += 1;
             }
+            let (gx, gy) = topology.grid().coords(g.node);
             for (token, slot, mass, payload) in &g.absorbed {
-                self.deposit(*token, *slot, *mass, payload);
+                self.deposit(*token, *slot, *mass, payload, (gx, gy), side);
                 stats.absorbed_mass += mass;
             }
         }
@@ -392,7 +425,15 @@ impl Engine {
         stats
     }
 
-    fn deposit(&mut self, token: u32, slot: u16, mass: f64, payload: &[f64]) {
+    fn deposit(
+        &mut self,
+        token: u32,
+        slot: u16,
+        mass: f64,
+        payload: &[f64],
+        at: (usize, usize),
+        side: usize,
+    ) {
         let d = self.d_head;
         let tick = self.tick;
         let out = self.outputs.get_mut(&token).expect("absorbed a particle of an unknown token");
@@ -402,6 +443,13 @@ impl Engine {
         }
         out.absorbed_mass += mass;
         out.hop_mass += mass * (tick - out.injected_tick + 1) as f64;
+
+        let step = std::f64::consts::TAU / side as f64;
+        for (axis, coord) in [at.0, at.1].into_iter().enumerate() {
+            let theta = coord as f64 * step;
+            out.anchor_cos[axis] += mass * theta.cos();
+            out.anchor_sin[axis] += mass * theta.sin();
+        }
     }
 
     /// Runs ticks until nothing is left in flight.
@@ -479,6 +527,61 @@ mod tests {
         engine.run_to_quiescence(&t, &mut bank, 10_000);
         let outputs = (0..tokens).map(|k| engine.take_output(k).unwrap()).collect();
         (outputs, engine.visits().to_vec())
+    }
+
+    #[test]
+    fn the_resting_place_averages_across_the_seam() {
+        // The wraparound bug this exists to prevent: mass split between x = 0
+        // and x = side-1 is concentrated *at the seam*, and a plain arithmetic
+        // mean would report the opposite side of the grid instead.
+        let side = 8usize;
+        let mut out = TokenOutput {
+            accumulated: vec![0.0; D * SLOTS],
+            absorbed_mass: 0.0,
+            hop_mass: 0.0,
+            visits: 0,
+            anchor_cos: [0.0; 2],
+            anchor_sin: [0.0; 2],
+            injected_tick: 0,
+        };
+        let step = std::f64::consts::TAU / side as f64;
+        for (x, mass) in [(0usize, 0.5), (side - 1, 0.5)] {
+            let theta = x as f64 * step;
+            out.anchor_cos[0] += mass * theta.cos();
+            out.anchor_sin[0] += mass * theta.sin();
+            // y concentrated at 3, to check the axes are handled independently.
+            let phi = 3.0 * step;
+            out.anchor_cos[1] += mass * phi.cos();
+            out.anchor_sin[1] += mass * phi.sin();
+        }
+        let (x, y) = out.resting_place(side).expect("resultant is not degenerate");
+        let ring_gap = |a: usize, b: usize| (a + side - b) % side;
+        let to_seam = ring_gap(x, 0).min(ring_gap(0, x));
+        assert!(to_seam <= 1, "mean landed at {x}, which is {to_seam} from the seam");
+        assert_eq!(y, 3, "the other axis must be unaffected");
+    }
+
+    #[test]
+    fn a_resting_place_spread_evenly_round_the_ring_is_undefined() {
+        let side = 8usize;
+        let mut out = TokenOutput {
+            accumulated: vec![0.0; D * SLOTS],
+            absorbed_mass: 0.0,
+            hop_mass: 0.0,
+            visits: 0,
+            anchor_cos: [0.0; 2],
+            anchor_sin: [0.0; 2],
+            injected_tick: 0,
+        };
+        let step = std::f64::consts::TAU / side as f64;
+        for x in 0..side {
+            let theta = x as f64 * step;
+            for axis in 0..2 {
+                out.anchor_cos[axis] += theta.cos() / side as f64;
+                out.anchor_sin[axis] += theta.sin() / side as f64;
+            }
+        }
+        assert!(out.resting_place(side).is_none(), "a vanishing resultant has no direction");
     }
 
     #[test]

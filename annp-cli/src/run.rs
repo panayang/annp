@@ -134,6 +134,9 @@ pub struct Config {
     /// Admit tokens one per tick regardless of what is in flight. Leaks the
     /// future into earlier predictions; only for measuring by how much.
     pub overlapped: bool,
+    /// Pin every token to its phase position instead of remembering where its
+    /// mass came to rest. The control for the adaptive anchor.
+    pub fixed_ingress: bool,
 }
 
 fn mean(xs: &[f64]) -> f64 {
@@ -182,6 +185,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
 
     runtime.set_bypass(cfg.bypass);
     runtime.set_mode(if cfg.overlapped { Mode::Overlapped } else { Mode::Serial });
+    runtime.set_adaptive_ingress(!cfg.fixed_ingress);
 
     let mut source = MarkovSource::new(cfg.vocab, cfg.fanout, &mut rng);
     let entropy_rate = source.entropy_rate();
@@ -274,6 +278,21 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         100.0 * visits[decile..].iter().sum::<u64>() as f64 / total as f64
     );
     println!("  busiest single     {:.2}% of all visits", 100.0 * visits[visits.len() - 1] as f64 / total as f64);
+    println!();
+
+    let (known, distinct, mean_move) = runtime.model().ingress().drift();
+    println!("ingress anchors ({})", if cfg.fixed_ingress { "fixed at phase position" } else { "readout of resting place" });
+    println!("  tokens with a remembered anchor  {known} / {}", cfg.vocab);
+    println!("  distinct cells occupied          {distinct}");
+    println!("  mean move per observation        {mean_move:.2} (torus L1)");
+    println!("  anchor movement over the run (a settling map decays, a jittering one does not)");
+    for (label, from, to) in [
+        ("first tenth", 0.0, 0.1),
+        ("middle tenth", 0.45, 0.55),
+        ("last tenth", 0.9, 1.0),
+    ] {
+        println!("    {:<16} {:>6.2}", label, window(&scored, from, to, |s| s.anchor_move as f64));
+    }
     println!();
 
     let mut csv = String::from("position,token,target,loss_nats,passthrough_nats,visits,mean_hops\n");
