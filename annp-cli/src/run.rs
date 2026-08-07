@@ -121,10 +121,8 @@ pub struct Config {
     pub long_range: usize,
     pub rungs: usize,
     pub embed_rungs: usize,
-    pub top_k: usize,
     pub mass_floor: f64,
     pub eta: f64,
-    pub homeostasis: f64,
     pub learning_rate: f64,
     pub ladder_ratio: f64,
     pub seed: u64,
@@ -181,9 +179,8 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             eta: cfg.eta,
             schedule,
             rungs: cfg.rungs,
-            homeostasis: cfg.homeostasis,
         },
-        EngineParams { top_k: cfg.top_k, mass_floor: cfg.mass_floor, slots: cfg.slots },
+        EngineParams { mass_floor: cfg.mass_floor, slots: cfg.slots },
         &mut rng,
     );
 
@@ -222,7 +219,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         "serial — one token in flight, loss is a valid compression bound"
     });
     println!(
-        "  vocab={} fanout={} d_head={} slots={} grid={}x{} deg={} top_k={} floor={}",
+        "  vocab={} fanout={} d_head={} slots={} grid={}x{} deg={} floor={}",
         cfg.vocab,
         cfg.fanout,
         cfg.d_head,
@@ -230,7 +227,6 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         cfg.grid_side,
         cfg.grid_side,
         4 + cfg.long_range,
-        cfg.top_k,
         cfg.mass_floor
     );
     println!(

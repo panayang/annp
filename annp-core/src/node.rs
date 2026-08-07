@@ -45,25 +45,31 @@
 //!    floor is inert and halting rests entirely on an absorb option that
 //!    homeostasis had suppressed.
 //!
-//!    The replacement is computed in two stages so that the decoupling
-//!    §10.1 ④ claimed is true by construction rather than by argument: the
-//!    absorbed share comes from **content alone**, and homeostasis appears only
-//!    when dividing the forwarded remainder among neighbours. Homeostasis
-//!    therefore cannot move the absorption rate at all — not "should not", but
-//!    cannot, because it is not in that computation.
+//!    The absorbed share is computed from content alone. With the homeostatic
+//!    bias gone there is nothing else that could have moved it, so the
+//!    decoupling §10.1 ④ claimed holds trivially now rather than by argument.
 //!
-//! Homeostasis stays: a zero-sum redistribution across a node's out-edges.
+//! Routing reads **rung 1**, the same state the transform reads. Publishing the
+//! deepest rung instead was tried on the theory that an expectation rebuilt
+//! from a single recent input gives every particle a landscape that jitters
+//! underneath it; it measured 0.3% *worse* (DESIGN.md §16). The ladder earns
+//! its keep by restraining rung 1, not by offering a second readout — which
+//! also means §1.4's reading of the deep rungs as a separately usable
+//! "consolidated key-value memory" is not supported.
 //!
-//! An earlier version of this comment claimed that being zero-sum meant it
-//! "can never shift the absorption rate". **That is false.** The bias is added
-//! to logits that then compete through a *top-k truncation* against a fixed
-//! absorb reference, and a zero-sum shift can push an edge below the reference
-//! and let absorb into the retained set. Three edges at logits
-//! `(0.5, 0.5, -1.0)` with `top_k = 2` absorb nothing; add the zero-sum bias
-//! `(-0.6, +0.6, 0.0)` and absorb takes 25%. Biases are unbounded and every
-//! losing edge accrues bias every tick, so this is an ordinary state, not a
-//! contrived one. Collapse prevention and the compute budget are therefore
-//! **not** decoupled, and nothing currently bounds the coupling.
+//! Two mechanisms have been **removed** rather than kept and defaulted off,
+//! because measurement said they earned nothing (DESIGN.md §15.2, §16).
+//!
+//! *Top-k truncation* was meant to bound compute and did the opposite: it
+//! squeezed the absorb option out of the retained set, so mass never drained
+//! and paths ran long. Branching is bounded by the mass floor alone. Under the
+//! relative rules it changed the result by 0.7%, and the best configuration was
+//! the one that truncated nothing.
+//!
+//! *Homeostatic edge bias* cost 0.58% and bought 0.7 points of load balance,
+//! with neither setting anywhere near collapse — while being implicated in
+//! every defect found: suppressed absorption, hop count drifting with `d_head`,
+//! and `top_k = 1` never halting. Nothing now competes with the content score.
 
 use crate::graph::Topology;
 use crate::ladder::{AssocMemory, Schedule};
@@ -80,8 +86,6 @@ pub struct NodeParams {
     pub eta: f64,
     pub schedule: Schedule,
     pub rungs: usize,
-    /// Rate at which an edge's homeostatic bias moves against its own usage.
-    pub homeostasis: f64,
 }
 
 /// How a node decides whether to forward a particle at all.
@@ -119,8 +123,7 @@ pub struct Outcome {
     /// `||q - W q_prev||` before the write. Zero on a node's first ever visit,
     /// where there is no previous input to have predicted from.
     pub surprise: f64,
-    /// Routing weights over `out_edges ++ [absorb]`, summing to 1. Only the
-    /// top-k entries are non-zero.
+    /// Routing weights over `out_edges ++ [absorb]`, summing to 1.
     pub weights: Vec<f64>,
 }
 
@@ -136,7 +139,6 @@ pub struct Context<'a> {
     pub expects: &'a [f64],
     /// This node's own slice of `expects`.
     pub self_expect: &'a [f64],
-    pub top_k: usize,
 }
 
 /// Reusable buffers for one `Node::step`. Held per worker so a tick can be
@@ -157,8 +159,6 @@ pub struct Node {
     /// Most recent payload, the delta rule's key.
     last_input: Vec<f64>,
     has_fired: bool,
-    /// Homeostatic bias per out-edge, in the topology's edge order.
-    edge_bias: Vec<f64>,
 }
 
 impl Node {
@@ -219,7 +219,7 @@ impl Node {
         surprise: f64,
         scratch: &mut Scratch,
     ) -> Vec<f64> {
-        let Context { params, out_edges, expects, self_expect, top_k } = *ctx;
+        let Context { params, out_edges, expects, self_expect } = *ctx;
         let d = params.d_head;
         let absorb_slot = out_edges.len();
         let Scratch { logits, order, .. } = scratch;
@@ -261,20 +261,11 @@ impl Node {
         }
         let p_absorb = absorbed / total;
 
-        // Stage two: divide the forwarded remainder among the top-k candidates,
-        // and here the bias does apply — it chooses between neighbours.
-        let bias = &self.edge_bias;
-        order.sort_by(|&a, &b| {
-            (logits[b] + bias[b]).total_cmp(&(logits[a] + bias[a])).then(a.cmp(&b))
-        });
-        order.truncate(top_k.max(1));
-        let peak = order
-            .iter()
-            .map(|&j| logits[j] + bias[j])
-            .fold(f64::NEG_INFINITY, f64::max);
+        // Stage two: divide the forwarded remainder among the candidates.
+        let peak = order.iter().map(|&j| logits[j]).fold(f64::NEG_INFINITY, f64::max);
         let mut total = 0.0;
         for &j in order.iter() {
-            let w = (logits[j] + bias[j] - peak).exp();
+            let w = (logits[j] - peak).exp();
             weights[j] = w;
             total += w;
         }
@@ -283,29 +274,7 @@ impl Node {
             weights[j] *= forwarded / total;
         }
         weights[absorb_slot] = p_absorb;
-
-        self.apply_homeostasis(params, &weights, absorb_slot);
         weights
-    }
-
-    /// Nudges each edge's bias against its own share of the forwarded mass.
-    ///
-    /// Exactly zero-sum across a node's edges, so homeostasis redistributes
-    /// between neighbours and can never move the absorption rate — absorption
-    /// stays governed by the fixed reference logit and the mass floor, which
-    /// keeps the compute budget separate from collapse prevention.
-    fn apply_homeostasis(&mut self, params: &NodeParams, weights: &[f64], degree: usize) {
-        if params.homeostasis == 0.0 || degree == 0 {
-            return;
-        }
-        let forwarded: f64 = weights[..degree].iter().sum();
-        if forwarded <= 0.0 {
-            return;
-        }
-        let uniform = 1.0 / degree as f64;
-        for (b, &w) in self.edge_bias.iter_mut().zip(&weights[..degree]) {
-            *b -= params.homeostasis * (w / forwarded - uniform);
-        }
     }
 
     /// This node's normalised prediction of the input it expects next, or
@@ -346,11 +315,10 @@ impl NodeBank {
     pub fn new(topology: &Topology, params: NodeParams) -> Self {
         assert!(params.d_head > 0, "d_head must be positive");
         assert!(params.eta > 0.0, "eta must be positive");
-        assert!(params.homeostasis >= 0.0, "homeostasis rate must be non-negative");
         let n = topology.grid().len();
         let d = params.d_head;
         let nodes = (0..n)
-            .map(|i| Node {
+            .map(|_| Node {
                 // One rung means no consolidation at all, matching what
                 // `embed_rungs` already accepts. Without this the node ladder
                 // cannot be ablated, which is how it went unmeasured.
@@ -361,7 +329,6 @@ impl NodeBank {
                 },
                 last_input: vec![0.0; d],
                 has_fired: false,
-                edge_bias: vec![0.0; topology.degree(i as u32)],
             })
             .collect();
         Self {
@@ -400,11 +367,6 @@ impl NodeBank {
         self.nodes[node as usize].has_fired
     }
 
-    #[inline]
-    pub fn edge_bias(&self, node: u32) -> &[f64] {
-        &self.nodes[node as usize].edge_bias
-    }
-
     /// Disjoint access to the nodes and the frozen expectation snapshot, so a
     /// tick can be processed across threads.
     #[inline]
@@ -413,7 +375,7 @@ impl NodeBank {
     }
 
     /// Single-threaded convenience wrapper over `Node::step`.
-    pub fn process(&mut self, topology: &Topology, node: u32, q: &[f64], top_k: usize) -> Outcome {
+    pub fn process(&mut self, topology: &Topology, node: u32, q: &[f64]) -> Outcome {
         let params = self.params;
         let edges = topology.out_edges(node);
         let mut scratch = std::mem::take(&mut self.scratch);
@@ -425,7 +387,6 @@ impl NodeBank {
             out_edges: edges,
             expects: &self.expects,
             self_expect: &self_expect,
-            top_k,
         };
         let out = self.nodes[node as usize].step(&ctx, q, &mut scratch);
         self.scratch = scratch;
@@ -460,7 +421,6 @@ mod tests {
             eta: 1.0,
             schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
             rungs: 4,
-            homeostasis: 0.0,
         };
         let bank = NodeBank::new(&t, p);
         (t, bank)
@@ -478,7 +438,7 @@ mod tests {
         let mut rng = Rng::new(2);
         for node in 0..t.grid().len() as u32 {
             let q = unit(&mut rng, 16);
-            let out = bank.process(&t, node, &q, 3);
+            let out = bank.process(&t, node, &q);
             assert_eq!(out.weights.len(), t.degree(node) + 1);
             let total: f64 = out.weights.iter().sum();
             assert!((total - 1.0).abs() < 1e-12, "weights sum to {total}");
@@ -504,16 +464,15 @@ mod tests {
                 eta: 1.0,
                 schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
                 rungs: 4,
-                homeostasis: 0.0,
             },
         );
         // The very first arrival at a node has no predecessor, so surprise is
         // zero by definition and it behaves like the plain relative rule.
         let q = unit(&mut rng, 16);
-        assert_eq!(bank.process(&t, 0, &q, 3).weights[t.degree(0)], 1.0);
+        assert_eq!(bank.process(&t, 0, &q).weights[t.degree(0)], 1.0);
         // The second arrival is genuinely unpredicted, and now it travels.
         let q2 = unit(&mut rng, 16);
-        let out = bank.process(&t, 0, &q2, 3);
+        let out = bank.process(&t, 0, &q2);
         assert!(out.weights[t.degree(0)] < 1.0, "surprise did not reopen any route");
     }
 
@@ -527,7 +486,7 @@ mod tests {
         let mut rng = Rng::new(21);
         for node in 0..t.grid().len() as u32 {
             let q = unit(&mut rng, 16);
-            let out = bank.process(&t, node, &q, 3);
+            let out = bank.process(&t, node, &q);
             assert_eq!(out.weights[t.degree(node)], 1.0, "node {node} forwarded something");
         }
     }
@@ -539,13 +498,13 @@ mod tests {
         let (a, b) = (unit(&mut rng, 16), unit(&mut rng, 16));
         let student = t.out_edges(0)[2];
         for _ in 0..60 {
-            bank.process(&t, student, &a, 2);
-            bank.process(&t, student, &b, 2);
+            bank.process(&t, student, &a);
+            bank.process(&t, student, &b);
         }
-        bank.process(&t, student, &a, 2);
+        bank.process(&t, student, &a);
         bank.publish(student);
 
-        let out = bank.process(&t, 0, &b, 2);
+        let out = bank.process(&t, 0, &b);
         assert!(out.weights[2] > 0.0, "the edge to the node expecting this got nothing");
         assert!(out.weights[t.degree(0)] < 1.0, "everything was absorbed anyway");
     }
@@ -558,7 +517,7 @@ mod tests {
         let (t, mut bank) = fixture(5);
         let mut rng = Rng::new(3);
         let q = unit(&mut rng, 16);
-        let out = bank.process(&t, 0, &q, 2);
+        let out = bank.process(&t, 0, &q);
         for (e, x) in out.emitted.iter().zip(&q) {
             assert!((e - x).abs() < 1e-12, "fresh node altered the payload");
         }
@@ -572,7 +531,7 @@ mod tests {
         for _ in 0..500 {
             let node = rng.next_below(t.grid().len() as u64) as u32;
             let q = unit(&mut rng, 16);
-            let out = bank.process(&t, node, &q, 2);
+            let out = bank.process(&t, node, &q);
             assert!((norm(&out.emitted) - 1.0).abs() < 1e-9, "norm drifted");
         }
     }
@@ -588,14 +547,14 @@ mod tests {
         let mut first = None;
         let mut last = 0.0;
         for _ in 0..40 {
-            bank.process(&t, 0, &a, 2);
-            let out = bank.process(&t, 0, &b, 2);
+            bank.process(&t, 0, &a);
+            let out = bank.process(&t, 0, &b);
             first.get_or_insert(out.surprise);
             last = out.surprise;
         }
         assert!(last < 0.5 * first.unwrap(), "{first:?} -> {last}");
 
-        bank.process(&t, 0, &a, 2);
+        bank.process(&t, 0, &a);
         bank.publish(0);
         let alignment = dot(bank.expectation(0), &b);
         assert!(alignment > 0.8, "expectation points at {alignment} of the way to b");
@@ -612,15 +571,15 @@ mod tests {
         let source = 0u32;
         let student = t.out_edges(source)[2];
         for _ in 0..60 {
-            bank.process(&t, student, &a, 2);
-            bank.process(&t, student, &b, 2);
+            bank.process(&t, student, &a);
+            bank.process(&t, student, &b);
         }
-        bank.process(&t, student, &a, 2);
+        bank.process(&t, student, &a);
         bank.publish(student);
 
         // Send the student's expected input through the source node. A fresh
         // source is transparent, so the emitted payload is still `b`.
-        let out = bank.process(&t, source, &b, 2);
+        let out = bank.process(&t, source, &b);
         let best = out
             .weights
             .iter()
@@ -629,121 +588,6 @@ mod tests {
             .map(|(i, _)| i)
             .unwrap();
         assert_eq!(best, 2, "mass should go to the edge whose target expects this");
-    }
-
-    #[test]
-    fn homeostasis_cannot_move_the_absorbed_share() {
-        // The invariant DESIGN.md §10.1 ④ claimed and the fixed reference could
-        // not deliver. The absorbed share is computed from content alone, so
-        // perturbing the bias by any amount leaves it bit-identical; only the
-        // split among neighbours changes.
-        let (t, mut bank) = fixture(6);
-        let mut rng = Rng::new(23);
-        let (a, b) = (unit(&mut rng, 16), unit(&mut rng, 16));
-        for &edge in t.out_edges(0) {
-            for _ in 0..40 {
-                bank.process(&t, edge, &a, 2);
-                bank.process(&t, edge, &b, 2);
-            }
-            bank.process(&t, edge, &a, 2);
-            bank.publish(edge);
-        }
-        let degree = t.degree(0);
-
-        // Clone first: `process` advances the node's own memory, so calling it
-        // twice on one bank would compare two different states and hide the
-        // property being tested behind a real state change.
-        let mut perturbed = bank.clone();
-        for (slot, delta) in [(0usize, 5.0), (1, -3.0), (2, 11.0)] {
-            perturbed.nodes[0].edge_bias[slot] += delta;
-        }
-        let before = bank.process(&t, 0, &b, 3);
-        assert!(before.weights[degree] > 0.0 && before.weights[degree] < 1.0, "need a mixed case");
-        let after = perturbed.process(&t, 0, &b, 3);
-        assert_ne!(
-            before.weights[..degree],
-            after.weights[..degree],
-            "the bias should still change which neighbour gets the mass"
-        );
-        assert_eq!(
-            before.weights[degree].to_bits(),
-            after.weights[degree].to_bits(),
-            "bias moved the absorbed share"
-        );
-    }
-
-    #[test]
-    fn homeostasis_forces_turn_taking() {
-        // The mechanism, in the one setting where its effect is unambiguous:
-        // a node fed the same payload repeatedly, with one neighbour trained to
-        // expect exactly that. At top_k = 1 the winner takes everything, so
-        // without homeostasis that edge wins every single time.
-        let build = |homeostasis: f64| {
-            let mut rng = Rng::new(8);
-            let t = Topology::small_world(Grid::new(6), SmallWorld::default(), &mut rng);
-            let mut bank = NodeBank::new(
-                &t,
-                NodeParams {
-                    // This test is about the bias mechanics themselves, so it
-                    // uses the rule under which one edge can sweep every draw.
-                    absorb: AbsorbRule::FixedReference,
-                    d_head: 16,
-                    eta: 1.0,
-                    schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
-                    rungs: 4,
-                    homeostasis,
-                },
-            );
-            let mut rng = Rng::new(9);
-            let (a, b) = (unit(&mut rng, 16), unit(&mut rng, 16));
-            let student = t.out_edges(0)[2];
-            for _ in 0..60 {
-                bank.process(&t, student, &a, 2);
-                bank.process(&t, student, &b, 2);
-            }
-            bank.process(&t, student, &a, 2);
-            bank.publish(student);
-
-            let mut wins = vec![0u32; t.degree(0) + 1];
-            for _ in 0..200 {
-                let out = bank.process(&t, 0, &b, 1);
-                let w = out.weights.iter().position(|x| *x > 0.0).unwrap();
-                wins[w] += 1;
-            }
-            wins
-        };
-
-        let without = build(0.0);
-        assert_eq!(without[2], 200, "with no homeostasis one edge should sweep");
-        let with = build(0.05);
-        assert!(with[2] < 200, "homeostasis failed to break the monopoly");
-        assert!(
-            with.iter().filter(|c| **c > 0).count() > 1,
-            "mass never reached a second option"
-        );
-    }
-
-    #[test]
-    fn homeostasis_is_zero_sum_across_a_nodes_edges() {
-        // It may move mass between neighbours; it must never be able to change
-        // how much is absorbed, or it would double as a compute-budget knob.
-        let mut rng = Rng::new(7);
-        let t = Topology::small_world(Grid::new(6), SmallWorld::default(), &mut rng);
-        let bank_params = NodeParams {
-            absorb: AbsorbRule::Relative,
-            d_head: 16,
-            eta: 1.0,
-            schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
-            rungs: 4,
-            homeostasis: 0.1,
-        };
-        let mut bank = NodeBank::new(&t, bank_params);
-        for _ in 0..200 {
-            let q = unit(&mut rng, 16);
-            bank.process(&t, 0, &q, 3);
-        }
-        let sum: f64 = bank.edge_bias(0).iter().sum();
-        assert!(sum.abs() < 1e-9, "biases drifted off zero-sum by {sum}");
     }
 
     #[test]

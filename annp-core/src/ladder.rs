@@ -301,6 +301,16 @@ impl AssocMemory {
         }
     }
 
+    /// The most consolidated version of this matrix: the deepest rung, or the
+    /// matrix itself when there is no ladder. Slow-moving by construction,
+    /// which is what makes it usable as a stable field for routing to climb.
+    pub fn consolidated(&self) -> &Mat {
+        match &self.state {
+            State::Single { w, .. } => w,
+            State::Ladder(l) => l.rung(l.num_rungs() - 1),
+        }
+    }
+
     pub fn ladder_state(&self) -> Option<&Ladder> {
         match &self.state {
             State::Ladder(l) => Some(l),

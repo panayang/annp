@@ -313,8 +313,14 @@ mod tests {
                 embed_rungs: 3,
                 learning_rate: 0.05,
             },
-            NodeParams { absorb: AbsorbRule::Relative, d_head: 8, eta: 1.0, schedule, rungs: 4, homeostasis: 0.05 },
-            EngineParams { top_k: 2, mass_floor: 1e-3, slots: 8 },
+            NodeParams {
+                absorb: AbsorbRule::RelativeSurprise,
+                d_head: 8,
+                eta: 1.0,
+                schedule,
+                rungs: 4,
+            },
+            EngineParams { mass_floor: 1e-3, slots: 8 },
             &mut rng,
         )
     }

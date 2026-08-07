@@ -115,16 +115,10 @@ enum Command {
         /// Rungs behind the tied table; 1 means a plain matrix.
         #[arg(long, default_value_t = 3)]
         embed_rungs: usize,
-        #[arg(long, default_value_t = 2)]
-        top_k: usize,
         #[arg(long, default_value_t = 1e-3)]
         mass_floor: f64,
         #[arg(long, default_value_t = 1.0)]
         eta: f64,
-        /// Zero by default: measured at 0.05 it costs 0.58% and buys 0.7
-        /// points of load balance (DESIGN.md §15.2).
-        #[arg(long, default_value_t = 0.0)]
-        homeostasis: f64,
         #[arg(long, default_value_t = 0.05)]
         learning_rate: f64,
         /// Ladder ratio r. E0-d measured the usable range as 2..=8.
@@ -220,10 +214,8 @@ fn main() -> std::io::Result<()> {
             long_range,
             rungs,
             embed_rungs,
-            top_k,
             mass_floor,
             eta,
-            homeostasis,
             learning_rate,
             ladder_ratio,
             seed,
@@ -243,10 +235,8 @@ fn main() -> std::io::Result<()> {
                 long_range,
                 rungs,
                 embed_rungs,
-                top_k,
                 mass_floor,
                 eta,
-                homeostasis,
                 learning_rate,
                 ladder_ratio,
                 seed,

@@ -156,8 +156,6 @@ impl TokenOutput {
 
 #[derive(Clone, Copy, Debug)]
 pub struct EngineParams {
-    /// Edges kept from the routing softmax, counting the absorb option.
-    pub top_k: usize,
     /// Children below this mass are absorbed instead of forwarded, which caps
     /// the live particle count at `1 / mass_floor` per unit of injected mass.
     pub mass_floor: f64,
@@ -204,7 +202,6 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(bank: &NodeBank, params: EngineParams) -> Self {
-        assert!(params.top_k >= 1, "top_k must be at least 1");
         assert!(params.mass_floor > 0.0, "mass floor must be positive or particles never die");
         assert!(params.slots >= 1, "a token needs at least one slot");
         let d_head = bank.params().d_head;
@@ -319,7 +316,7 @@ impl Engine {
         //    skipping the idle ones is what makes the scattered `&mut` safe; the
         //    skip is a predictable branch and the node count is small next to a
         //    tick's real work.
-        let (params, top_k) = (self.params, self.params.top_k);
+        let params = self.params;
         let (node_slice, expects, node_params) = bank.parts_mut();
         let (order, current, range) = (&self.order, &self.current, &self.range);
         let mut groups: Vec<GroupOutput> = node_slice
@@ -345,7 +342,6 @@ impl Engine {
                         out_edges: edges,
                         expects,
                         self_expect: &expects[lo..lo + node_params.d_head],
-                        top_k,
                     };
                     let outcome = node.step(&ctx, current.payload(i), &mut scratch);
                     out.surprise_sum += outcome.surprise;
@@ -495,7 +491,6 @@ mod tests {
                 eta: 1.0,
                 schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
                 rungs: 4,
-                homeostasis: 0.05,
             },
         );
         (t, bank)
@@ -512,7 +507,7 @@ mod tests {
     }
 
     fn params() -> EngineParams {
-        EngineParams { top_k: 2, mass_floor: 1e-3, slots: SLOTS }
+        EngineParams { mass_floor: 1e-3, slots: SLOTS }
     }
 
     /// Streams `tokens` tokens, one injected per tick, and returns the outputs
