@@ -86,6 +86,9 @@ pub struct NodeParams {
     pub eta: f64,
     pub schedule: Schedule,
     pub rungs: usize,
+    /// Timescales in a node's context key. `1` means the key is the last input
+    /// alone, which is exactly the original behaviour.
+    pub context_scales: usize,
 }
 
 /// How a node decides whether to forward a particle at all.
@@ -146,6 +149,7 @@ pub struct Context<'a> {
 #[derive(Clone, Debug, Default)]
 pub struct Scratch {
     pred: Vec<f64>,
+    key_before: Vec<f64>,
     logits: Vec<f64>,
     order: Vec<usize>,
 }
@@ -156,8 +160,28 @@ pub struct Scratch {
 #[derive(Clone, Debug)]
 pub struct Node {
     memory: AssocMemory,
-    /// Most recent payload, the delta rule's key.
-    last_input: Vec<f64>,
+    /// Leaky integrators of the payloads this node has seen, with geometrically
+    /// spaced time constants `tau_j = r^j`. Their normalised sum is the delta
+    /// rule's key.
+    ///
+    /// This is what lets `W` map *recent history* to the next input rather than
+    /// the last input alone, and it is the difference between representing
+    /// `E[next | current]` and `E[next | history]`. Everything else the node
+    /// does — routing, absorption, surprise — is unchanged.
+    ///
+    /// Not a ladder, deliberately. A ladder conserves its capacity-weighted
+    /// total, so injecting a unit payload on every visit would accumulate
+    /// without bound and rung 1 would converge to the historical mean of
+    /// everything this node has ever seen — the very quantity §16.1 measured to
+    /// be useless as a key. Each integrator here is a convex combination of
+    /// unit vectors and so stays bounded, while the geometric spacing keeps the
+    /// point of a ladder: no single characteristic timescale.
+    ///
+    /// `tau_0 = 1` reduces to `c = q`, so `context_scales == 1` is exactly the
+    /// original last-input key rather than an approximation of it.
+    context: Vec<Vec<f64>>,
+    /// Normalised sum of `context`, cached because every visit needs it twice.
+    key: Vec<f64>,
     has_fired: bool,
     /// Mass forwarded through each plastic out-edge since the last rewiring.
     /// Structural bookkeeping only — it plays no part in routing, which is a
@@ -185,17 +209,22 @@ impl Node {
 
         // Learn. On the very first visit there is no previous input, so there
         // is nothing that could have been predicted and nothing to correct.
+        // The key *before* this payload is folded in: what the node had to
+        // predict from. Reading back later uses the key *including* it.
+        scratch.key_before.clear();
+        scratch.key_before.extend_from_slice(&self.key);
         let surprise = if self.has_fired {
-            self.memory.write(&self.last_input, q, params.eta)
+            self.memory.write(&scratch.key_before, q, params.eta)
         } else {
             self.has_fired = true;
             0.0
         };
-        self.last_input.copy_from_slice(q);
+        self.absorb_into_context(q);
         self.memory.relax();
 
-        // Predict. This is also what neighbours route against once published.
-        self.memory.read().mul_vec(q, &mut scratch.pred);
+        // Predict, from the context including what just arrived. This is also
+        // what neighbours route against once published.
+        self.memory.read().mul_vec(&self.key, &mut scratch.pred);
 
         // Emit. Residual, so an untrained node is transparent rather than
         // annihilating. Renormalised because unit-norm payloads are the
@@ -293,6 +322,40 @@ impl Node {
         weights
     }
 
+    /// Folds a payload into every timescale and refreshes the cached key.
+    fn absorb_into_context(&mut self, q: &[f64]) {
+        let scales = self.context.len();
+        for (state, tau) in self.context.iter_mut().zip(Self::timescales(scales)) {
+            let blend = 1.0 / tau;
+            for (c, &x) in state.iter_mut().zip(q) {
+                *c += blend * (x - *c);
+            }
+        }
+        self.key.fill(0.0);
+        for state in &self.context {
+            for (k, &c) in self.key.iter_mut().zip(state) {
+                *k += c;
+            }
+        }
+        let len = norm(&self.key);
+        if len > 1e-12 {
+            for k in self.key.iter_mut() {
+                *k /= len;
+            }
+        } else {
+            // Cancelled to nothing, which needs a usable direction rather than
+            // a zero key; the newest payload is the best available.
+            self.key.copy_from_slice(q);
+        }
+    }
+
+    /// `tau_j = 2^j`. The ratio is fixed rather than taken from the ladder's
+    /// `r`, because these are bounded integrators and not a diffusion — sharing
+    /// a symbol would suggest a coupling that does not exist.
+    fn timescales(count: usize) -> impl Iterator<Item = f64> {
+        (0..count).map(|j| (1u64 << j) as f64)
+    }
+
     /// This node's normalised prediction of the input it expects next, or
     /// all-zero if it has never fired.
     fn expectation_into(&self, params: &NodeParams, out: &mut [f64], scratch: &mut Scratch) {
@@ -301,7 +364,7 @@ impl Node {
             return;
         }
         scratch.pred.resize(params.d_head, 0.0);
-        self.memory.read().mul_vec(&self.last_input, &mut scratch.pred);
+        self.memory.read().mul_vec(&self.key, &mut scratch.pred);
         let len = norm(&scratch.pred);
         if len > 1e-12 {
             for (o, &p) in out.iter_mut().zip(&scratch.pred) {
@@ -331,6 +394,7 @@ impl NodeBank {
     pub fn new(topology: &Topology, params: NodeParams) -> Self {
         assert!(params.d_head > 0, "d_head must be positive");
         assert!(params.eta > 0.0, "eta must be positive");
+        assert!(params.context_scales >= 1, "a node needs at least one timescale");
         let n = topology.grid().len();
         let d = params.d_head;
         let nodes = (0..n)
@@ -343,7 +407,8 @@ impl NodeBank {
                 } else {
                     AssocMemory::ladder(d, params.schedule, params.rungs)
                 },
-                last_input: vec![0.0; d],
+                context: vec![vec![0.0; d]; params.context_scales.max(1)],
+                key: vec![0.0; d],
                 has_fired: false,
                 plastic_usage: vec![0.0; topology.plastic_slots(i as u32).len()],
                 turnover_visits: 0,
@@ -470,6 +535,7 @@ mod tests {
             eta: 1.0,
             schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
             rungs: 4,
+            context_scales: 1,
         };
         let bank = NodeBank::new(&t, p);
         (t, bank)
@@ -513,6 +579,7 @@ mod tests {
                 eta: 1.0,
                 schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
                 rungs: 4,
+                context_scales: 1,
             },
         );
         // The very first arrival at a node has no predecessor, so surprise is
@@ -556,6 +623,109 @@ mod tests {
         let out = bank.process(&t, 0, &b);
         assert!(out.weights[2] > 0.0, "the edge to the node expecting this got nothing");
         assert!(out.weights[t.degree(0)] < 1.0, "everything was absorbed anyway");
+    }
+
+    #[test]
+    fn one_timescale_is_exactly_the_last_input_key() {
+        // tau_0 = 1 gives c <- q, so a single scale is the original behaviour
+        // rather than an approximation of it. Anything else would mean the
+        // ablation is not comparing like with like.
+        let mut rng = Rng::new(61);
+        let d = 16;
+        let mut bank = {
+            let t = Topology::small_world(Grid::new(5), SmallWorld::default(), &mut Rng::new(1));
+            let p = NodeParams {
+                absorb: AbsorbRule::RelativeSurprise,
+                d_head: d,
+                eta: 1.0,
+                schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
+                rungs: 4,
+                context_scales: 1,
+            };
+            (NodeBank::new(&t, p), t)
+        };
+        let (bank, t) = (&mut bank.0, bank.1);
+        let inputs: Vec<Vec<f64>> = (0..8).map(|_| unit(&mut rng, d)).collect();
+        for q in &inputs {
+            bank.process(&t, 0, q);
+        }
+        // With one scale the key is the most recent payload. Exact in exact
+        // arithmetic; the renormalisation divides by a norm that is 1 only to
+        // within an ulp, so compare to that tolerance rather than bitwise.
+        let last = inputs.last().unwrap();
+        for (k, x) in bank.nodes[0].key.iter().zip(last) {
+            assert!((k - x).abs() < 1e-14, "key drifted from the last input: {k} vs {x}");
+        }
+        bank.publish(0);
+        assert!(bank.expectation(0).iter().any(|x| *x != 0.0));
+    }
+
+    #[test]
+    fn more_timescales_make_the_key_depend_on_older_inputs() {
+        // The whole point: with several scales the key after seeing (a, b)
+        // differs from the key after seeing (c, b), so W can distinguish
+        // histories that end the same way.
+        let build = |scales: usize| {
+            let t = Topology::small_world(Grid::new(5), SmallWorld::default(), &mut Rng::new(1));
+            let p = NodeParams {
+                absorb: AbsorbRule::RelativeSurprise,
+                d_head: 16,
+                eta: 1.0,
+                schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
+                rungs: 4,
+                context_scales: scales,
+            };
+            (NodeBank::new(&t, p), t)
+        };
+        let mut rng = Rng::new(62);
+        let (a, b, c) = (unit(&mut rng, 16), unit(&mut rng, 16), unit(&mut rng, 16));
+
+        for (scales, should_differ) in [(1usize, false), (4, true)] {
+            let (mut bank1, t) = build(scales);
+            bank1.process(&t, 0, &a);
+            bank1.process(&t, 0, &b);
+            let key_ab = bank1.nodes[0].key.clone();
+
+            let (mut bank2, t2) = build(scales);
+            bank2.process(&t2, 0, &c);
+            bank2.process(&t2, 0, &b);
+            let key_cb = bank2.nodes[0].key.clone();
+
+            let gap: f64 =
+                key_ab.iter().zip(&key_cb).map(|(x, y)| (x - y) * (x - y)).sum::<f64>().sqrt();
+            if should_differ {
+                assert!(gap > 0.05, "{scales} scales: keys differ by only {gap}");
+            } else {
+                assert!(gap < 1e-12, "one scale must ignore what came before: {gap}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_context_key_stays_bounded() {
+        // The reason this is not a ladder. Each integrator is a convex
+        // combination of unit vectors, so nothing accumulates; a conserving
+        // ladder fed a unit payload every visit would grow without bound and
+        // its key would converge to the historical mean.
+        let t = Topology::small_world(Grid::new(5), SmallWorld::default(), &mut Rng::new(1));
+        let p = NodeParams {
+            absorb: AbsorbRule::RelativeSurprise,
+            d_head: 16,
+            eta: 1.0,
+            schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
+            rungs: 4,
+            context_scales: 6,
+        };
+        let mut bank = NodeBank::new(&t, p);
+        let mut rng = Rng::new(63);
+        for _ in 0..20_000 {
+            let q = unit(&mut rng, 16);
+            bank.process(&t, 0, &q);
+            for state in &bank.nodes[0].context {
+                assert!(norm(state) <= 1.0 + 1e-9, "integrator grew past unit norm");
+            }
+            assert!((norm(&bank.nodes[0].key) - 1.0).abs() < 1e-9, "key is not unit norm");
+        }
     }
 
     #[test]

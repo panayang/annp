@@ -142,6 +142,10 @@ enum Command {
         long_range: usize,
         #[arg(long, default_value_t = 4)]
         rungs: usize,
+        /// Timescales in a node's context key. 1 is the last input alone,
+        /// which is exactly the behaviour before this existed.
+        #[arg(long, default_value_t = 1)]
+        context_scales: usize,
         /// Rungs behind the tied table; 1 means a plain matrix.
         #[arg(long, default_value_t = 3)]
         embed_rungs: usize,
@@ -255,6 +259,7 @@ fn main() -> std::io::Result<()> {
             grid_side,
             long_range,
             rungs,
+            context_scales,
             embed_rungs,
             mass_floor,
             eta,
@@ -280,6 +285,7 @@ fn main() -> std::io::Result<()> {
                 grid_side,
                 long_range,
                 rungs,
+                context_scales,
                 embed_rungs,
                 mass_floor,
                 eta,

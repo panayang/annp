@@ -491,6 +491,7 @@ mod tests {
                 eta: 1.0,
                 schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
                 rungs: 4,
+                context_scales: 1,
             },
         );
         (t, bank)

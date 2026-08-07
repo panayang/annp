@@ -397,6 +397,7 @@ mod tests {
                 eta: 1.0,
                 schedule,
                 rungs: 4,
+                context_scales: 1,
             },
             EngineParams { mass_floor: 1e-3, slots: 8 },
             &mut rng,
