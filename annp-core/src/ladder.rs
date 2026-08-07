@@ -31,10 +31,15 @@ pub enum Schedule {
     /// `~m^2/g`, so covering a long horizon costs `O(sqrt(horizon))` rungs.
     Uniform { g: f64 },
     /// `C_k = r^(k-1)`, `g_k = g1 * r^-(k-1)`, hence `tau_k ~ r^(2(k-1))/g1`.
-    /// Covers `r^(2m)` of dynamic range with `m` rungs. Because the scale
-    /// invariance is discrete rather than continuous, the decay is `t^-1/2`
-    /// modulated by a log-periodic ripple of period `ln r` — a falsifiable
-    /// signature of the mechanism, not a nuisance.
+    /// Covers `r^(2m)` of dynamic range with `m` rungs, against `m^2` for
+    /// `Uniform`, and reaches the same `t^-1/2` exponent.
+    ///
+    /// Keep `r` in `2..=8`. E0-d measured the impulse response over six decades
+    /// and found `-0.4991` at `r = 2` and `-0.4993` at `r = 8`, but `-0.5203` at
+    /// `r = 16` and `-0.4597` at `r = 32`: past 8 the chain is no longer a good
+    /// approximation to the diffusion. (An earlier version of this comment
+    /// claimed a log-periodic ripple of period `ln r`. There is none — see
+    /// DESIGN.md §8.4.)
     Geometric { r: f64, g1: f64 },
 }
 
@@ -161,6 +166,14 @@ impl Ladder {
             .sum()
     }
 
+    /// Writes `values` into every rung, leaving the chain at equilibrium.
+    pub fn initialise(&mut self, values: &[f64]) {
+        for rung in self.rungs.iter_mut() {
+            assert_eq!(values.len(), rung.as_slice().len(), "initialise: size mismatch");
+            rung.as_mut_slice().copy_from_slice(values);
+        }
+    }
+
     /// `U_1 += (s / C_1) * a b^T`. Input is a flux into rung 1, so it is scaled
     /// by that rung's inverse capacity like every other term in its equation.
     pub fn inject(&mut self, a: &[f64], b: &[f64], s: f64) {
@@ -236,8 +249,47 @@ impl AssocMemory {
         Self { state: State::Single { w: Mat::zeros(d, d), decay }, pred: vec![0.0; d], resid: vec![0.0; d] }
     }
 
+    /// Rectangular single matrix, for measuring what the ladder costs.
+    pub fn single_rect(rows: usize, cols: usize, decay: f64) -> Self {
+        assert!(decay > 0.0 && decay <= 1.0, "decay must lie in (0, 1]");
+        Self {
+            state: State::Single { w: Mat::zeros(rows, cols), decay },
+            pred: vec![0.0; rows],
+            resid: vec![0.0; rows],
+        }
+    }
+
     pub fn ladder(d: usize, schedule: Schedule, m: usize) -> Self {
-        Self { state: State::Ladder(Ladder::new(schedule, m, d, d)), pred: vec![0.0; d], resid: vec![0.0; d] }
+        Self::ladder_rect(d, d, schedule, m)
+    }
+
+    /// Rectangular ladder. The output head's weight matrix is `vocab x d_model`
+    /// and its gradient is a rank-one outer product, which `inject` already
+    /// expresses, so it rides the same consolidation machinery as everything
+    /// else with no special case.
+    pub fn ladder_rect(rows: usize, cols: usize, schedule: Schedule, m: usize) -> Self {
+        Self {
+            state: State::Ladder(Ladder::new(schedule, m, rows, cols)),
+            pred: vec![0.0; rows],
+            resid: vec![0.0; rows],
+        }
+    }
+
+    /// Writes `values` into **every** rung.
+    ///
+    /// Seeding only rung 1 would be a slow catastrophe: the chain conserves the
+    /// capacity-weighted total, so an initial value in rung 1 alone diffuses
+    /// outwards until every rung holds `1 / sum_k C_k` of it — a factor of 341
+    /// for `r = 4, m = 5`. Initialising the chain at equilibrium means
+    /// diffusion does nothing until real updates arrive.
+    pub fn initialise(&mut self, values: &[f64]) {
+        match &mut self.state {
+            State::Single { w, .. } => {
+                assert_eq!(values.len(), w.as_slice().len(), "initialise: size mismatch");
+                w.as_mut_slice().copy_from_slice(values);
+            }
+            State::Ladder(l) => l.initialise(values),
+        }
     }
 
     /// The matrix the forward pass sees: rung 1 for a ladder, the single matrix
@@ -446,6 +498,33 @@ mod tests {
             mem.relax();
         }
         assert!((mem.recall(&k, &v) - decay.powi(200)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn an_initialised_ladder_does_not_decay() {
+        // Seeding rung 1 alone would bleed away to 1/sum(C_k) of its value.
+        // Seeding every rung puts the chain at equilibrium, so an initialised
+        // weight matrix survives.
+        let d = 6;
+        let mut mem = AssocMemory::ladder(d, geo(4.0), 5);
+        let values: Vec<f64> = (0..d * d).map(|i| (i as f64 * 0.37).sin()).collect();
+        mem.initialise(&values);
+        for _ in 0..100_000 {
+            mem.relax();
+        }
+        for (got, want) in mem.read().as_slice().iter().zip(&values) {
+            assert!((got - want).abs() < 1e-12, "{got} drifted from {want}");
+        }
+    }
+
+    #[test]
+    fn a_rectangular_ladder_takes_rank_one_gradients() {
+        let mut mem = AssocMemory::ladder_rect(5, 3, geo(2.0), 4);
+        mem.inject(&[1.0, 0.0, 0.0, 0.0, -2.0], &[0.5, 1.0, 0.0], 1.0);
+        assert_eq!(mem.read().shape(), (5, 3));
+        assert_eq!(mem.read().get(0, 1), 1.0);
+        assert_eq!(mem.read().get(4, 0), -1.0);
+        assert_eq!(mem.read().get(2, 2), 0.0);
     }
 
     #[test]

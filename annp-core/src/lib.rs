@@ -8,5 +8,6 @@ pub mod engine;
 pub mod graph;
 pub mod ladder;
 pub mod linalg;
+pub mod model;
 pub mod node;
 pub mod rng;
