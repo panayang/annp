@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use rayon::prelude::*;
 
 use crate::graph::Topology;
-use crate::node::{NodeBank, Scratch};
+use crate::node::{Context, NodeBank, Scratch};
 
 /// Live particles, struct-of-arrays. The engine sorts indices, never payloads.
 #[derive(Clone, Debug)]
@@ -339,14 +339,15 @@ impl Engine {
                 };
                 for &pi in &order[lo as usize..hi as usize] {
                     let i = pi as usize;
-                    let outcome = node.step(
-                        &node_params,
-                        edges,
+                    let lo = id * node_params.d_head;
+                    let ctx = Context {
+                        params: &node_params,
+                        out_edges: edges,
                         expects,
-                        current.payload(i),
+                        self_expect: &expects[lo..lo + node_params.d_head],
                         top_k,
-                        &mut scratch,
-                    );
+                    };
+                    let outcome = node.step(&ctx, current.payload(i), &mut scratch);
                     out.surprise_sum += outcome.surprise;
                     out.visits += 1;
 
@@ -477,7 +478,7 @@ mod tests {
     use super::*;
     use crate::graph::{Grid, SmallWorld, Topology};
     use crate::ladder::Schedule;
-    use crate::node::NodeParams;
+    use crate::node::{AbsorbRule, NodeParams};
     use crate::rng::Rng;
 
     const D: usize = 16;
@@ -489,6 +490,7 @@ mod tests {
         let bank = NodeBank::new(
             &t,
             NodeParams {
+                absorb: AbsorbRule::Relative,
                 d_head: D,
                 eta: 1.0,
                 schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },

@@ -25,7 +25,7 @@ use annp_core::engine::EngineParams;
 use annp_core::graph::{Grid, SmallWorld, Topology};
 use annp_core::ladder::Schedule;
 use annp_core::model::ModelParams;
-use annp_core::node::NodeParams;
+use annp_core::node::{AbsorbRule, NodeParams};
 use annp_core::rng::Rng;
 use annp_core::runtime::{Mode, Runtime, Scored};
 
@@ -137,6 +137,9 @@ pub struct Config {
     /// Pin every token to its phase position instead of remembering where its
     /// mass came to rest. The control for the adaptive anchor.
     pub fixed_ingress: bool,
+    /// Use the old constant absorb logit. Reproduces the measurements that
+    /// condemned it; not for new results.
+    pub fixed_absorb: bool,
 }
 
 fn mean(xs: &[f64]) -> f64 {
@@ -173,6 +176,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             learning_rate: cfg.learning_rate,
         },
         NodeParams {
+            absorb: if cfg.fixed_absorb { AbsorbRule::FixedReference } else { AbsorbRule::Relative },
             d_head: cfg.d_head,
             eta: cfg.eta,
             schedule,
@@ -187,7 +191,13 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     runtime.set_mode(if cfg.overlapped { Mode::Overlapped } else { Mode::Serial });
     runtime.set_adaptive_ingress(!cfg.fixed_ingress);
 
-    let mut source = MarkovSource::new(cfg.vocab, cfg.fanout, &mut rng);
+    // The source gets its own generator. Drawing it from the one the model
+    // construction just used would make the data depend on the architecture:
+    // `Ingress::new` consumes a number of draws that varies with `slots`, so a
+    // sweep over slot counts silently swept over Markov chains too. The printed
+    // entropy rate is the guard — it must not move across a sweep.
+    let mut source =
+        MarkovSource::new(cfg.vocab, cfg.fanout, &mut Rng::new(cfg.seed ^ 0x50_17_CE_50_17_CE_00));
     let entropy_rate = source.entropy_rate();
 
     let started = std::time::Instant::now();

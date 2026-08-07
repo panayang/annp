@@ -294,6 +294,7 @@ mod tests {
     use super::*;
     use crate::graph::{Grid, SmallWorld};
     use crate::ladder::Schedule;
+    use crate::node::AbsorbRule;
     use crate::rng::Rng;
 
     fn build(vocab: usize, seed: u64) -> Runtime {
@@ -312,7 +313,7 @@ mod tests {
                 embed_rungs: 3,
                 learning_rate: 0.05,
             },
-            NodeParams { d_head: 8, eta: 1.0, schedule, rungs: 4, homeostasis: 0.05 },
+            NodeParams { absorb: AbsorbRule::Relative, d_head: 8, eta: 1.0, schedule, rungs: 4, homeostasis: 0.05 },
             EngineParams { top_k: 2, mass_floor: 1e-3, slots: 8 },
             &mut rng,
         )
@@ -410,20 +411,22 @@ mod tests {
     }
 
     #[test]
-    fn per_token_compute_does_not_grow_with_position() {
-        // DESIGN.md §1.6's central claim, as a test. Compare the visit count
-        // charged to tokens early in a stream against tokens far later.
+    fn per_token_compute_settles_rather_than_growing_with_position() {
+        // DESIGN.md §1.6 claims per-token cost does not grow with sequence
+        // length. Under the relative absorption rule there is now a genuine
+        // warm-up: an untrained network absorbs everything immediately and
+        // grows its paths as nodes learn, so cost rises before it settles.
+        // The claim is about the settled regime, so both windows are taken
+        // after the warm-up; the warm-up curve itself is reported by `annp run`.
         let mut rt = build(48, 4);
-        let stream: Vec<u32> = (0..1_200).map(|i| (i * 13 % 48) as u32).collect();
+        let stream: Vec<u32> = (0..3_000).map(|i| (i * 13 % 48) as u32).collect();
         let scored = feed(&mut rt, &stream);
         let mean = |s: &[Scored]| s.iter().map(|x| x.visits as f64).sum::<f64>() / s.len() as f64;
-        // Skip the first few, where the network is still empty and everything
-        // is absorbed immediately.
-        let early = mean(&scored[100..300]);
-        let late = mean(&scored[900..1_100]);
+        let middle = mean(&scored[1_400..1_700]);
+        let late = mean(&scored[2_600..2_900]);
         assert!(
-            (late / early - 1.0).abs() < 0.25,
-            "compute per token drifted from {early} to {late}"
+            (late / middle - 1.0).abs() < 0.25,
+            "compute per token drifted from {middle} to {late} after warm-up"
         );
     }
 

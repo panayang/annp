@@ -121,6 +121,9 @@ enum Command {
         /// worse — the anchor random-walks and never settles (DESIGN.md §13).
         #[arg(long, default_value_t = false)]
         adaptive_ingress: bool,
+        /// Use the old constant absorb logit instead of the relative rule.
+        #[arg(long, default_value_t = false)]
+        fixed_absorb: bool,
         #[arg(long, default_value = "results/run")]
         out: PathBuf,
     },
@@ -202,6 +205,7 @@ fn main() -> std::io::Result<()> {
             bypass,
             overlapped,
             adaptive_ingress,
+            fixed_absorb,
             out,
         } => {
             let cfg = run::Config {
@@ -224,6 +228,7 @@ fn main() -> std::io::Result<()> {
                 bypass,
                 overlapped,
                 fixed_ingress: !adaptive_ingress,
+                fixed_absorb,
             };
             run::run(&cfg, &out)
         }
