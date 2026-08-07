@@ -10,6 +10,7 @@ mod topology;
 
 use std::path::PathBuf;
 
+use annp_core::model::IngressMode;
 use annp_core::node::AbsorbRule;
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -23,6 +24,30 @@ enum AbsorbArg {
     Relative,
     /// As `relative`, less the node's own surprise.
     Surprise,
+}
+
+/// CLI spelling of `IngressMode`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum IngressArg {
+    /// Phase of the embedding in two fixed random planes.
+    Content,
+    /// One fixed anchor for every token.
+    Constant,
+    /// A cursor advancing one node per token.
+    Cursor,
+    /// Where the token's own mass last came to rest.
+    Readout,
+}
+
+impl From<IngressArg> for IngressMode {
+    fn from(i: IngressArg) -> Self {
+        match i {
+            IngressArg::Content => IngressMode::Content,
+            IngressArg::Constant => IngressMode::Constant,
+            IngressArg::Cursor => IngressMode::Cursor,
+            IngressArg::Readout => IngressMode::Readout,
+        }
+    }
 }
 
 impl From<AbsorbArg> for AbsorbRule {
@@ -147,21 +172,15 @@ enum Command {
         /// bigram at all.
         #[arg(long, default_value_t = false)]
         untied: bool,
-        /// Send every token to the same anchor. Forces consecutive tokens to
-        /// share nodes, which is the precondition every topology proposal
-        /// assumes and none has tested.
-        #[arg(long, default_value_t = false)]
-        constant_ingress: bool,
+
         /// Admit one token per tick regardless of what is still in flight.
         /// Leaks future tokens into earlier predictions; the difference against
         /// the default serial protocol is the size of that leak.
         #[arg(long, default_value_t = false)]
         overlapped: bool,
-        /// Remember where a token's mass came to rest and enter there next
-        /// time, instead of pinning ingress to the phase position. Measured
-        /// worse — the anchor random-walks and never settles (DESIGN.md §13).
-        #[arg(long, default_value_t = false)]
-        adaptive_ingress: bool,
+        /// How a token's entry point is chosen.
+        #[arg(long, value_enum, default_value_t = IngressArg::Content)]
+        ingress: IngressArg,
         /// How a node decides whether to forward a particle at all.
         #[arg(long, value_enum, default_value_t = AbsorbArg::Surprise)]
         absorb: AbsorbArg,
@@ -246,9 +265,8 @@ fn main() -> std::io::Result<()> {
             frozen_topology,
             blind_turnover,
             untied,
-            constant_ingress,
             overlapped,
-            adaptive_ingress,
+            ingress,
             absorb,
             out,
         } => {
@@ -272,9 +290,8 @@ fn main() -> std::io::Result<()> {
                 frozen_topology,
                 blind_turnover,
                 untied,
-                constant_ingress,
-                overlapped,
-                fixed_ingress: !adaptive_ingress,
+                    overlapped,
+                ingress: ingress.into(),
                 absorb: absorb.into(),
             };
             run::run(&cfg, &out)

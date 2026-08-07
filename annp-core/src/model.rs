@@ -116,6 +116,30 @@ impl Rotation {
     }
 }
 
+/// How a token's entry point on the grid is chosen.
+///
+/// Content addressing was the original design: similar tokens start near each
+/// other so their memories are co-located. It is measured to place
+/// *consecutive* tokens at unrelated points, which is why no context flows —
+/// sequence neighbours are not content neighbours.
+///
+/// `Constant` is the control that showed context can flow at all, at the cost
+/// of piling every token onto the same nodes. `Cursor` keeps that sharing while
+/// spreading the load. Note what `Cursor` does *not* address: it gives
+/// recency, not similarity, and a source whose dependencies are all recent
+/// flatters it. Real language needs both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IngressMode {
+    /// Phase of the embedding in two fixed random planes.
+    Content,
+    /// One fixed anchor for every token. Maximal sharing, no addressing.
+    Constant,
+    /// A cursor advancing one node per token. Recency becomes adjacency.
+    Cursor,
+    /// Where this token's own mass last came to rest. Measured worse.
+    Readout,
+}
+
 /// Maps an embedding to the grid position its particles enter at.
 #[derive(Clone, Debug)]
 pub struct Ingress {
@@ -130,22 +154,12 @@ pub struct Ingress {
     offsets: Vec<(u32, u32)>,
     /// Where each token's mass last came to rest, once it has been observed.
     remembered: Vec<Option<(usize, usize)>>,
-    /// Send every token to the same anchor, ignoring its content.
-    ///
-    /// The decisive control for whether context can flow at all. Content
-    /// addressing places consecutive tokens at unrelated points, and with ~2.8
-    /// hops touching ~10 of 576 nodes their paths essentially never intersect
-    /// (DESIGN.md §20). Pinning every token to one anchor forces maximal
-    /// sharing: if context still does not flow under that, no topology will fix
-    /// it, because the node transform is not carrying context in the first
-    /// place.
-    constant_anchor: bool,
+    mode: IngressMode,
     /// How far anchors have travelled in total, and over how many moves. Rising
     /// distinct-anchor counts with bounded drift is a map forming; drift that
     /// never settles, or a collapsing anchor count, is the failure mode.
     moves: u64,
     travelled: u64,
-    adaptive: bool,
 }
 
 impl Ingress {
@@ -196,28 +210,21 @@ impl Ingress {
             remembered: vec![None; vocab],
             moves: 0,
             travelled: 0,
-            adaptive: true,
-            constant_anchor: false,
+            mode: IngressMode::Content,
         }
     }
 
-    /// Turns the readout off, pinning every token to its phase position. The
-    /// control for whether remembering the resting place buys anything.
-    pub fn set_adaptive(&mut self, adaptive: bool) {
-        self.adaptive = adaptive;
-    }
-
-    pub fn set_constant_anchor(&mut self, constant: bool) {
-        self.constant_anchor = constant;
+    pub fn set_mode(&mut self, mode: IngressMode) {
+        self.mode = mode;
     }
 
     /// Records where a token's mass came to rest. Returns how far its anchor
     /// moved on the torus.
     pub fn observe(&mut self, token: u32, resting: (usize, usize), embedding: &[f64]) -> usize {
-        if !self.adaptive {
+        if self.mode != IngressMode::Readout {
             return 0;
         }
-        let previous = self.anchor(token, embedding);
+        let previous = self.anchor(token, 0, embedding);
         let gap = |a: usize, b: usize| {
             let d = (a + self.side - b) % self.side;
             d.min(self.side - d)
@@ -237,15 +244,24 @@ impl Ingress {
         (known.len(), distinct.len(), mean)
     }
 
-    /// Where this token enters: its remembered resting place if it has one,
-    /// otherwise the phase of its embedding.
-    pub fn anchor(&self, token: u32, embedding: &[f64]) -> (usize, usize) {
-        if self.constant_anchor {
-            return (self.side / 2, self.side / 2);
-        }
-        match self.remembered[token as usize] {
-            Some(a) => a,
-            None => self.phase_anchor(embedding),
+    /// Where this token enters.
+    pub fn anchor(&self, token: u32, position: u64, embedding: &[f64]) -> (usize, usize) {
+        match self.mode {
+            IngressMode::Content => self.phase_anchor(embedding),
+            IngressMode::Constant => (self.side / 2, self.side / 2),
+            // One node per token along a serpentine raster: consecutive tokens
+            // land within two nodes of each other, so their footprints overlap
+            // heavily, and the grid is covered every side^2 tokens so the load
+            // spreads. Neither number is tuned — the step follows from wanting
+            // overlap at a path length of ~3, the period from the grid.
+            IngressMode::Cursor => {
+                let p = position as usize;
+                (p % self.side, (p / self.side) % self.side)
+            }
+            IngressMode::Readout => match self.remembered[token as usize] {
+                Some(a) => a,
+                None => self.phase_anchor(embedding),
+            },
         }
     }
 
@@ -261,8 +277,15 @@ impl Ingress {
     }
 
     /// Entry node for one slot of a token with this embedding.
-    pub fn node_for(&self, grid: &Grid, token: u32, embedding: &[f64], slot: usize) -> u32 {
-        let (x, y) = self.anchor(token, embedding);
+    pub fn node_for(
+        &self,
+        grid: &Grid,
+        token: u32,
+        position: u64,
+        embedding: &[f64],
+        slot: usize,
+    ) -> u32 {
+        let (x, y) = self.anchor(token, position, embedding);
         let (dx, dy) = self.offsets[slot];
         grid.index((x + dx as usize) % self.side, (y + dy as usize) % self.side)
     }
@@ -363,12 +386,8 @@ impl Model {
         &self.ingress
     }
 
-    pub fn set_adaptive_ingress(&mut self, adaptive: bool) {
-        self.ingress.set_adaptive(adaptive);
-    }
-
-    pub fn set_constant_ingress(&mut self, constant: bool) {
-        self.ingress.set_constant_anchor(constant);
+    pub fn set_ingress_mode(&mut self, mode: IngressMode) {
+        self.ingress.set_mode(mode);
     }
 
     /// Remembers where a token's mass came to rest, for its next entry.
@@ -389,7 +408,7 @@ impl Model {
 
     /// Turns a token into particles: rotate, slice, split each chunk into a
     /// unit direction and a share of the mass, and place it by content.
-    pub fn shatter(&mut self, grid: &Grid, token: u32) -> Shattered {
+    pub fn shatter(&mut self, grid: &Grid, token: u32, position: u64) -> Shattered {
         let (d_head, slots) = (self.params.d_head, self.params.slots);
         let d_model = self.params.d_model();
         let lo = token as usize * d_model;
@@ -416,7 +435,7 @@ impl Model {
                     v[0] = 1.0;
                     v
                 };
-                let node = self.ingress.node_for(grid, token, &anchor_source, s);
+                let node = self.ingress.node_for(grid, token, position, &anchor_source, s);
                 (node, s as u16, mag / scale, payload)
             })
             .collect();
@@ -533,7 +552,7 @@ mod tests {
         let grid = Grid::new(16);
         let mut model = Model::new(params(), &mut rng);
         for token in 0..64 {
-            let s = model.shatter(&grid, token);
+            let s = model.shatter(&grid, token, 0);
             assert_eq!(s.seeds.len(), 8);
             let total: f64 = s.seeds.iter().map(|(_, _, m, _)| m).sum();
             assert!((total - 1.0).abs() < 1e-12, "masses sum to {total}");
@@ -556,7 +575,7 @@ mod tests {
 
         for token in [0u32, 7, 41, 63] {
             let want = model.embedding_of(token).to_vec();
-            let s = model.shatter(&grid, token);
+            let s = model.shatter(&grid, token, 0);
             let mut accumulated = vec![0.0; model.params().d_model()];
             for (_, slot, mass, payload) in &s.seeds {
                 let lo = *slot as usize * d_head;
@@ -582,15 +601,15 @@ mod tests {
         p.grid_side = 32;
         let mut model = Model::new(p, &mut rng);
 
-        let a = model.shatter(&grid, 11).seeds[0].0;
-        let b = model.shatter(&grid, 11).seeds[0].0;
+        let a = model.shatter(&grid, 11, 0).seeds[0].0;
+        let b = model.shatter(&grid, 11, 0).seeds[0].0;
         assert_eq!(a, b, "ingress is not a function of the token");
 
         let base = model.embedding_of(11).to_vec();
         let mut near = base.clone();
         near[0] += 1e-4;
         let far = model.embedding_of(30).to_vec();
-        let node_of = |t: u32, v: &[f64]| model.ingress.node_for(&grid, t, v, 0);
+        let node_of = |t: u32, v: &[f64]| model.ingress.node_for(&grid, t, 0, v, 0);
         assert_eq!(node_of(11, &base), node_of(11, &near), "a tiny change moved the ingress node");
         // Not a claim that unrelated tokens are always far, only that ingress is
         // not collapsing every token onto one node.
@@ -609,7 +628,7 @@ mod tests {
         let mut p = params();
         p.grid_side = 32;
         let mut model = Model::new(p, &mut rng);
-        let s = model.shatter(&grid, 3);
+        let s = model.shatter(&grid, 3, 0);
         let nodes: Vec<u32> = s.seeds.iter().map(|(n, _, _, _)| *n).collect();
         let distinct: std::collections::HashSet<_> = nodes.iter().collect();
         assert!(distinct.len() >= 6, "slots piled up: {} distinct of 8", distinct.len());
@@ -759,7 +778,7 @@ mod tests {
             let mut p = params();
             p.slots = slots;
             let mut model = Model::new(p, &mut rng);
-            let s = model.shatter(&grid, 1);
+            let s = model.shatter(&grid, 1, 0);
             assert_eq!(s.seeds.len(), slots);
             assert!(s.seeds.iter().all(|(_, _, _, v)| v.len() == 8));
         }

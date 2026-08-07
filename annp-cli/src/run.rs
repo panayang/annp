@@ -24,7 +24,7 @@ use std::path::Path;
 use annp_core::engine::EngineParams;
 use annp_core::graph::{Grid, SmallWorld, Topology};
 use annp_core::ladder::Schedule;
-use annp_core::model::ModelParams;
+use annp_core::model::{IngressMode, ModelParams};
 use annp_core::node::{AbsorbRule, NodeParams};
 use annp_core::rng::Rng;
 use annp_core::runtime::{Mode, Runtime, Scored};
@@ -210,14 +210,13 @@ pub struct Config {
     /// Give the output head its own weights instead of reusing the embedding
     /// table. Removes the symmetry the tied head imposes.
     pub untied: bool,
+    pub ingress: IngressMode,
     /// Send every token to the same anchor, ignoring content.
-    pub constant_ingress: bool,
     /// Admit tokens one per tick regardless of what is in flight. Leaks the
     /// future into earlier predictions; only for measuring by how much.
     pub overlapped: bool,
     /// Pin every token to its phase position instead of remembering where its
     /// mass came to rest. The control for the adaptive anchor.
-    pub fixed_ingress: bool,
     /// Use the old constant absorb logit. Reproduces the measurements that
     /// condemned it; not for new results.
     pub absorb: AbsorbRule,
@@ -272,8 +271,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     runtime.set_turnover(!cfg.frozen_topology);
     runtime.set_blind_turnover(cfg.blind_turnover);
     runtime.set_mode(if cfg.overlapped { Mode::Overlapped } else { Mode::Serial });
-    runtime.set_adaptive_ingress(!cfg.fixed_ingress);
-    runtime.set_constant_ingress(cfg.constant_ingress);
+    runtime.set_ingress_mode(cfg.ingress);
 
     // The source gets its own generator. Drawing it from the one the model
     // construction just used would make the data depend on the architecture:
@@ -413,7 +411,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     println!();
 
     let (known, distinct, mean_move) = runtime.model().ingress().drift();
-    println!("ingress anchors ({})", if cfg.fixed_ingress { "fixed at phase position" } else { "readout of resting place" });
+    println!("ingress: {:?}", cfg.ingress);
     println!("  tokens with a remembered anchor  {known} / {}", cfg.vocab);
     println!("  distinct cells occupied          {distinct}");
     println!("  mean move per observation        {mean_move:.2} (torus L1)");

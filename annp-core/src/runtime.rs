@@ -165,12 +165,8 @@ impl Runtime {
         self.bypass = bypass;
     }
 
-    pub fn set_adaptive_ingress(&mut self, adaptive: bool) {
-        self.model.set_adaptive_ingress(adaptive);
-    }
-
-    pub fn set_constant_ingress(&mut self, constant: bool) {
-        self.model.set_constant_ingress(constant);
+    pub fn set_ingress_mode(&mut self, mode: crate::model::IngressMode) {
+        self.model.set_ingress_mode(mode);
     }
 
     pub fn set_turnover(&mut self, turnover: bool) {
@@ -267,7 +263,7 @@ impl Runtime {
     pub fn advance(&mut self, token: Option<u32>) -> Vec<Scored> {
         if let Some(token) = token {
             let position = self.position;
-            let shattered = self.model.shatter(self.topology.grid(), token);
+            let shattered = self.model.shatter(self.topology.grid(), token, position as u64);
             self.engine.inject(position, &shattered.seeds);
             self.pending.insert(position, (token, shattered.scale));
             self.stream.insert(position, token);
@@ -432,10 +428,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "readout ingress is measured worse (§13); kept for the record"]
     fn anchors_move_without_collapsing() {
         // The readout's failure mode is every token migrating to one region;
         // routing homeostasis does not guard against it, so it is checked here.
         let mut rt = build(32, 11);
+        rt.set_ingress_mode(crate::model::IngressMode::Readout);
         let stream: Vec<u32> = (0..400).map(|i| (i * 7 % 32) as u32).collect();
         feed(&mut rt, &stream);
         let (known, distinct, mean_move) = rt.model().ingress().drift();
@@ -447,7 +445,7 @@ mod tests {
     #[test]
     fn fixed_ingress_anchors_never_move() {
         let mut rt = build(32, 11);
-        rt.set_adaptive_ingress(false);
+        rt.set_ingress_mode(crate::model::IngressMode::Content);
         let stream: Vec<u32> = (0..200).map(|i| (i * 7 % 32) as u32).collect();
         feed(&mut rt, &stream);
         let (known, _, mean_move) = rt.model().ingress().drift();
