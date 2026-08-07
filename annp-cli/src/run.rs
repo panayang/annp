@@ -210,6 +210,8 @@ pub struct Config {
     /// Give the output head its own weights instead of reusing the embedding
     /// table. Removes the symmetry the tied head imposes.
     pub untied: bool,
+    /// Send every token to the same anchor, ignoring content.
+    pub constant_ingress: bool,
     /// Admit tokens one per tick regardless of what is in flight. Leaks the
     /// future into earlier predictions; only for measuring by how much.
     pub overlapped: bool,
@@ -271,6 +273,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     runtime.set_blind_turnover(cfg.blind_turnover);
     runtime.set_mode(if cfg.overlapped { Mode::Overlapped } else { Mode::Serial });
     runtime.set_adaptive_ingress(!cfg.fixed_ingress);
+    runtime.set_constant_ingress(cfg.constant_ingress);
 
     // The source gets its own generator. Drawing it from the one the model
     // construction just used would make the data depend on the architecture:

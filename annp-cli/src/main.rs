@@ -147,6 +147,11 @@ enum Command {
         /// bigram at all.
         #[arg(long, default_value_t = false)]
         untied: bool,
+        /// Send every token to the same anchor. Forces consecutive tokens to
+        /// share nodes, which is the precondition every topology proposal
+        /// assumes and none has tested.
+        #[arg(long, default_value_t = false)]
+        constant_ingress: bool,
         /// Admit one token per tick regardless of what is still in flight.
         /// Leaks future tokens into earlier predictions; the difference against
         /// the default serial protocol is the size of that leak.
@@ -241,6 +246,7 @@ fn main() -> std::io::Result<()> {
             frozen_topology,
             blind_turnover,
             untied,
+            constant_ingress,
             overlapped,
             adaptive_ingress,
             absorb,
@@ -266,6 +272,7 @@ fn main() -> std::io::Result<()> {
                 frozen_topology,
                 blind_turnover,
                 untied,
+                constant_ingress,
                 overlapped,
                 fixed_ingress: !adaptive_ingress,
                 absorb: absorb.into(),

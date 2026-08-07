@@ -130,6 +130,16 @@ pub struct Ingress {
     offsets: Vec<(u32, u32)>,
     /// Where each token's mass last came to rest, once it has been observed.
     remembered: Vec<Option<(usize, usize)>>,
+    /// Send every token to the same anchor, ignoring its content.
+    ///
+    /// The decisive control for whether context can flow at all. Content
+    /// addressing places consecutive tokens at unrelated points, and with ~2.8
+    /// hops touching ~10 of 576 nodes their paths essentially never intersect
+    /// (DESIGN.md §20). Pinning every token to one anchor forces maximal
+    /// sharing: if context still does not flow under that, no topology will fix
+    /// it, because the node transform is not carrying context in the first
+    /// place.
+    constant_anchor: bool,
     /// How far anchors have travelled in total, and over how many moves. Rising
     /// distinct-anchor counts with bounded drift is a map forming; drift that
     /// never settles, or a collapsing anchor count, is the failure mode.
@@ -187,6 +197,7 @@ impl Ingress {
             moves: 0,
             travelled: 0,
             adaptive: true,
+            constant_anchor: false,
         }
     }
 
@@ -194,6 +205,10 @@ impl Ingress {
     /// control for whether remembering the resting place buys anything.
     pub fn set_adaptive(&mut self, adaptive: bool) {
         self.adaptive = adaptive;
+    }
+
+    pub fn set_constant_anchor(&mut self, constant: bool) {
+        self.constant_anchor = constant;
     }
 
     /// Records where a token's mass came to rest. Returns how far its anchor
@@ -225,6 +240,9 @@ impl Ingress {
     /// Where this token enters: its remembered resting place if it has one,
     /// otherwise the phase of its embedding.
     pub fn anchor(&self, token: u32, embedding: &[f64]) -> (usize, usize) {
+        if self.constant_anchor {
+            return (self.side / 2, self.side / 2);
+        }
         match self.remembered[token as usize] {
             Some(a) => a,
             None => self.phase_anchor(embedding),
@@ -347,6 +365,10 @@ impl Model {
 
     pub fn set_adaptive_ingress(&mut self, adaptive: bool) {
         self.ingress.set_adaptive(adaptive);
+    }
+
+    pub fn set_constant_ingress(&mut self, constant: bool) {
+        self.ingress.set_constant_anchor(constant);
     }
 
     /// Remembers where a token's mass came to rest, for its next entry.

@@ -169,6 +169,10 @@ impl Runtime {
         self.model.set_adaptive_ingress(adaptive);
     }
 
+    pub fn set_constant_ingress(&mut self, constant: bool) {
+        self.model.set_constant_ingress(constant);
+    }
+
     pub fn set_turnover(&mut self, turnover: bool) {
         self.turnover = turnover;
     }
