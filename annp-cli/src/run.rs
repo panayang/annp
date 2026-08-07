@@ -139,7 +139,7 @@ pub struct Config {
     pub fixed_ingress: bool,
     /// Use the old constant absorb logit. Reproduces the measurements that
     /// condemned it; not for new results.
-    pub fixed_absorb: bool,
+    pub absorb: AbsorbRule,
 }
 
 fn mean(xs: &[f64]) -> f64 {
@@ -176,7 +176,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             learning_rate: cfg.learning_rate,
         },
         NodeParams {
-            absorb: if cfg.fixed_absorb { AbsorbRule::FixedReference } else { AbsorbRule::Relative },
+            absorb: cfg.absorb,
             d_head: cfg.d_head,
             eta: cfg.eta,
             schedule,
@@ -215,6 +215,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
 
     println!("run — synthetic Markov source, {} tokens{}", scored.len(),
         if cfg.bypass { "  [BYPASS]" } else { "" });
+    println!("  absorb rule: {:?}", cfg.absorb);
     println!("  protocol: {}", if cfg.overlapped {
         "OVERLAPPED — leaks future tokens, loss is NOT a compression bound"
     } else {

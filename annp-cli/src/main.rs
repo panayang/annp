@@ -10,7 +10,30 @@ mod topology;
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use annp_core::node::AbsorbRule;
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// CLI spelling of `AbsorbRule`, kept separate so the core crate does not
+/// depend on clap.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AbsorbArg {
+    /// Constant logit of zero. Reproduces the measurements that condemned it.
+    Fixed,
+    /// Move on only if a neighbour expects this better than the current node.
+    Relative,
+    /// As `relative`, less the node's own surprise.
+    Surprise,
+}
+
+impl From<AbsorbArg> for AbsorbRule {
+    fn from(a: AbsorbArg) -> Self {
+        match a {
+            AbsorbArg::Fixed => AbsorbRule::FixedReference,
+            AbsorbArg::Relative => AbsorbRule::Relative,
+            AbsorbArg::Surprise => AbsorbRule::RelativeSurprise,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "annp", about = "ANNP experiments", version)]
@@ -98,7 +121,9 @@ enum Command {
         mass_floor: f64,
         #[arg(long, default_value_t = 1.0)]
         eta: f64,
-        #[arg(long, default_value_t = 0.05)]
+        /// Zero by default: measured at 0.05 it costs 0.58% and buys 0.7
+        /// points of load balance (DESIGN.md §15.2).
+        #[arg(long, default_value_t = 0.0)]
         homeostasis: f64,
         #[arg(long, default_value_t = 0.05)]
         learning_rate: f64,
@@ -121,9 +146,9 @@ enum Command {
         /// worse — the anchor random-walks and never settles (DESIGN.md §13).
         #[arg(long, default_value_t = false)]
         adaptive_ingress: bool,
-        /// Use the old constant absorb logit instead of the relative rule.
-        #[arg(long, default_value_t = false)]
-        fixed_absorb: bool,
+        /// How a node decides whether to forward a particle at all.
+        #[arg(long, value_enum, default_value_t = AbsorbArg::Surprise)]
+        absorb: AbsorbArg,
         #[arg(long, default_value = "results/run")]
         out: PathBuf,
     },
@@ -205,7 +230,7 @@ fn main() -> std::io::Result<()> {
             bypass,
             overlapped,
             adaptive_ingress,
-            fixed_absorb,
+            absorb,
             out,
         } => {
             let cfg = run::Config {
@@ -228,7 +253,7 @@ fn main() -> std::io::Result<()> {
                 bypass,
                 overlapped,
                 fixed_ingress: !adaptive_ingress,
-                fixed_absorb,
+                absorb: absorb.into(),
             };
             run::run(&cfg, &out)
         }

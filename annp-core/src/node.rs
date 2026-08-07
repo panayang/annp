@@ -90,6 +90,22 @@ pub enum AbsorbRule {
     /// Stop unless some neighbour expects this content better than the current
     /// node does. Homeostasis cannot influence the decision.
     Relative,
+    /// `Relative`, with the node's own surprise subtracted from the reference:
+    /// stop where you are understood, keep moving where you are not.
+    ///
+    /// A node that predicted this arrival well has nothing left to learn from
+    /// it and the particle is home; a node that was surprised does not
+    /// understand it, and the particle should keep looking. Surprise is already
+    /// computed, is already the design's one credit signal, and shares units
+    /// with the inner products (both come from unit vectors), so this costs no
+    /// new constant.
+    ///
+    /// It also anneals by itself. An untrained node has surprise ~1, which
+    /// drops the reference far enough that every neighbour is a candidate; as
+    /// the network learns, surprise falls, the reference rises, and paths
+    /// shorten. The exploration schedule is driven by how well the network
+    /// understands its input rather than by a hand-set temperature.
+    RelativeSurprise,
     /// Absorption competes at a constant logit of zero. Kept to reproduce the
     /// measurements that condemned it; do not use for new results.
     FixedReference,
@@ -191,12 +207,18 @@ impl Node {
             emitted.copy_from_slice(q);
         }
 
-        let weights = self.route(ctx, &emitted, scratch);
+        let weights = self.route(ctx, &emitted, surprise, scratch);
         Outcome { emitted, surprise, weights }
     }
 
     /// Routing weights over `out_edges ++ [absorb]`, summing to one.
-    fn route(&mut self, ctx: &Context<'_>, emitted: &[f64], scratch: &mut Scratch) -> Vec<f64> {
+    fn route(
+        &mut self,
+        ctx: &Context<'_>,
+        emitted: &[f64],
+        surprise: f64,
+        scratch: &mut Scratch,
+    ) -> Vec<f64> {
         let Context { params, out_edges, expects, self_expect, top_k } = *ctx;
         let d = params.d_head;
         let absorb_slot = out_edges.len();
@@ -211,6 +233,7 @@ impl Node {
         let mut weights = vec![0.0; absorb_slot + 1];
         let reference = match params.absorb {
             AbsorbRule::Relative => dot(emitted, self_expect),
+            AbsorbRule::RelativeSurprise => dot(emitted, self_expect) - surprise,
             AbsorbRule::FixedReference => 0.0,
         };
 
@@ -219,7 +242,7 @@ impl Node {
         // where it fits best, and it stops.
         order.clear();
         order.extend((0..absorb_slot).filter(|&j| match params.absorb {
-            AbsorbRule::Relative => logits[j] > reference,
+            AbsorbRule::Relative | AbsorbRule::RelativeSurprise => logits[j] > reference,
             AbsorbRule::FixedReference => true,
         }));
         if order.is_empty() {
@@ -461,6 +484,37 @@ mod tests {
             assert!((total - 1.0).abs() < 1e-12, "weights sum to {total}");
             assert!(out.weights.iter().all(|w| *w >= 0.0));
         }
+    }
+
+    #[test]
+    fn surprise_reopens_an_untrained_network() {
+        // The counterpart to `an_untrained_network_absorbs_immediately`: under
+        // the plain relative rule nothing beats where the particle already is,
+        // so it never moves. Subtracting an untrained node's surprise (~1)
+        // drops the reference far enough that every neighbour qualifies, and
+        // the annealing back to a short path is driven by learning rather than
+        // by a schedule.
+        let mut rng = Rng::new(31);
+        let t = Topology::small_world(Grid::new(6), SmallWorld::default(), &mut rng);
+        let mut bank = NodeBank::new(
+            &t,
+            NodeParams {
+                absorb: AbsorbRule::RelativeSurprise,
+                d_head: 16,
+                eta: 1.0,
+                schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
+                rungs: 4,
+                homeostasis: 0.0,
+            },
+        );
+        // The very first arrival at a node has no predecessor, so surprise is
+        // zero by definition and it behaves like the plain relative rule.
+        let q = unit(&mut rng, 16);
+        assert_eq!(bank.process(&t, 0, &q, 3).weights[t.degree(0)], 1.0);
+        // The second arrival is genuinely unpredicted, and now it travels.
+        let q2 = unit(&mut rng, 16);
+        let out = bank.process(&t, 0, &q2, 3);
+        assert!(out.weights[t.degree(0)] < 1.0, "surprise did not reopen any route");
     }
 
     #[test]
