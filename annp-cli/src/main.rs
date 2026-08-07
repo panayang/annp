@@ -96,9 +96,14 @@ enum Command {
     Run {
         #[arg(long, default_value_t = 20_000)]
         tokens: usize,
-        #[arg(long, default_value_t = 64)]
+        #[arg(long, default_value_t = 16)]
         vocab: usize,
-        /// Successors per state. Lower means a more predictable source.
+        /// Markov order. At 1 the current token is a sufficient statistic and
+        /// no context-using model can beat a context-free one; above 1 context
+        /// is worth something.
+        #[arg(long, default_value_t = 2)]
+        order: usize,
+        /// Successors per context. Lower means a more predictable source.
         #[arg(long, default_value_t = 3)]
         fanout: usize,
         #[arg(long, default_value_t = 16)]
@@ -219,6 +224,7 @@ fn main() -> std::io::Result<()> {
         Command::Run {
             tokens,
             vocab,
+            order,
             fanout,
             d_head,
             slots,
@@ -243,7 +249,8 @@ fn main() -> std::io::Result<()> {
             let cfg = run::Config {
                 tokens,
                 vocab,
-                fanout,
+                order,
+            fanout,
                 d_head,
                 slots,
                 grid_side,

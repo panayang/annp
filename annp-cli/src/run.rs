@@ -29,24 +29,35 @@ use annp_core::node::{AbsorbRule, NodeParams};
 use annp_core::rng::Rng;
 use annp_core::runtime::{Mode, Runtime, Scored};
 
-/// A fixed random Markov chain, sparse enough to have a low entropy rate.
+/// A fixed random Markov chain of order `k`, sparse enough to have a low
+/// entropy rate.
 ///
-/// Each state moves to one of `fanout` successors with probabilities drawn from
-/// a Dirichlet-ish normalisation of uniforms. The entropy rate is the
-/// stationary-weighted average of the per-state entropies, computed exactly by
-/// power iteration rather than estimated.
+/// Order matters more than anything else about this source. At order 1 the
+/// current token is a sufficient statistic, so a model that reads only the
+/// current token is optimal *by construction* and every additional mechanism
+/// can do nothing but add noise — which is exactly what §19 found. At order
+/// `k > 1` the current token is provably insufficient, so context is worth
+/// something and an architecture built to accumulate it has something to earn.
 pub struct MarkovSource {
+    vocab: usize,
+    order: usize,
+    /// Contexts are the last `order` tokens, most recent in the lowest digit.
+    contexts: usize,
     successors: Vec<Vec<u32>>,
     probabilities: Vec<Vec<f64>>,
-    state: u32,
+    context: usize,
 }
 
 impl MarkovSource {
-    pub fn new(vocab: usize, fanout: usize, rng: &mut Rng) -> Self {
+    pub fn new(vocab: usize, order: usize, fanout: usize, rng: &mut Rng) -> Self {
+        assert!(order >= 1, "order must be at least 1");
         assert!(fanout >= 1 && fanout < vocab, "fanout must be a proper subset of the vocabulary");
-        let mut successors = Vec::with_capacity(vocab);
-        let mut probabilities = Vec::with_capacity(vocab);
-        for _ in 0..vocab {
+        let contexts = vocab
+            .checked_pow(order as u32)
+            .expect("vocab^order overflowed; lower the vocabulary or the order");
+        let mut successors = Vec::with_capacity(contexts);
+        let mut probabilities = Vec::with_capacity(contexts);
+        for _ in 0..contexts {
             let mut to: Vec<u32> = Vec::with_capacity(fanout);
             while to.len() < fanout {
                 let candidate = rng.next_below(vocab as u64) as u32;
@@ -62,81 +73,112 @@ impl MarkovSource {
             successors.push(to);
             probabilities.push(p);
         }
-        Self { successors, probabilities, state: 0 }
+        Self { vocab, order, contexts, successors, probabilities, context: 0 }
+    }
+
+    #[inline]
+    pub fn order(&self) -> usize {
+        self.order
+    }
+
+    /// Context reached by appending `next` and dropping the oldest token.
+    #[inline]
+    fn shift(&self, context: usize, next: u32) -> usize {
+        (context * self.vocab + next as usize) % self.contexts
     }
 
     pub fn next(&mut self, rng: &mut Rng) -> u32 {
         let u = rng.next_f64();
-        let (to, p) =
-            (&self.successors[self.state as usize], &self.probabilities[self.state as usize]);
+        let (to, p) = (&self.successors[self.context], &self.probabilities[self.context]);
         let mut acc = 0.0;
+        let mut chosen = *to.last().expect("fanout is at least one");
         for (t, w) in to.iter().zip(p) {
             acc += w;
             if u < acc {
-                self.state = *t;
-                return *t;
+                chosen = *t;
+                break;
             }
         }
-        self.state = *to.last().expect("fanout is at least one");
-        self.state
+        self.context = self.shift(self.context, chosen);
+        chosen
     }
 
-    /// Exact entropy rate in nats: `sum_i pi_i H(p_i)`.
+    /// Exact entropy rate in nats: `sum_c pi_c H(p_c)` over contexts.
     pub fn entropy_rate(&self) -> f64 {
-        let n = self.successors.len();
+        let n = self.contexts;
         let mut pi = vec![1.0 / n as f64; n];
         let mut next = vec![0.0; n];
-        // Power iteration. The chain is sparse and random, so this converges
-        // fast; a fixed generous budget keeps the result reproducible.
-        for _ in 0..10_000 {
+        for _ in 0..20_000 {
             next.fill(0.0);
-            for ((to, p), mass) in self.successors.iter().zip(&self.probabilities).zip(&pi) {
+            for (c, ((to, p), mass)) in
+                self.successors.iter().zip(&self.probabilities).zip(&pi).enumerate()
+            {
                 for (t, w) in to.iter().zip(p) {
-                    next[*t as usize] += mass * w;
+                    next[self.shift(c, *t)] += mass * w;
                 }
             }
             std::mem::swap(&mut pi, &mut next);
         }
         let total: f64 = pi.iter().sum();
         (0..n)
-            .map(|i| {
-                let h: f64 = self.probabilities[i]
+            .map(|c| {
+                let h: f64 = self.probabilities[c]
                     .iter()
                     .map(|p| if *p > 0.0 { -p * p.ln() } else { 0.0 })
                     .sum();
-                pi[i] / total * h
+                pi[c] / total * h
             })
             .sum()
     }
 }
 
-/// Prequential bigram coder: predict the next token from counts of what has
-/// followed the current one so far, then update.
+/// Prequential counting coder of a given order: predict the next token from
+/// counts of what has followed this context so far, then update.
 ///
-/// The absolute yardstick every other number in this bench needs. It is the
-/// dumbest thing that models this source at all, it is online and single-pass
-/// exactly like everything else here, and its code length is valid for the
-/// same reason. Krichevsky-Trofimov smoothing (add one half) so an unseen
-/// transition is merely improbable rather than impossible.
-struct BigramCoder {
+/// The absolute yardsticks this bench needs, and two are reported. The
+/// **order-1** coder is what is achievable knowing only the current token, so
+/// it is the ceiling on any context-free model — including a bypass control.
+/// The **order-k** coder matches the source and is the ceiling on anything.
+/// The gap between them is the headroom that context provides, and therefore
+/// the only part of the task an architecture built to accumulate context can
+/// possibly be credited for.
+///
+/// Both are online and single-pass exactly like everything else here, so their
+/// code lengths are valid on the same terms. Krichevsky-Trofimov smoothing (add
+/// one half) so an unseen transition is improbable rather than impossible.
+struct CountingCoder {
     vocab: usize,
+    order: usize,
+    contexts: usize,
     counts: Vec<f64>,
     totals: Vec<f64>,
+    context: usize,
 }
 
-impl BigramCoder {
-    fn new(vocab: usize) -> Self {
-        Self { vocab, counts: vec![0.0; vocab * vocab], totals: vec![0.0; vocab] }
+impl CountingCoder {
+    fn new(vocab: usize, order: usize) -> Self {
+        let contexts = vocab.checked_pow(order as u32).expect("vocab^order overflowed");
+        Self {
+            vocab,
+            order,
+            contexts,
+            counts: vec![0.0; contexts * vocab],
+            totals: vec![0.0; contexts],
+            context: 0,
+        }
     }
 
-    /// Nats charged for coding `next` given `current`, before updating.
-    fn observe(&mut self, current: u32, next: u32) -> f64 {
-        let (c, n) = (current as usize, next as usize);
+    /// Nats charged for coding `next` from the context seen so far, then the
+    /// counts and the context advance.
+    fn observe(&mut self, next: u32) -> f64 {
         let alpha = 0.5;
+        let (c, n) = (self.context, next as usize);
         let p = (self.counts[c * self.vocab + n] + alpha)
             / (self.totals[c] + alpha * self.vocab as f64);
         self.counts[c * self.vocab + n] += 1.0;
         self.totals[c] += 1.0;
+        self.context = (c * self.vocab + n) % self.contexts;
+        let _ = self.order;
         -p.ln()
     }
 }
@@ -145,6 +187,7 @@ impl BigramCoder {
 pub struct Config {
     pub tokens: usize,
     pub vocab: usize,
+    pub order: usize,
     pub fanout: usize,
     pub d_head: usize,
     pub slots: usize,
@@ -235,29 +278,28 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     // sweep over slot counts silently swept over Markov chains too. The printed
     // entropy rate is the guard — it must not move across a sweep.
     let mut source =
-        MarkovSource::new(cfg.vocab, cfg.fanout, &mut Rng::new(cfg.seed ^ 0x50_17_CE_50_17_CE_00));
+        MarkovSource::new(cfg.vocab, cfg.order, cfg.fanout, &mut Rng::new(cfg.seed ^ 0x50_17_CE_50_17_CE_00));
     let entropy_rate = source.entropy_rate();
 
     let started = std::time::Instant::now();
     let mut scored: Vec<Scored> = Vec::with_capacity(cfg.tokens);
     let mut stream_rng = Rng::new(cfg.seed ^ 0x5EED);
-    let mut bigram = BigramCoder::new(cfg.vocab);
-    let mut bigram_nats = 0.0;
-    let mut bigram_tail = 0.0;
-    let mut previous: Option<u32> = None;
+    let mut coders =
+        [CountingCoder::new(cfg.vocab, 1), CountingCoder::new(cfg.vocab, cfg.order)];
+    let mut coder_nats = [0.0f64; 2];
+    let mut coder_tail = [0.0f64; 2];
     for i in 0..cfg.tokens {
         let token = source.next(&mut stream_rng);
-        if let Some(prev) = previous {
-            let nats = bigram.observe(prev, token);
-            bigram_nats += nats;
+        for (k, coder) in coders.iter_mut().enumerate() {
+            let nats = coder.observe(token);
+            coder_nats[k] += nats;
             if i * 10 >= cfg.tokens * 9 {
-                bigram_tail += nats;
+                coder_tail[k] += nats;
             }
         }
-        previous = Some(token);
         scored.extend(runtime.advance(Some(token)));
     }
-    let bigram_tail_count = (cfg.tokens - cfg.tokens * 9 / 10).max(1) as f64;
+    let tail_count = (cfg.tokens - cfg.tokens * 9 / 10).max(1) as f64;
     scored.extend(runtime.drain(100_000));
     let elapsed = started.elapsed();
 
@@ -273,8 +315,9 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         "serial — one token in flight, loss is a valid compression bound"
     });
     println!(
-        "  vocab={} fanout={} d_head={} slots={} grid={}x{} deg={} floor={}",
+        "  vocab={} order={} fanout={} d_head={} slots={} grid={}x{} deg={} floor={}",
         cfg.vocab,
+        cfg.order,
         cfg.fanout,
         cfg.d_head,
         cfg.slots,
@@ -307,16 +350,25 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         );
     }
     println!(
-        "  {:<26} {:>8.4}",
-        "prequential bigram",
-        bigram_tail / bigram_tail_count * nats_to_bits
+        "  {:<26} {:>8.4}   <- ceiling on any context-free model",
+        "order-1 counting coder",
+        coder_tail[0] / tail_count * nats_to_bits
+    );
+    println!(
+        "  {:<26} {:>8.4}   <- ceiling on anything",
+        format!("order-{} counting coder", source.order()),
+        coder_tail[1] / tail_count * nats_to_bits
     );
     println!("  {:<26} {:>8.4}", "source entropy rate", entropy_rate * nats_to_bits);
+    println!(
+        "  context is worth {:.4} bits/token: everything between the two coders",
+        (coder_tail[0] - coder_tail[1]) / tail_count * nats_to_bits
+    );
     println!(
         "  prequential total: {:.1} bits over {} tokens   (bigram coder: {:.1})",
         scored.iter().map(|s| s.loss).sum::<f64>() * nats_to_bits,
         scored.len(),
-        bigram_nats * nats_to_bits
+        coder_nats[1] * nats_to_bits
     );
     println!();
 
@@ -393,33 +445,84 @@ mod tests {
     #[test]
     fn a_deterministic_chain_has_zero_entropy_rate() {
         let mut rng = Rng::new(1);
-        let source = MarkovSource::new(64, 1, &mut rng);
-        assert!(source.entropy_rate() < 1e-12, "{}", source.entropy_rate());
+        for order in [1usize, 2] {
+            let source = MarkovSource::new(16, order, 1, &mut rng);
+            assert!(source.entropy_rate() < 1e-12, "order {order}: {}", source.entropy_rate());
+        }
     }
 
     #[test]
     fn entropy_rate_is_bounded_by_the_fanout() {
-        // A state with `fanout` successors cannot exceed ln(fanout) nats, and a
-        // chain of such states cannot exceed it on average either.
         let mut rng = Rng::new(2);
-        for fanout in [2usize, 4, 8] {
-            let source = MarkovSource::new(64, fanout, &mut rng);
-            let h = source.entropy_rate();
-            assert!(h > 0.0 && h < (fanout as f64).ln(), "fanout {fanout}: {h}");
+        for order in [1usize, 2] {
+            for fanout in [2usize, 4, 8] {
+                let source = MarkovSource::new(16, order, fanout, &mut rng);
+                let h = source.entropy_rate();
+                assert!(h > 0.0 && h < (fanout as f64).ln(), "order {order} fanout {fanout}: {h}");
+            }
         }
     }
 
     #[test]
-    fn the_source_only_emits_declared_successors() {
+    fn the_source_only_emits_successors_of_its_current_context() {
         let mut rng = Rng::new(3);
-    let mut source = MarkovSource::new(32, 3, &mut rng);
+        let mut source = MarkovSource::new(16, 2, 3, &mut rng);
         let mut stream = Rng::new(4);
-        let mut state = source.state;
         for _ in 0..5_000 {
-            let allowed = source.successors[state as usize].clone();
+            let context = source.context;
+            let allowed = source.successors[context].clone();
             let next = source.next(&mut stream);
-            assert!(allowed.contains(&next), "{state} -> {next} is not an edge");
-            state = next;
+            assert!(allowed.contains(&next), "context {context} -> {next} is not an edge");
         }
+    }
+
+    #[test]
+    fn a_higher_order_source_is_not_predictable_from_one_token() {
+        // The property that makes this bench able to measure a context-using
+        // model at all. At order 2 the same token is followed by different
+        // things depending on what preceded it; at order 1 it never is, which
+        // is why §19 found the network could only ever add noise.
+        let vocab = 16usize;
+        let mut rng = Rng::new(5);
+        let source = MarkovSource::new(vocab, 2, 3, &mut rng);
+        let mut context_dependent = 0;
+        for token in 0..vocab {
+            let futures: Vec<Vec<u32>> = (0..vocab)
+                .map(|earlier| {
+                    let mut s = source.successors[earlier * vocab + token].clone();
+                    s.sort_unstable();
+                    s
+                })
+                .collect();
+            if futures.iter().any(|f| *f != futures[0]) {
+                context_dependent += 1;
+            }
+        }
+        assert!(
+            context_dependent > vocab / 2,
+            "only {context_dependent} of {vocab} tokens have context-dependent futures"
+        );
+    }
+
+    #[test]
+    fn the_order_k_coder_beats_the_order_1_coder_on_a_higher_order_source() {
+        // The gap between the two yardsticks is the headroom context provides.
+        // If it were not positive, the bench would be back to being unable to
+        // measure a context-using model.
+        let vocab = 16usize;
+        let mut rng = Rng::new(7);
+        let mut source = MarkovSource::new(vocab, 2, 3, &mut rng);
+        let mut stream = Rng::new(8);
+        let (mut c1, mut c2) = (CountingCoder::new(vocab, 1), CountingCoder::new(vocab, 2));
+        let (mut n1, mut n2) = (0.0, 0.0);
+        for i in 0..60_000 {
+            let t = source.next(&mut stream);
+            let (a, b) = (c1.observe(t), c2.observe(t));
+            if i >= 40_000 {
+                n1 += a;
+                n2 += b;
+            }
+        }
+        assert!(n2 < n1 * 0.8, "order-2 coder {n2} did not clearly beat order-1 {n1}");
     }
 }
