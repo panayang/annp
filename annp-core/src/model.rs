@@ -68,9 +68,18 @@ pub struct Rotation {
 
 impl Rotation {
     pub fn new(n: usize, rng: &mut Rng) -> Self {
-        assert!(n.is_power_of_two(), "the Hadamard transform needs a power-of-two width, got {n}");
-        let signs = (0..n).map(|_| if rng.next_u64() & 1 == 0 { 1.0 } else { -1.0 }).collect();
-        Self { n, signs, scale: 1.0 / (n as f64).sqrt() }
+        assert!(
+            n.is_power_of_two(),
+            "the Hadamard transform needs a power-of-two width, got {n}"
+        );
+        let signs = (0..n)
+            .map(|_| if rng.next_u64() & 1 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        Self {
+            n,
+            signs,
+            scale: 1.0 / (n as f64).sqrt(),
+        }
     }
 
     #[inline]
@@ -177,7 +186,10 @@ impl Ingress {
                 }
             }
             let len = norm(&planes[i]);
-            assert!(len > 1e-9, "degenerate ingress plane; is d_model at least 4?");
+            assert!(
+                len > 1e-9,
+                "degenerate ingress plane; is d_model at least 4?"
+            );
             for x in planes[i].iter_mut() {
                 *x /= len;
             }
@@ -194,13 +206,18 @@ impl Ingress {
                 let dy = rng.next_below((2 * radius + 1) as u64) as i64 - radius;
                 tries += 1;
                 let inside = dx * dx + dy * dy <= radius * radius;
-                let wrapped =
-                    (dx.rem_euclid(side as i64) as u32, dy.rem_euclid(side as i64) as u32);
+                let wrapped = (
+                    dx.rem_euclid(side as i64) as u32,
+                    dy.rem_euclid(side as i64) as u32,
+                );
                 if inside && (!offsets.contains(&wrapped) || tries > 200) {
                     offsets.push(wrapped);
                     break;
                 }
-                assert!(tries < 10_000, "cannot place {slots} slots on a side-{side} grid");
+                assert!(
+                    tries < 10_000,
+                    "cannot place {slots} slots on a side-{side} grid"
+                );
             }
         }
         Self {
@@ -240,7 +257,11 @@ impl Ingress {
     pub fn drift(&self) -> (usize, usize, f64) {
         let known: Vec<(usize, usize)> = self.remembered.iter().flatten().copied().collect();
         let distinct: std::collections::HashSet<(usize, usize)> = known.iter().copied().collect();
-        let mean = if self.moves > 0 { self.travelled as f64 / self.moves as f64 } else { 0.0 };
+        let mean = if self.moves > 0 {
+            self.travelled as f64 / self.moves as f64
+        } else {
+            0.0
+        };
         (known.len(), distinct.len(), mean)
     }
 
@@ -273,7 +294,10 @@ impl Ingress {
             let unit = (angle + std::f64::consts::PI) / std::f64::consts::TAU;
             ((unit * self.side as f64) as usize).min(self.side - 1)
         };
-        (phase(&self.planes[0], &self.planes[1]), phase(&self.planes[2], &self.planes[3]))
+        (
+            phase(&self.planes[0], &self.planes[1]),
+            phase(&self.planes[2], &self.planes[3]),
+        )
     }
 
     /// Entry node for one slot of a token with this embedding.
@@ -373,8 +397,9 @@ impl Model {
         // Unit-norm rows in expectation, so a fresh embedding is already in the
         // range the unit-norm payload invariant expects.
         let sigma = 1.0 / (d_model as f64).sqrt();
-        let init: Vec<f64> =
-            (0..params.vocab * d_model).map(|_| rng.next_normal() * sigma).collect();
+        let init: Vec<f64> = (0..params.vocab * d_model)
+            .map(|_| rng.next_normal() * sigma)
+            .collect();
         embedding.initialise(&init);
 
         let head = (!params.tied).then(|| {
@@ -385,13 +410,25 @@ impl Model {
             }
         });
 
-        let lookup = match params.head_kind {
-            HeadKind::Lookup { slots } => Some(LookupHead::new(params.vocab, d_model, slots, rng)),
-            HeadKind::Linear => None,
-        };
-
+        // Structure first, and only then the head, off a generator of its own.
+        // Drawing the head from the shared stream made turning it on shift the
+        // rotation signs and the ingress planes, so "linear head vs lookup
+        // head" was never comparing two runs that differed in one thing. This
+        // is the same defect as the source once had (§19): a configuration
+        // change must not be able to perturb structure it has nothing to do
+        // with.
         let rotation = Rotation::new(d_model, rng);
         let ingress = Ingress::new(params.grid_side, d_model, params.slots, params.vocab, rng);
+        // Drawn unconditionally so the shared stream advances the same way
+        // whichever head is in use; a conditional draw would work today and
+        // break the moment anything else is constructed after this.
+        let mut head_rng = Rng::new(rng.next_u64() ^ 0x4E_AD_5E_ED_00_11_22_33);
+        let lookup = match params.head_kind {
+            HeadKind::Lookup { slots } => {
+                Some(LookupHead::new(params.vocab, d_model, slots, &mut head_rng))
+            }
+            HeadKind::Linear => None,
+        };
         Self {
             params,
             embedding,
@@ -445,8 +482,9 @@ impl Model {
         self.embed_buf.copy_from_slice(&anchor_source);
         self.rotation.forward(&mut self.embed_buf);
 
-        let magnitudes: Vec<f64> =
-            (0..slots).map(|s| norm(&self.embed_buf[s * d_head..(s + 1) * d_head])).collect();
+        let magnitudes: Vec<f64> = (0..slots)
+            .map(|s| norm(&self.embed_buf[s * d_head..(s + 1) * d_head]))
+            .collect();
         let scale: f64 = magnitudes.iter().sum();
         assert!(scale > 1e-12, "token {token} has a degenerate embedding");
 
@@ -463,7 +501,9 @@ impl Model {
                     v[0] = 1.0;
                     v
                 };
-                let node = self.ingress.node_for(grid, token, position, &anchor_source, s);
+                let node = self
+                    .ingress
+                    .node_for(grid, token, position, &anchor_source, s);
                 (node, s as u16, mag / scale, payload)
             })
             .collect();
@@ -506,8 +546,15 @@ impl Model {
     /// Cross-entropy without updating anything. Leaves the softmax in
     /// `logit_buf` for `learn` to reuse.
     pub fn cross_entropy(&mut self, assembled: &[f64], target: u32) -> f64 {
-        assert_eq!(assembled.len(), self.params.d_model(), "assembled width mismatch");
-        assert!((target as usize) < self.params.vocab, "target out of vocabulary");
+        assert_eq!(
+            assembled.len(),
+            self.params.d_model(),
+            "assembled width mismatch"
+        );
+        assert!(
+            (target as usize) < self.params.vocab,
+            "target out of vocabulary"
+        );
         if let Some(lookup) = self.lookup.as_mut() {
             let loss = lookup.score(assembled, target);
             self.logit_buf.copy_from_slice(lookup.last_mixture());
@@ -564,7 +611,11 @@ mod tests {
         rng.fill_unit_vector(&mut v);
         let original = v.clone();
         rot.forward(&mut v);
-        assert!((norm(&v) - 1.0).abs() < 1e-12, "Parseval violated: {}", norm(&v));
+        assert!(
+            (norm(&v) - 1.0).abs() < 1e-12,
+            "Parseval violated: {}",
+            norm(&v)
+        );
         rot.inverse(&mut v);
         for (got, want) in v.iter().zip(&original) {
             assert!((got - want).abs() < 1e-12);
@@ -581,7 +632,10 @@ mod tests {
         v[0] = 1.0;
         rot.forward(&mut v);
         for x in &v {
-            assert!((x.abs() - 1.0 / 8.0).abs() < 1e-12, "energy not spread: {x}");
+            assert!(
+                (x.abs() - 1.0 / 8.0).abs() < 1e-12,
+                "energy not spread: {x}"
+            );
         }
     }
 
@@ -649,12 +703,20 @@ mod tests {
         near[0] += 1e-4;
         let far = model.embedding_of(30).to_vec();
         let node_of = |t: u32, v: &[f64]| model.ingress.node_for(&grid, t, 0, v, 0);
-        assert_eq!(node_of(11, &base), node_of(11, &near), "a tiny change moved the ingress node");
+        assert_eq!(
+            node_of(11, &base),
+            node_of(11, &near),
+            "a tiny change moved the ingress node"
+        );
         // Not a claim that unrelated tokens are always far, only that ingress is
         // not collapsing every token onto one node.
         let spread: std::collections::HashSet<u32> =
             (0..64).map(|t| node_of(t, model.embedding_of(t))).collect();
-        assert!(spread.len() > 20, "only {} distinct entry nodes for 64 tokens", spread.len());
+        assert!(
+            spread.len() > 20,
+            "only {} distinct entry nodes for 64 tokens",
+            spread.len()
+        );
         let _ = far;
     }
 
@@ -670,7 +732,11 @@ mod tests {
         let s = model.shatter(&grid, 3, 0);
         let nodes: Vec<u32> = s.seeds.iter().map(|(n, _, _, _)| *n).collect();
         let distinct: std::collections::HashSet<_> = nodes.iter().collect();
-        assert!(distinct.len() >= 6, "slots piled up: {} distinct of 8", distinct.len());
+        assert!(
+            distinct.len() >= 6,
+            "slots piled up: {} distinct of 8",
+            distinct.len()
+        );
         for &a in &nodes {
             for &b in &nodes {
                 assert!(grid.distance(a, b) <= 8, "slots scattered across the grid");
@@ -714,7 +780,9 @@ mod tests {
         let head = untied.head.as_ref().expect("untied").read().clone();
         let raw = |u: u32, v: u32| {
             let e = untied.embedding_of(u);
-            (0..d_model).map(|i| head.get(v as usize, i) * e[i]).sum::<f64>()
+            (0..d_model)
+                .map(|i| head.get(v as usize, i) * e[i])
+                .sum::<f64>()
         };
         assert!(
             (raw(3, 9) - raw(9, 3)).abs() > 1e-6,
@@ -738,8 +806,14 @@ mod tests {
         let on_other = model.cross_entropy(&e5, 20);
         let uniform = 64f64.ln();
         assert!(on_self < on_other, "tying should favour the current token");
-        assert!((on_other - uniform).abs() < 0.5, "off-diagonal loss {on_other} vs ln(64)");
-        assert!(on_self > 2.5, "self-preference is one logit, not a solved problem: {on_self}");
+        assert!(
+            (on_other - uniform).abs() < 0.5,
+            "off-diagonal loss {on_other} vs ln(64)"
+        );
+        assert!(
+            on_self > 2.5,
+            "self-preference is one logit, not a solved problem: {on_self}"
+        );
     }
 
     #[test]
@@ -785,13 +859,52 @@ mod tests {
         };
         let (plain_start, plain_end) = after(1);
         let (lad_start, lad_end) = after(4);
-        assert!((plain_start - lad_start).abs() < 1e-9, "same starting point");
+        assert!(
+            (plain_start - lad_start).abs() < 1e-9,
+            "same starting point"
+        );
         let plain_drop = plain_start - plain_end;
         let ladder_drop = lad_start - lad_end;
-        assert!(ladder_drop > 0.0 && ladder_drop < plain_drop, "{ladder_drop} vs {plain_drop}");
+        assert!(
+            ladder_drop > 0.0 && ladder_drop < plain_drop,
+            "{ladder_drop} vs {plain_drop}"
+        );
         // Pin the order of magnitude so a change in the schedule shows up here.
         let ratio = ladder_drop / plain_drop;
-        assert!((0.1..0.7).contains(&ratio), "ladder retains {ratio} of the plain update");
+        assert!(
+            (0.1..0.7).contains(&ratio),
+            "ladder retains {ratio} of the plain update"
+        );
+    }
+
+    #[test]
+    fn the_head_choice_does_not_perturb_the_network_structure() {
+        // Changing the readout must leave the rotation and the ingress map
+        // untouched, or an ablation of the head is silently also an ablation of
+        // a random draw. This went wrong once here and once for the source
+        // (§19), so it is pinned rather than argued.
+        let structure = |kind: HeadKind| {
+            let mut q = params();
+            q.head_kind = kind;
+            q.tied = false;
+            let grid = Grid::new(q.grid_side);
+            let model = Model::new(q, &mut Rng::new(4242));
+            let mut probe = vec![0.0; model.params().d_model()];
+            probe[0] = 1.0;
+            model.rotation.forward(&mut probe);
+            let anchors: Vec<u32> = (0..8)
+                .map(|t| {
+                    model
+                        .ingress
+                        .node_for(&grid, t, 0, model.embedding_of(t), 0)
+                })
+                .collect();
+            (probe, anchors)
+        };
+        let (rot_a, anchors_a) = structure(HeadKind::Linear);
+        let (rot_b, anchors_b) = structure(HeadKind::Lookup { slots: 512 });
+        assert_eq!(rot_a, rot_b, "the head changed the rotation");
+        assert_eq!(anchors_a, anchors_b, "the head changed the ingress map");
     }
 
     #[test]
@@ -839,8 +952,15 @@ mod tests {
         model.cross_entropy(&x, 0);
         let mixed = model.last_probabilities().to_vec();
         let total: f64 = mixed.iter().sum();
-        assert!((total - 1.0).abs() < 1e-12, "mixture is not a distribution: {total}");
-        assert!(mixed[0] > 0.2 && mixed[1] > 0.2, "mixture collapsed: {:?}", &mixed[..4]);
+        assert!(
+            (total - 1.0).abs() < 1e-12,
+            "mixture is not a distribution: {total}"
+        );
+        assert!(
+            mixed[0] > 0.2 && mixed[1] > 0.2,
+            "mixture collapsed: {:?}",
+            &mixed[..4]
+        );
     }
 
     #[test]
@@ -866,7 +986,11 @@ mod tests {
             .collect();
         let sample = |a: usize, b: usize| -> Vec<f64> {
             let s = |i: usize| if i == 0 { -1.0 } else { 1.0 };
-            axis[0].iter().zip(&axis[1]).map(|(x, y)| s(a) * x + s(b) * y).collect()
+            axis[0]
+                .iter()
+                .zip(&axis[1])
+                .map(|(x, y)| s(a) * x + s(b) * y)
+                .collect()
         };
 
         let mut losses = Vec::new();
@@ -921,7 +1045,6 @@ mod tests {
     }
 }
 
-
 /// A soft lookup readout: stored `(key, distribution)` pairs, mixed in
 /// probability space.
 ///
@@ -973,7 +1096,9 @@ impl LookupHead {
             vocab,
             width,
             slots,
-            keys: (0..slots * width).map(|_| rng.next_normal() * sigma).collect(),
+            keys: (0..slots * width)
+                .map(|_| rng.next_normal() * sigma)
+                .collect(),
             // Zero values start every component at the uniform distribution, so
             // the head begins by predicting uniformly rather than arbitrarily.
             values: vec![0.0; slots * vocab],

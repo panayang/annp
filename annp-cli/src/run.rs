@@ -18,6 +18,7 @@
 //!   visit distribution finally means something (DESIGN.md §10.4 could not say
 //!   anything with uniform ingress).
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -51,7 +52,10 @@ pub struct MarkovSource {
 impl MarkovSource {
     pub fn new(vocab: usize, order: usize, fanout: usize, rng: &mut Rng) -> Self {
         assert!(order >= 1, "order must be at least 1");
-        assert!(fanout >= 1 && fanout < vocab, "fanout must be a proper subset of the vocabulary");
+        assert!(
+            fanout >= 1 && fanout < vocab,
+            "fanout must be a proper subset of the vocabulary"
+        );
         let contexts = vocab
             .checked_pow(order as u32)
             .expect("vocab^order overflowed; lower the vocabulary or the order");
@@ -73,7 +77,14 @@ impl MarkovSource {
             successors.push(to);
             probabilities.push(p);
         }
-        Self { vocab, order, contexts, successors, probabilities, context: 0 }
+        Self {
+            vocab,
+            order,
+            contexts,
+            successors,
+            probabilities,
+            context: 0,
+        }
     }
 
     #[inline]
@@ -89,7 +100,10 @@ impl MarkovSource {
 
     pub fn next(&mut self, rng: &mut Rng) -> u32 {
         let u = rng.next_f64();
-        let (to, p) = (&self.successors[self.context], &self.probabilities[self.context]);
+        let (to, p) = (
+            &self.successors[self.context],
+            &self.probabilities[self.context],
+        );
         let mut acc = 0.0;
         let mut chosen = *to.last().expect("fanout is at least one");
         for (t, w) in to.iter().zip(p) {
@@ -110,8 +124,12 @@ impl MarkovSource {
         let mut next = vec![0.0; n];
         for _ in 0..20_000 {
             next.fill(0.0);
-            for (c, ((to, p), mass)) in
-                self.successors.iter().zip(&self.probabilities).zip(&pi).enumerate()
+            for (c, ((to, p), mass)) in self
+                .successors
+                .iter()
+                .zip(&self.probabilities)
+                .zip(&pi)
+                .enumerate()
             {
                 for (t, w) in to.iter().zip(p) {
                     next[self.shift(c, *t)] += mass * w;
@@ -157,7 +175,9 @@ struct CountingCoder {
 
 impl CountingCoder {
     fn new(vocab: usize, order: usize) -> Self {
-        let contexts = vocab.checked_pow(order as u32).expect("vocab^order overflowed");
+        let contexts = vocab
+            .checked_pow(order as u32)
+            .expect("vocab^order overflowed");
         Self {
             vocab,
             order,
@@ -237,7 +257,11 @@ impl AdditiveCoder {
             for n in 0..v {
                 self.scratch[n] = self.current[r][ci + n] + self.previous[r][pi + n];
             }
-            let peak = self.scratch.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let peak = self
+                .scratch
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
             let mut total = 0.0;
             for x in self.scratch.iter_mut() {
                 *x = (*x - peak).exp();
@@ -309,7 +333,11 @@ impl Probe {
                 let row = &self.weights[r][n * self.width..(n + 1) * self.width];
                 self.scratch[n] = row.iter().zip(x).map(|(w, v)| w * v).sum();
             }
-            let peak = self.scratch.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let peak = self
+                .scratch
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
             let mut total = 0.0;
             for v in self.scratch.iter_mut() {
                 *v = (*v - peak).exp();
@@ -458,7 +486,9 @@ impl NonlinearProbe {
         // One shared initialisation across rates so they differ only in step
         // size; zero second layer so the probe starts at the uniform prediction.
         let sigma = 1.0 / (width as f64).sqrt();
-        let init: Vec<f64> = (0..hidden * width).map(|_| rng.next_normal() * sigma).collect();
+        let init: Vec<f64> = (0..hidden * width)
+            .map(|_| rng.next_normal() * sigma)
+            .collect();
         Self {
             vocab,
             width,
@@ -531,16 +561,122 @@ impl NonlinearProbe {
     }
 }
 
+/// Symbol layout for the lost-in-the-middle test.
+///
+/// A needle is a prompt followed by a value, taught at a known position and
+/// asked again at the end. Two layouts, and which one is in use decides what
+/// the test can credit:
+///
+/// * **Single-symbol key.** One key symbol per needle. This is an *order-1*
+///   task: §11 showed an untied head with `eta = 1` stores a bigram exactly in
+///   one write, so the head alone saturates it and the network is not needed.
+///   §29.6 measured exactly that — bypass beat the network.
+/// * **Paired key.** `P` key symbols shared across `P * P` needles, the value
+///   fixed by the *pair*. Each second symbol appears in `P` needles with `P`
+///   different values, so knowing only the last token leaves the answer uniform
+///   over `P`: an order-1 model is provably capped at `ln P` and anything below
+///   that had to have carried the first symbol forward. That is the part only
+///   the network can do.
+struct Needles {
+    /// Symbols taken off the top of the vocabulary.
+    reserved: usize,
+    /// Prompt for each needle. The last token is the scored slot, since
+    /// `Scored` charges for predicting what follows it.
+    prompt: Vec<Vec<u32>>,
+    value: Vec<u32>,
+}
+
+impl Needles {
+    /// `key_symbols` below two selects the single-symbol layout.
+    fn plan(count: usize, key_symbols: usize) -> Self {
+        if count == 0 {
+            return Self {
+                reserved: 0,
+                prompt: Vec::new(),
+                value: Vec::new(),
+            };
+        }
+        if key_symbols < 2 {
+            return Self {
+                reserved: 2 * count,
+                prompt: (0..count).map(|i| vec![2 * i as u32]).collect(),
+                value: (0..count).map(|i| 2 * i as u32 + 1).collect(),
+            };
+        }
+        let p = key_symbols;
+        let n = p * p;
+        Self {
+            reserved: p + n,
+            prompt: (0..n)
+                .map(|i| vec![(i / p) as u32, (i % p) as u32])
+                .collect(),
+            value: (0..n).map(|i| (p + i) as u32).collect(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.value.len()
+    }
+
+    /// Tokens one teaching repetition occupies.
+    fn stride(&self) -> usize {
+        self.prompt.first().map_or(0, |k| k.len()) + 1
+    }
+
+    /// The floor an order-1 model cannot beat, in nats, or zero when the layout
+    /// does not impose one.
+    fn order_one_floor(&self, key_symbols: usize) -> f64 {
+        if key_symbols < 2 {
+            0.0
+        } else {
+            (key_symbols as f64).ln()
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub tokens: usize,
     pub vocab: usize,
     pub order: usize,
+    /// Independent sources cycled through, for the continual-learning test.
+    pub domains: usize,
+    /// Tokens spent in each domain before switching.
+    pub domain_span: usize,
+    /// Replace one domain with an unseen chain at this fraction through the run.
+    /// Separates domain-specific retention from a model that has simply got
+    /// better at chains in general: a fresh domain should re-enter at the
+    /// pass-0 level if retention is specific, and at the current level if it is
+    /// not.
+    pub fresh_domain_at: f64,
+    /// Needle-in-a-haystack probes for the lost-in-the-middle test (§0), 0 to
+    /// disable. Each needle is a key/value pair spliced into the stream once at
+    /// a known position; all of them are queried in a block at the very end, so
+    /// the only thing separating them is how long ago they were seen.
+    ///
+    /// The pairs use the top `2 * needles` symbols, and the source is built over
+    /// the rest, so a key occurs exactly twice in the whole run: once when it is
+    /// taught and once when it is asked. Without that reservation a key would
+    /// also turn up as ordinary source output and retrieval would be ill-posed.
+    pub needles: usize,
+    /// How many times each needle is taught. One is the one-shot test; more is
+    /// the positive control that says whether the measurement can show recall
+    /// at all, so that a null result at one shot means "cannot bind in one
+    /// exposure" rather than "this bench cannot see binding".
+    pub needle_repeats: usize,
+    /// Size of the shared key-symbol pool. Below two, each needle gets its own
+    /// key and the task is order-1; at `P >= 2` there are `P * P` needles whose
+    /// value is fixed by a *pair* of keys, which an order-1 model cannot
+    /// resolve. See `Needles`.
+    pub needle_key_symbols: usize,
     pub fanout: usize,
     pub d_head: usize,
     pub slots: usize,
     pub grid_side: usize,
     pub long_range: usize,
+    /// Long-range contact exponent. §9 measured this standalone with greedy
+    /// lattice-distance routing and never end to end.
+    pub exponent: f64,
     pub rungs: usize,
     pub context_scales: usize,
     /// Run linear probes along the path and report where context lives.
@@ -551,6 +687,11 @@ pub struct Config {
     pub learning_rate: f64,
     pub ladder_ratio: f64,
     pub seed: u64,
+    /// Seed for topology and model initialisation only. Separate from `seed`
+    /// so run-to-run variance of the *architecture* can be measured against a
+    /// fixed source and a fixed token stream — without it, changing seeds
+    /// changes the data too and the two effects cannot be told apart.
+    pub structure_seed: u64,
     /// Run the control: score the input embedding instead of the network's
     /// output, everything else identical.
     pub bypass: bool,
@@ -582,18 +723,26 @@ fn mean(xs: &[f64]) -> f64 {
 /// comparable across lengths.
 fn window(scored: &[Scored], from: f64, to: f64, f: impl Fn(&Scored) -> f64) -> f64 {
     let lo = (scored.len() as f64 * from) as usize;
-    let hi = ((scored.len() as f64 * to) as usize).max(lo + 1).min(scored.len());
+    let hi = ((scored.len() as f64 * to) as usize)
+        .max(lo + 1)
+        .min(scored.len());
     mean(&scored[lo..hi].iter().map(f).collect::<Vec<_>>())
 }
 
 pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(out_dir)?;
-    let mut rng = Rng::new(cfg.seed);
-    let schedule = Schedule::Geometric { r: cfg.ladder_ratio, g1: 0.5 };
+    let mut rng = Rng::new(cfg.structure_seed);
+    let schedule = Schedule::Geometric {
+        r: cfg.ladder_ratio,
+        g1: 0.5,
+    };
 
     let topology = Topology::small_world(
         Grid::new(cfg.grid_side),
-        SmallWorld { long_range: cfg.long_range, exponent: 2.0 },
+        SmallWorld {
+            long_range: cfg.long_range,
+            exponent: cfg.exponent,
+        },
         &mut rng,
     );
     let mut runtime = Runtime::new(
@@ -617,25 +766,51 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             rungs: cfg.rungs,
             context_scales: cfg.context_scales,
         },
-        EngineParams { mass_floor: cfg.mass_floor, slots: cfg.slots },
+        EngineParams {
+            mass_floor: cfg.mass_floor,
+            slots: cfg.slots,
+        },
         &mut rng,
     );
 
     runtime.set_bypass(cfg.bypass);
     runtime.set_turnover(!cfg.frozen_topology);
     runtime.set_blind_turnover(cfg.blind_turnover);
-    runtime.set_mode(if cfg.overlapped { Mode::Overlapped } else { Mode::Serial });
+    runtime.set_mode(if cfg.overlapped {
+        Mode::Overlapped
+    } else {
+        Mode::Serial
+    });
     runtime.set_ingress_mode(cfg.ingress);
     runtime.capture_representations(cfg.probe);
 
-    // The source gets its own generator. Drawing it from the one the model
+    // The sources get their own generator. Drawing them from the one the model
     // construction just used would make the data depend on the architecture:
     // `Ingress::new` consumes a number of draws that varies with `slots`, so a
     // sweep over slot counts silently swept over Markov chains too. The printed
     // entropy rate is the guard — it must not move across a sweep.
-    let mut source =
-        MarkovSource::new(cfg.vocab, cfg.order, cfg.fanout, &mut Rng::new(cfg.seed ^ 0x50_17_CE_50_17_CE_00));
-    let entropy_rate = source.entropy_rate();
+    //
+    // With `domains > 1` the stream cycles through independent chains, which is
+    // the continual-learning test: does returning to a domain cost less the
+    // second time than the first, or has the model forgotten it?
+    let mut source_rng = Rng::new(cfg.seed ^ 0x50_17_CE_50_17_CE_00);
+    // Needle symbols are carved off the top of the vocabulary so the source can
+    // never emit one; see `Config::needles`.
+    let plan = Needles::plan(cfg.needles, cfg.needle_key_symbols);
+    let needles = plan.len();
+    assert!(
+        plan.reserved < cfg.vocab,
+        "the needle layout reserves {} of the {} symbols, leaving nothing for the source; \
+         raise --vocab so that vocab minus the reserved count is the source size you want",
+        plan.reserved,
+        cfg.vocab
+    );
+    let source_vocab = cfg.vocab - plan.reserved;
+    let base = source_vocab as u32;
+    let mut sources: Vec<MarkovSource> = (0..cfg.domains.max(1))
+        .map(|_| MarkovSource::new(source_vocab, cfg.order, cfg.fanout, &mut source_rng))
+        .collect();
+    let entropy_rate = sources.iter().map(|s| s.entropy_rate()).sum::<f64>() / sources.len() as f64;
 
     let started = std::time::Instant::now();
     let mut scored: Vec<Scored> = Vec::with_capacity(cfg.tokens);
@@ -647,16 +822,125 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let mut readout_linear = Probe::new(cfg.vocab, d_model);
     let mut oracle = OracleCoder::new(cfg.vocab, Probe::new(cfg.vocab, 1).rate_count());
     let mut decoded: Vec<u32> = Vec::new();
-    let mut readout_nonlinear =
-        NonlinearProbe::new(cfg.vocab, d_model, d_model, &mut Rng::new(cfg.seed ^ 0x9A_7C_11_05));
+    let mut readout_nonlinear = NonlinearProbe::new(
+        cfg.vocab,
+        d_model,
+        d_model,
+        &mut Rng::new(cfg.seed ^ 0x9A_7C_11_05),
+    );
     let mut additive = AdditiveCoder::new(cfg.vocab);
     let mut previous_token: Option<u32> = None;
-    let mut coders =
-        [CountingCoder::new(cfg.vocab, 1), CountingCoder::new(cfg.vocab, cfg.order)];
+    let mut coders = [
+        CountingCoder::new(cfg.vocab, 1),
+        CountingCoder::new(cfg.vocab, cfg.order),
+    ];
     let mut coder_nats = [0.0f64; 2];
     let mut coder_tail = [0.0f64; 2];
+    let domains = cfg.domains.max(1);
+    let span = cfg.domain_span.max(1);
+    let swap_at = if cfg.fresh_domain_at > 0.0 && cfg.fresh_domain_at < 1.0 {
+        Some((cfg.tokens as f64 * cfg.fresh_domain_at) as usize)
+    } else {
+        None
+    };
+    let mut swapped = false;
+    let mut fresh_reentry = (0.0f64, 0u64);
+    let mut familiar_reentry = (0.0f64, 0u64);
+    // Loss on the opening fifth of each visit to a domain, indexed by which
+    // pass through the cycle it is. Retention shows as this falling across
+    // passes; catastrophic forgetting shows as it staying flat.
+    let mut reentry: Vec<(f64, u64)> = vec![(0.0, 0); cfg.tokens / (span * domains) + 2];
+    // Where each needle is taught, and where it is asked. Teaching is spread
+    // evenly over the body of the run; asking happens in one block at the end,
+    // in a shuffled order so that position within the block is uncorrelated
+    // with how long ago the needle was taught.
+    let stride = plan.stride();
+    let query_len = needles * stride;
+    let body = cfg.tokens.saturating_sub(query_len);
+    let mut forced: HashMap<usize, u32> = HashMap::new();
+    // Scored slot of a query -> which needle is being asked.
+    let mut asked: HashMap<usize, usize> = HashMap::new();
+    let mut taught_at: Vec<usize> = vec![0; needles];
+    // 0 for the matched half, 1 for the null half; assigned by teaching
+    // position rather than by needle index, see below.
+    let mut role: Vec<u8> = vec![0; needles];
+    // Which needle's value each query actually asks for: the needle's own for
+    // the matched half, another needle's for the null half.
+    let mut answer: HashMap<usize, usize> = HashMap::new();
+    if needles > 0 {
+        let repeats = cfg.needle_repeats.max(1);
+        let mut order: Vec<usize> = (0..needles).collect();
+        for k in (1..order.len()).rev() {
+            order.swap(k, stream_rng.next_below(k as u64 + 1) as usize);
+        }
+        let teach = |forced: &mut HashMap<usize, u32>, at: usize, i: usize, value: usize| {
+            for (o, t) in plan.prompt[i].iter().enumerate() {
+                forced.insert(at + o, base + *t);
+            }
+            forced.insert(at + stride - 1, base + plan.value[value]);
+        };
+        // Teaching order is a permutation of the needles, not their index.
+        //
+        // With the paired layout, needle `i` uses key symbols `(i / P, i % P)`,
+        // so the needles sharing a second symbol are `i, i+P, i+2P, ...`. Laying
+        // them out in index order puts the *last* write for every shared key in
+        // the newest band, which makes band membership the same thing as "am I
+        // the most recent binding for my key". The gradient measured that way is
+        // last-write-wins — trivially expected, and nothing to do with distance.
+        let mut layout: Vec<usize> = (0..needles).collect();
+        for k in (1..layout.len()).rev() {
+            layout.swap(k, stream_rng.next_below(k as u64 + 1) as usize);
+        }
+        for (slot, &i) in layout.iter().enumerate() {
+            let at = (slot + 1) * body / (needles + 2);
+            for r in 0..repeats {
+                teach(&mut forced, at + r * stride, i, i);
+            }
+            taught_at[i] = at;
+            // Matched and foil alternate along *position*, so the two halves
+            // still span the same distances after the permutation.
+            role[i] = (slot % 2) as u8;
+        }
+        // Half the needles are asked for their own value, half for another
+        // needle's. The mismatched half is the null: those values were taught
+        // exactly as often and are exactly as rare, so the only thing separating
+        // the halves is whether the binding is the right one.
+        //
+        // Uniform-over-the-vocabulary is *not* the null. Needle symbols are rare,
+        // so the model gives them far less than 1/V and a score above `ln V` can
+        // still be recall. Reading the curve against that line would waste the
+        // whole experiment.
+        let odd: Vec<usize> = (0..needles).filter(|i| role[*i] == 1).collect();
+        for (slot, &i) in order.iter().enumerate() {
+            let at = body + slot * stride;
+            let value = if role[i] == 0 {
+                i
+            } else {
+                let k = odd.iter().position(|&x| x == i).expect("odd index");
+                odd[(k + 1) % odd.len()]
+            };
+            teach(&mut forced, at, i, value);
+            asked.insert(at + stride - 2, i);
+            answer.insert(i, value);
+        }
+    }
+    let mut needle_loss: Vec<f64> = vec![f64::NAN; needles];
     for i in 0..cfg.tokens {
-        let token = source.next(&mut stream_rng);
+        if let Some(at) = swap_at {
+            // Swap at a domain boundary so the fresh chain gets a whole visit.
+            if !swapped && i >= at && i % span == 0 {
+                sources[0] =
+                    MarkovSource::new(source_vocab, cfg.order, cfg.fanout, &mut source_rng);
+                swapped = true;
+            }
+        }
+        let domain = (i / span) % domains;
+        let token = match forced.get(&i) {
+            // Spliced in, not substituted: the chain is not advanced, so the
+            // source sequence the model sees is still a valid sample of it.
+            Some(t) => *t,
+            None => sources[domain].next(&mut stream_rng),
+        };
         if let Some(prev) = previous_token {
             additive.observe(prev, token, i * 10 >= cfg.tokens * 9);
         }
@@ -668,7 +952,45 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
                 coder_tail[k] += nats;
             }
         }
+        let pass = (i / (span * domains)).min(reentry.len() - 1);
+        let within = i % span;
         for mut s in runtime.advance(Some(token)) {
+            if let Some(&n) = asked.get(&(s.position as usize)) {
+                // Guard the alignment rather than trusting it: `Scored` charges
+                // for the token *after* `position`, so scoring the key's slot is
+                // only recall of the value if these line up.
+                assert_eq!(
+                    s.token,
+                    base + *plan.prompt[n].last().expect("a needle has a prompt"),
+                    "needle key misaligned"
+                );
+                assert_eq!(
+                    s.target,
+                    base + plan.value[answer[&n]],
+                    "needle value misaligned"
+                );
+                needle_loss[n] = s.loss;
+            }
+            if domains > 1 && within < span / 5 {
+                reentry[pass].0 += s.loss;
+                reentry[pass].1 += 1;
+                // After the swap, domain 0 is a chain the model has never seen
+                // while the others are ones it has met many times. Both are read
+                // in the same passes, so the model's general warm-up is matched
+                // and only domain-specific retention can separate them. That
+                // matters: comparing the fresh domain against pass 0 would not
+                // control for warm-up, and pass 0 is measured on an untrained
+                // model.
+                if swapped {
+                    let side = if domain == 0 {
+                        &mut fresh_reentry
+                    } else {
+                        &mut familiar_reentry
+                    };
+                    side.0 += s.loss;
+                    side.1 += 1;
+                }
+            }
             if let Some(reps) = s.reps.take() {
                 let in_tail = s.position as usize * 10 >= cfg.tokens * 9;
                 if let Some(prev) = probe_previous.get(&s.position) {
@@ -680,11 +1002,11 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
                         probe.observe(x, *prev, in_tail);
                     }
                 }
-                for (probe, x) in probes_cur.iter_mut().zip([
-                    &reps.ingress,
-                    &reps.after_one_hop,
-                    &reps.assembled,
-                ]) {
+                for (probe, x) in
+                    probes_cur
+                        .iter_mut()
+                        .zip([&reps.ingress, &reps.after_one_hop, &reps.assembled])
+                {
                     probe.observe(x, s.token, in_tail);
                 }
                 // What any readout of the assembled vector could reach, split
@@ -712,14 +1034,20 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let uniform = (cfg.vocab as f64).ln();
     let nats_to_bits = 1.0 / std::f64::consts::LN_2;
 
-    println!("run — synthetic Markov source, {} tokens{}", scored.len(),
-        if cfg.bypass { "  [BYPASS]" } else { "" });
+    println!(
+        "run — synthetic Markov source, {} tokens{}",
+        scored.len(),
+        if cfg.bypass { "  [BYPASS]" } else { "" }
+    );
     println!("  absorb rule: {:?}", cfg.absorb);
-    println!("  protocol: {}", if cfg.overlapped {
-        "OVERLAPPED — leaks future tokens, loss is NOT a compression bound"
-    } else {
-        "serial — one token in flight, loss is a valid compression bound"
-    });
+    println!(
+        "  protocol: {}",
+        if cfg.overlapped {
+            "OVERLAPPED — leaks future tokens, loss is NOT a compression bound"
+        } else {
+            "serial — one token in flight, loss is a valid compression bound"
+        }
+    );
     println!(
         "  vocab={} order={} fanout={} d_head={} slots={} grid={}x{} deg={} floor={}",
         cfg.vocab,
@@ -746,9 +1074,10 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         "passthrough baseline",
         window(&scored, 0.75, 1.0, |s| s.passthrough_loss) * nats_to_bits
     );
-    for (label, from, to) in
-        [("network, first decile", 0.0, 0.1), ("network, last decile", 0.9, 1.0)]
-    {
+    for (label, from, to) in [
+        ("network, first decile", 0.0, 0.1),
+        ("network, last decile", 0.9, 1.0),
+    ] {
         println!(
             "  {:<26} {:>8.4}",
             label,
@@ -762,7 +1091,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     );
     println!(
         "  {:<26} {:>8.4}   <- ceiling on anything",
-        format!("order-{} counting coder", source.order()),
+        format!("order-{} counting coder", sources[0].order()),
         coder_tail[1] / tail_count * nats_to_bits
     );
     println!(
@@ -770,7 +1099,11 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         "log-linear order-2",
         additive.best_tail() / tail_count * nats_to_bits
     );
-    println!("  {:<26} {:>8.4}", "source entropy rate", entropy_rate * nats_to_bits);
+    println!(
+        "  {:<26} {:>8.4}",
+        "source entropy rate",
+        entropy_rate * nats_to_bits
+    );
     println!(
         "  context is worth {:.4} bits/token: everything between the two coders",
         (coder_tail[0] - coder_tail[1]) / tail_count * nats_to_bits
@@ -801,9 +1134,18 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
 
     if cfg.probe {
         println!("linear probes, bits to name a token from a representation");
-        println!("  chance is {:.4}; lower means the information is linearly present", (cfg.vocab as f64).ln() * nats_to_bits);
-        println!("  {:<20} {:>12} {:>12}", "representation", "previous", "current");
-        for (i, label) in ["ingress embedding", "after one hop", "assembled"].iter().enumerate() {
+        println!(
+            "  chance is {:.4}; lower means the information is linearly present",
+            (cfg.vocab as f64).ln() * nats_to_bits
+        );
+        println!(
+            "  {:<20} {:>12} {:>12}",
+            "representation", "previous", "current"
+        );
+        for (i, label) in ["ingress embedding", "after one hop", "assembled"]
+            .iter()
+            .enumerate()
+        {
             println!(
                 "  {:<20} {:>12.4} {:>12.4}",
                 label,
@@ -813,7 +1155,11 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         }
         println!();
         println!("readout ceiling on the assembled vector, bits per token");
-        println!("  {:<26} {:>8.4}", "the model itself", window(&scored, 0.9, 1.0, |s| s.loss) * nats_to_bits);
+        println!(
+            "  {:<26} {:>8.4}",
+            "the model itself",
+            window(&scored, 0.9, 1.0, |s| s.loss) * nats_to_bits
+        );
         println!(
             "  {:<26} {:>8.4}   <- what the existing linear head could reach",
             "linear probe",
@@ -830,7 +1176,105 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             "decode-then-look-up",
             oracle_tail / tail_count * nats_to_bits
         );
-        println!("  previous token decoded correctly {:.1}% of the time", 100.0 * accuracy);
+        println!(
+            "  previous token decoded correctly {:.1}% of the time",
+            100.0 * accuracy
+        );
+        println!();
+    }
+
+    if domains > 1 {
+        println!("continual learning: {domains} domains, {span} tokens each, cycled");
+        println!("  loss over the opening fifth of each visit, by pass through the cycle");
+        println!("  {:<8} {:>10} {:>10}", "pass", "bits", "tokens");
+        for (pass, (sum, n)) in reentry.iter().enumerate() {
+            if *n > 0 {
+                println!(
+                    "  {:<8} {:>10.4} {:>10}",
+                    pass,
+                    sum / *n as f64 * nats_to_bits,
+                    n
+                );
+            }
+        }
+        println!(
+            "  falling across passes means the domain is being retained; flat means it is not"
+        );
+        if fresh_reentry.1 > 0 && familiar_reentry.1 > 0 {
+            let fresh = fresh_reentry.0 / fresh_reentry.1 as f64 * nats_to_bits;
+            let familiar = familiar_reentry.0 / familiar_reentry.1 as f64 * nats_to_bits;
+            println!("  after swapping one domain for an unseen chain, over the same passes:");
+            println!(
+                "    fresh domain     {:>10.4} bits over {} tokens",
+                fresh, fresh_reentry.1
+            );
+            println!(
+                "    familiar domains {:>10.4} bits over {} tokens",
+                familiar, familiar_reentry.1
+            );
+            println!("    gap              {:>10.4} bits", fresh - familiar);
+            println!(
+                "  a positive gap means what was retained is domain-specific, not general skill"
+            );
+        }
+        println!();
+    }
+
+    if needles > 0 {
+        let mut matched: Vec<(usize, f64)> = Vec::new();
+        let mut foil: Vec<(usize, f64)> = Vec::new();
+        for (i, (at, l)) in taught_at.iter().zip(&needle_loss).enumerate() {
+            if !l.is_finite() {
+                continue;
+            }
+            let row = (body - at, l * nats_to_bits);
+            if role[i] == 0 {
+                matched.push(row)
+            } else {
+                foil.push(row)
+            }
+        }
+        // Taught in permuted order, so sort back to oldest-first before banding.
+        matched.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
+        foil.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
+        println!(
+            "lost in the middle: {} needles taught {} time(s) each, all queried at the end",
+            taught_at.len(),
+            cfg.needle_repeats.max(1)
+        );
+        println!("  matched asks for the needle's own value, foil asks with the wrong key;");
+        let floor = plan.order_one_floor(cfg.needle_key_symbols) * nats_to_bits;
+        if floor > 0.0 {
+            println!(
+                "  an order-1 model cannot get matched below {floor:.4} bits, so anything under \
+                 that carried the first key symbol forward"
+            );
+        }
+        println!("  the gap between them is the recall, and a flat gap is the claim");
+        println!(
+            "  {:<10} {:>9} {:>9} {:>9}   range",
+            "taught ago", "matched", "foil", "gap"
+        );
+        // An odd needle count leaves the halves uneven; band over the common
+        // length so a band is never silently dropped.
+        let paired = matched.len().min(foil.len());
+        let third = (paired / 3).max(1);
+        let mean_of = |v: &[(usize, f64)]| v.iter().map(|(_, l)| l).sum::<f64>() / v.len() as f64;
+        for (label, a, b) in [
+            ("oldest", 0, third),
+            ("middle", third, paired.saturating_sub(third)),
+            ("newest", paired.saturating_sub(third), paired),
+        ] {
+            if a >= b {
+                continue;
+            }
+            let (m, f) = (mean_of(&matched[a..b]), mean_of(&foil[a..b]));
+            let (lo, hi) = (matched[b - 1].0, matched[a].0);
+            println!(
+                "  {label:<10} {m:>9.4} {f:>9.4} {:>9.4}   ({lo} to {hi} back)",
+                f - m
+            );
+        }
         println!();
     }
 
@@ -839,19 +1283,32 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     visits.sort_unstable();
     let idle = visits.iter().filter(|c| **c == 0).count();
     let decile = visits.len() * 9 / 10;
-    println!("load across {} nodes, with content-addressed ingress", visits.len());
-    println!("  never visited      {idle} ({:.1}%)", 100.0 * idle as f64 / visits.len() as f64);
+    println!(
+        "load across {} nodes, with content-addressed ingress",
+        visits.len()
+    );
+    println!(
+        "  never visited      {idle} ({:.1}%)",
+        100.0 * idle as f64 / visits.len() as f64
+    );
     println!(
         "  busiest decile     {:.1}% of all visits (10% would be uniform)",
         100.0 * visits[decile..].iter().sum::<u64>() as f64 / total as f64
     );
-    println!("  busiest single     {:.2}% of all visits", 100.0 * visits[visits.len() - 1] as f64 / total as f64);
+    println!(
+        "  busiest single     {:.2}% of all visits",
+        100.0 * visits[visits.len() - 1] as f64 / total as f64
+    );
     println!();
 
     println!("topology");
     println!(
         "  {}",
-        if cfg.frozen_topology { "frozen".to_string() } else { format!("{} rewirings", runtime.rewirings()) }
+        if cfg.frozen_topology {
+            "frozen".to_string()
+        } else {
+            format!("{} rewirings", runtime.rewirings())
+        }
     );
     println!();
 
@@ -866,11 +1323,16 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         ("middle tenth", 0.45, 0.55),
         ("last tenth", 0.9, 1.0),
     ] {
-        println!("    {:<16} {:>6.2}", label, window(&scored, from, to, |s| s.anchor_move as f64));
+        println!(
+            "    {:<16} {:>6.2}",
+            label,
+            window(&scored, from, to, |s| s.anchor_move as f64)
+        );
     }
     println!();
 
-    let mut csv = String::from("position,token,target,loss_nats,passthrough_nats,visits,mean_hops\n");
+    let mut csv =
+        String::from("position,token,target,loss_nats,passthrough_nats,visits,mean_hops\n");
     for s in &scored {
         let _ = writeln!(
             csv,
@@ -893,7 +1355,11 @@ mod tests {
         let mut rng = Rng::new(1);
         for order in [1usize, 2] {
             let source = MarkovSource::new(16, order, 1, &mut rng);
-            assert!(source.entropy_rate() < 1e-12, "order {order}: {}", source.entropy_rate());
+            assert!(
+                source.entropy_rate() < 1e-12,
+                "order {order}: {}",
+                source.entropy_rate()
+            );
         }
     }
 
@@ -904,7 +1370,10 @@ mod tests {
             for fanout in [2usize, 4, 8] {
                 let source = MarkovSource::new(16, order, fanout, &mut rng);
                 let h = source.entropy_rate();
-                assert!(h > 0.0 && h < (fanout as f64).ln(), "order {order} fanout {fanout}: {h}");
+                assert!(
+                    h > 0.0 && h < (fanout as f64).ln(),
+                    "order {order} fanout {fanout}: {h}"
+                );
             }
         }
     }
@@ -918,7 +1387,10 @@ mod tests {
             let context = source.context;
             let allowed = source.successors[context].clone();
             let next = source.next(&mut stream);
-            assert!(allowed.contains(&next), "context {context} -> {next} is not an edge");
+            assert!(
+                allowed.contains(&next),
+                "context {context} -> {next} is not an edge"
+            );
         }
     }
 
@@ -969,6 +1441,9 @@ mod tests {
                 n2 += b;
             }
         }
-        assert!(n2 < n1 * 0.8, "order-2 coder {n2} did not clearly beat order-1 {n1}");
+        assert!(
+            n2 < n1 * 0.8,
+            "order-2 coder {n2} did not clearly beat order-1 {n1}"
+        );
     }
 }

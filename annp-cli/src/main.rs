@@ -128,6 +128,29 @@ enum Command {
         /// is worth something.
         #[arg(long, default_value_t = 2)]
         order: usize,
+        /// Independent sources cycled through. Above 1 runs the
+        /// continual-learning test.
+        #[arg(long, default_value_t = 1)]
+        domains: usize,
+        /// Tokens spent in each domain before switching.
+        #[arg(long, default_value_t = 5000)]
+        domain_span: usize,
+        /// Replace one domain with an unseen chain at this fraction through the
+        /// run, to separate domain-specific retention from general improvement.
+        #[arg(long, default_value_t = 0.0)]
+        fresh_domain_at: f64,
+        /// Needle-in-a-haystack probes for the lost-in-the-middle test: key and
+        /// value pairs taught once at spread-out positions and all queried at
+        /// the end.
+        #[arg(long, default_value_t = 0)]
+        needles: usize,
+        /// Times each needle is taught. Raise it as a positive control.
+        #[arg(long, default_value_t = 1)]
+        needle_repeats: usize,
+        /// Shared key-symbol pool size. Two or more makes the needle a pair of
+        /// keys, which an order-1 model provably cannot resolve.
+        #[arg(long, default_value_t = 0)]
+        needle_key_symbols: usize,
         /// Successors per context. Lower means a more predictable source.
         #[arg(long, default_value_t = 3)]
         fanout: usize,
@@ -140,6 +163,10 @@ enum Command {
         grid_side: usize,
         #[arg(long, default_value_t = 4)]
         long_range: usize,
+        /// Long-range contact exponent; 0 makes them distance-independent, so
+        /// the grid metric contributes nothing to routing.
+        #[arg(long, default_value_t = 2.0)]
+        exponent: f64,
         #[arg(long, default_value_t = 4)]
         rungs: usize,
         /// Timescales in a node's context key. 1 is the last input alone,
@@ -163,6 +190,11 @@ enum Command {
         ladder_ratio: f64,
         #[arg(long, default_value_t = 20_260_807)]
         seed: u64,
+        /// Seed for topology and model initialisation only; the source and the
+        /// token stream stay on `--seed`. Vary this alone to measure run-to-run
+        /// variance at fixed data.
+        #[arg(long, default_value_t = 20_260_807)]
+        structure_seed: u64,
         /// Control run: score the input embedding instead of the network's
         /// output, with everything else identical.
         #[arg(long, default_value_t = false)]
@@ -239,7 +271,10 @@ fn main() -> std::io::Result<()> {
             seed,
             out,
         } => {
-            assert!(trials >= 2, "need at least two trials to report a standard error");
+            assert!(
+                trials >= 2,
+                "need at least two trials to report a standard error"
+            );
             let cfg = e0::Config {
                 d,
                 horizon,
@@ -261,11 +296,18 @@ fn main() -> std::io::Result<()> {
             tokens,
             vocab,
             order,
+            domains,
+            domain_span,
+            fresh_domain_at,
+            needles,
+            needle_repeats,
+            needle_key_symbols,
             fanout,
             d_head,
             slots,
             grid_side,
             long_range,
+            exponent,
             rungs,
             context_scales,
             probe,
@@ -275,6 +317,7 @@ fn main() -> std::io::Result<()> {
             learning_rate,
             ladder_ratio,
             seed,
+            structure_seed,
             bypass,
             frozen_topology,
             blind_turnover,
@@ -289,11 +332,18 @@ fn main() -> std::io::Result<()> {
                 tokens,
                 vocab,
                 order,
-            fanout,
+                domains,
+                domain_span,
+                fresh_domain_at,
+                needles,
+                needle_repeats,
+                needle_key_symbols,
+                fanout,
                 d_head,
                 slots,
                 grid_side,
                 long_range,
+                exponent,
                 rungs,
                 context_scales,
                 probe,
@@ -303,6 +353,7 @@ fn main() -> std::io::Result<()> {
                 learning_rate,
                 ladder_ratio,
                 seed,
+                structure_seed,
                 bypass,
                 frozen_topology,
                 blind_turnover,
@@ -318,9 +369,25 @@ fn main() -> std::io::Result<()> {
             };
             run::run(&cfg, &out)
         }
-        Command::Topology { sides, exponents, contacts, pairs, seed, out } => {
-            assert!(sides.len() >= 3, "the hops ~ N^beta fit needs at least three grid sizes");
-            let cfg = topology::Config { sides, exponents, contacts, pairs, seed };
+        Command::Topology {
+            sides,
+            exponents,
+            contacts,
+            pairs,
+            seed,
+            out,
+        } => {
+            assert!(
+                sides.len() >= 3,
+                "the hops ~ N^beta fit needs at least three grid sizes"
+            );
+            let cfg = topology::Config {
+                sides,
+                exponents,
+                contacts,
+                pairs,
+                seed,
+            };
             topology::run(&cfg, &out)
         }
     }
