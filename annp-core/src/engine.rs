@@ -136,7 +136,11 @@ impl TokenOutput {
     /// Mass-weighted mean number of node visits before absorption. Subtract
     /// one to compare against an edge-counting figure.
     pub fn mean_hops(&self) -> f64 {
-        if self.absorbed_mass > 0.0 { self.hop_mass / self.absorbed_mass } else { 0.0 }
+        if self.absorbed_mass > 0.0 {
+            self.hop_mass / self.absorbed_mass
+        } else {
+            0.0
+        }
     }
 
     /// Circular mean of where this token's mass was absorbed.
@@ -208,7 +212,10 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(bank: &NodeBank, params: EngineParams) -> Self {
-        assert!(params.mass_floor > 0.0, "mass floor must be positive or particles never die");
+        assert!(
+            params.mass_floor > 0.0,
+            "mass floor must be positive or particles never die"
+        );
         assert!(params.slots >= 1, "a token needs at least one slot");
         let d_head = bank.params().d_head;
         Self {
@@ -250,7 +257,11 @@ impl Engine {
     /// Their output is complete and will not change.
     pub fn settled(&self) -> Vec<u32> {
         let live: std::collections::BTreeSet<u32> = self.current.token.iter().copied().collect();
-        self.outputs.keys().copied().filter(|t| !live.contains(t)).collect()
+        self.outputs
+            .keys()
+            .copied()
+            .filter(|t| !live.contains(t))
+            .collect()
     }
 
     pub fn take_output(&mut self, token: u32) -> Option<TokenOutput> {
@@ -262,7 +273,10 @@ impl Engine {
     /// `seeds` is `(node, slot, mass, payload)`; masses should sum to one so
     /// that mass reads as a probability measure downstream.
     pub fn inject(&mut self, token: u32, seeds: &[(u32, u16, f64, Vec<f64>)]) {
-        assert!(!self.outputs.contains_key(&token), "token {token} was already injected");
+        assert!(
+            !self.outputs.contains_key(&token),
+            "token {token} was already injected"
+        );
         self.outputs.insert(
             token,
             TokenOutput {
@@ -277,8 +291,12 @@ impl Engine {
             },
         );
         for (node, slot, mass, payload) in seeds {
-            assert!((*slot as usize) < self.params.slots, "slot {slot} is out of range");
-            self.current.push(*node, token, *slot, *mass, payload, self.next_serial);
+            assert!(
+                (*slot as usize) < self.params.slots,
+                "slot {slot} is out of range"
+            );
+            self.current
+                .push(*node, token, *slot, *mass, payload, self.next_serial);
             self.next_serial += 1;
         }
     }
@@ -288,7 +306,10 @@ impl Engine {
     pub fn step(&mut self, topology: &Topology, bank: &mut NodeBank) -> TickStats {
         if self.current.is_empty() {
             self.tick += 1;
-            return TickStats { tick: self.tick, ..Default::default() };
+            return TickStats {
+                tick: self.tick,
+                ..Default::default()
+            };
         }
 
         // Charge this tick's work to the tokens that caused it.
@@ -302,7 +323,8 @@ impl Engine {
         self.order.clear();
         self.order.extend(0..self.current.len() as u32);
         let (nodes_of, serial_of) = (&self.current.node, &self.current.serial);
-        self.order.sort_unstable_by_key(|&i| (nodes_of[i as usize], serial_of[i as usize]));
+        self.order
+            .sort_unstable_by_key(|&i| (nodes_of[i as usize], serial_of[i as usize]));
 
         // 2. Contiguous run per node.
         for r in self.range.iter_mut() {
@@ -354,8 +376,7 @@ impl Engine {
                     out.surprise_sum += outcome.surprise;
                     out.visits += 1;
 
-                    let (token, slot, mass) =
-                        (current.token[i], current.slot[i], current.mass[i]);
+                    let (token, slot, mass) = (current.token[i], current.slot[i], current.mass[i]);
                     // The absorb option is the last weight, past every edge.
                     let mut kept = 0.0;
                     for (e, &w) in outcome.weights[..edges.len()].iter().enumerate() {
@@ -366,7 +387,8 @@ impl Engine {
                         if child < params.mass_floor {
                             // Too faint to be worth a hop; absorb it here so the
                             // mass is still accounted for.
-                            out.absorbed.push((token, slot, child, outcome.emitted.clone()));
+                            out.absorbed
+                                .push((token, slot, child, outcome.emitted.clone()));
                         } else {
                             kept += child;
                             out.children.push((
@@ -381,7 +403,8 @@ impl Engine {
                     let _ = kept;
                     let absorb = mass * outcome.weights[edges.len()];
                     if absorb > 0.0 {
-                        out.absorbed.push((token, slot, absorb, outcome.emitted.clone()));
+                        out.absorbed
+                            .push((token, slot, absorb, outcome.emitted.clone()));
                     }
                 }
                 Some(out)
@@ -405,15 +428,18 @@ impl Engine {
             self.visits[g.node as usize] += g.visits;
             surprise_sum += g.surprise_sum;
             for (target, token, slot, mass, payload) in &g.children {
-                if let Some(out) =
-                    self.outputs.get_mut(token).filter(|o| self.tick == o.injected_tick)
+                if let Some(out) = self
+                    .outputs
+                    .get_mut(token)
+                    .filter(|o| self.tick == o.injected_tick)
                 {
                     let lo = *slot as usize * d_head;
                     for (a, &p) in out.after_one_hop[lo..lo + d_head].iter_mut().zip(payload) {
                         *a += mass * p;
                     }
                 }
-                self.next.push(*target, *token, *slot, *mass, payload, self.next_serial);
+                self.next
+                    .push(*target, *token, *slot, *mass, payload, self.next_serial);
                 self.next_serial += 1;
                 stats.forwarded_mass += mass;
                 stats.spawned += 1;
@@ -424,8 +450,11 @@ impl Engine {
                 stats.absorbed_mass += mass;
             }
         }
-        stats.mean_surprise =
-            if stats.processed > 0 { surprise_sum / stats.processed as f64 } else { 0.0 };
+        stats.mean_surprise = if stats.processed > 0 {
+            surprise_sum / stats.processed as f64
+        } else {
+            0.0
+        };
 
         // 5. Republish expectations for the nodes that fired, so the next tick
         //    routes against a consistent snapshot.
@@ -449,7 +478,10 @@ impl Engine {
     ) {
         let d = self.d_head;
         let tick = self.tick;
-        let out = self.outputs.get_mut(&token).expect("absorbed a particle of an unknown token");
+        let out = self
+            .outputs
+            .get_mut(&token)
+            .expect("absorbed a particle of an unknown token");
         let lo = slot as usize * d;
         for (a, &p) in out.accumulated[lo..lo + d].iter_mut().zip(payload) {
             *a += mass * p;
@@ -518,13 +550,21 @@ mod tests {
             .map(|s| {
                 let mut v = vec![0.0; D];
                 rng.fill_unit_vector(&mut v);
-                (rng.next_below(nodes as u64) as u32, s as u16, 1.0 / SLOTS as f64, v)
+                (
+                    rng.next_below(nodes as u64) as u32,
+                    s as u16,
+                    1.0 / SLOTS as f64,
+                    v,
+                )
             })
             .collect()
     }
 
     fn params() -> EngineParams {
-        EngineParams { mass_floor: 1e-3, slots: SLOTS }
+        EngineParams {
+            mass_floor: 1e-3,
+            slots: SLOTS,
+        }
     }
 
     /// Streams `tokens` tokens, one injected per tick, and returns the outputs
@@ -539,7 +579,9 @@ mod tests {
             engine.step(&t, &mut bank);
         }
         engine.run_to_quiescence(&t, &mut bank, 10_000);
-        let outputs = (0..tokens).map(|k| engine.take_output(k).unwrap()).collect();
+        let outputs = (0..tokens)
+            .map(|k| engine.take_output(k).unwrap())
+            .collect();
         (outputs, engine.visits().to_vec())
     }
 
@@ -569,10 +611,15 @@ mod tests {
             out.anchor_cos[1] += mass * phi.cos();
             out.anchor_sin[1] += mass * phi.sin();
         }
-        let (x, y) = out.resting_place(side).expect("resultant is not degenerate");
+        let (x, y) = out
+            .resting_place(side)
+            .expect("resultant is not degenerate");
         let ring_gap = |a: usize, b: usize| (a + side - b) % side;
         let to_seam = ring_gap(x, 0).min(ring_gap(0, x));
-        assert!(to_seam <= 1, "mean landed at {x}, which is {to_seam} from the seam");
+        assert!(
+            to_seam <= 1,
+            "mean landed at {x}, which is {to_seam} from the seam"
+        );
         assert_eq!(y, 3, "the other axis must be unaffected");
     }
 
@@ -597,7 +644,10 @@ mod tests {
                 out.anchor_sin[axis] += theta.sin() / side as f64;
             }
         }
-        assert!(out.resting_place(side).is_none(), "a vanishing resultant has no direction");
+        assert!(
+            out.resting_place(side).is_none(),
+            "a vanishing resultant has no direction"
+        );
     }
 
     #[test]
@@ -630,7 +680,10 @@ mod tests {
 
     #[test]
     fn live_particle_count_is_bounded_by_the_mass_floor() {
-        let p = EngineParams { mass_floor: 1e-2, ..params() };
+        let p = EngineParams {
+            mass_floor: 1e-2,
+            ..params()
+        };
         let (t, mut bank) = fixture(10, 3);
         let mut engine = Engine::new(&bank, p);
         let mut rng = Rng::new(5);
@@ -660,7 +713,10 @@ mod tests {
         let (b_out, b_visits) = run(8);
         assert_eq!(a_visits, b_visits, "visit histograms diverged");
         for (x, y) in a_out.iter().zip(&b_out) {
-            assert_eq!(x.accumulated, y.accumulated, "reassembled payloads diverged");
+            assert_eq!(
+                x.accumulated, y.accumulated,
+                "reassembled payloads diverged"
+            );
             assert_eq!(x.absorbed_mass.to_bits(), y.absorbed_mass.to_bits());
             assert_eq!(x.hop_mass.to_bits(), y.hop_mass.to_bits());
         }
@@ -671,7 +727,11 @@ mod tests {
         let (a, av) = drive(8, 4, 16, params());
         let (b, bv) = drive(8, 4, 16, params());
         assert_eq!(av, bv);
-        assert!(a.iter().zip(&b).all(|(x, y)| x.accumulated == y.accumulated));
+        assert!(
+            a.iter()
+                .zip(&b)
+                .all(|(x, y)| x.accumulated == y.accumulated)
+        );
     }
 
     #[test]
@@ -690,8 +750,15 @@ mod tests {
         assert!(total > 0);
         let cut = v.len() * 9 / 10;
         let top_decile = v[cut..].iter().sum::<u64>() as f64 / total as f64;
-        assert!(top_decile < 0.35, "top decile takes {top_decile} of all visits");
+        assert!(
+            top_decile < 0.35,
+            "top decile takes {top_decile} of all visits"
+        );
         let idle = v.iter().filter(|c| **c == 0).count();
-        assert!(idle < v.len() / 2, "{idle} of {} nodes never fired", v.len());
+        assert!(
+            idle < v.len() / 2,
+            "{idle} of {} nodes never fired",
+            v.len()
+        );
     }
 }

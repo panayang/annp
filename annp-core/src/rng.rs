@@ -26,12 +26,18 @@ impl Rng {
             x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             x ^ (x >> 31)
         };
-        Self { s: [next(), next(), next(), next()], spare_normal: None }
+        Self {
+            s: [next(), next(), next(), next()],
+            spare_normal: None,
+        }
     }
 
     #[inline]
     pub fn next_u64(&mut self) -> u64 {
-        let result = self.s[0].wrapping_add(self.s[3]).rotate_left(23).wrapping_add(self.s[0]);
+        let result = self.s[0]
+            .wrapping_add(self.s[3])
+            .rotate_left(23)
+            .wrapping_add(self.s[0]);
         let t = self.s[1] << 17;
         self.s[2] ^= self.s[0];
         self.s[3] ^= self.s[1];
@@ -138,7 +144,10 @@ mod tests {
         }
         // Expect 10_000 each; 5-sigma of a binomial(70k, 1/7) is ~490.
         for c in counts {
-            assert!((9_000..11_000).contains(&c), "bucket counts skewed: {counts:?}");
+            assert!(
+                (9_000..11_000).contains(&c),
+                "bucket counts skewed: {counts:?}"
+            );
         }
     }
 

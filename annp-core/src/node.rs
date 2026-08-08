@@ -204,7 +204,10 @@ impl Node {
         let degree = ctx.out_edges.len();
         let d = params.d_head;
         assert_eq!(q.len(), d, "payload width must match d_head");
-        debug_assert!((norm(q) - 1.0).abs() < 1e-9, "payloads are unit norm by construction");
+        debug_assert!(
+            (norm(q) - 1.0).abs() < 1e-9,
+            "payloads are unit norm by construction"
+        );
         scratch.pred.resize(d, 0.0);
 
         // Learn. On the very first visit there is no previous input, so there
@@ -253,7 +256,11 @@ impl Node {
             *used += w;
         }
 
-        Outcome { emitted, surprise, weights }
+        Outcome {
+            emitted,
+            surprise,
+            weights,
+        }
     }
 
     /// Routing weights over `out_edges ++ [absorb]`, summing to one.
@@ -264,7 +271,12 @@ impl Node {
         surprise: f64,
         scratch: &mut Scratch,
     ) -> Vec<f64> {
-        let Context { params, out_edges, expects, self_expect } = *ctx;
+        let Context {
+            params,
+            out_edges,
+            expects,
+            self_expect,
+        } = *ctx;
         let d = params.d_head;
         let absorb_slot = out_edges.len();
         let Scratch { logits, order, .. } = scratch;
@@ -307,7 +319,10 @@ impl Node {
         let p_absorb = absorbed / total;
 
         // Stage two: divide the forwarded remainder among the candidates.
-        let peak = order.iter().map(|&j| logits[j]).fold(f64::NEG_INFINITY, f64::max);
+        let peak = order
+            .iter()
+            .map(|&j| logits[j])
+            .fold(f64::NEG_INFINITY, f64::max);
         let mut total = 0.0;
         for &j in order.iter() {
             let w = (logits[j] - peak).exp();
@@ -394,7 +409,10 @@ impl NodeBank {
     pub fn new(topology: &Topology, params: NodeParams) -> Self {
         assert!(params.d_head > 0, "d_head must be positive");
         assert!(params.eta > 0.0, "eta must be positive");
-        assert!(params.context_scales >= 1, "a node needs at least one timescale");
+        assert!(
+            params.context_scales >= 1,
+            "a node needs at least one timescale"
+        );
         let n = topology.grid().len();
         let d = params.d_head;
         let nodes = (0..n)
@@ -484,7 +502,10 @@ impl NodeBank {
         if n.turnover_visits == 0 {
             None
         } else {
-            Some((n.turnover_visits, n.turnover_surprise / n.turnover_visits as f64))
+            Some((
+                n.turnover_visits,
+                n.turnover_surprise / n.turnover_visits as f64,
+            ))
         }
     }
 
@@ -589,7 +610,10 @@ mod tests {
         // The second arrival is genuinely unpredicted, and now it travels.
         let q2 = unit(&mut rng, 16);
         let out = bank.process(&t, 0, &q2);
-        assert!(out.weights[t.degree(0)] < 1.0, "surprise did not reopen any route");
+        assert!(
+            out.weights[t.degree(0)] < 1.0,
+            "surprise did not reopen any route"
+        );
     }
 
     #[test]
@@ -603,7 +627,11 @@ mod tests {
         for node in 0..t.grid().len() as u32 {
             let q = unit(&mut rng, 16);
             let out = bank.process(&t, node, &q);
-            assert_eq!(out.weights[t.degree(node)], 1.0, "node {node} forwarded something");
+            assert_eq!(
+                out.weights[t.degree(node)],
+                1.0,
+                "node {node} forwarded something"
+            );
         }
     }
 
@@ -621,8 +649,14 @@ mod tests {
         bank.publish(student);
 
         let out = bank.process(&t, 0, &b);
-        assert!(out.weights[2] > 0.0, "the edge to the node expecting this got nothing");
-        assert!(out.weights[t.degree(0)] < 1.0, "everything was absorbed anyway");
+        assert!(
+            out.weights[2] > 0.0,
+            "the edge to the node expecting this got nothing"
+        );
+        assert!(
+            out.weights[t.degree(0)] < 1.0,
+            "everything was absorbed anyway"
+        );
     }
 
     #[test]
@@ -654,7 +688,10 @@ mod tests {
         // within an ulp, so compare to that tolerance rather than bitwise.
         let last = inputs.last().unwrap();
         for (k, x) in bank.nodes[0].key.iter().zip(last) {
-            assert!((k - x).abs() < 1e-14, "key drifted from the last input: {k} vs {x}");
+            assert!(
+                (k - x).abs() < 1e-14,
+                "key drifted from the last input: {k} vs {x}"
+            );
         }
         bank.publish(0);
         assert!(bank.expectation(0).iter().any(|x| *x != 0.0));
@@ -691,8 +728,12 @@ mod tests {
             bank2.process(&t2, 0, &b);
             let key_cb = bank2.nodes[0].key.clone();
 
-            let gap: f64 =
-                key_ab.iter().zip(&key_cb).map(|(x, y)| (x - y) * (x - y)).sum::<f64>().sqrt();
+            let gap: f64 = key_ab
+                .iter()
+                .zip(&key_cb)
+                .map(|(x, y)| (x - y) * (x - y))
+                .sum::<f64>()
+                .sqrt();
             if should_differ {
                 assert!(gap > 0.05, "{scales} scales: keys differ by only {gap}");
             } else {
@@ -724,7 +765,10 @@ mod tests {
             for state in &bank.nodes[0].context {
                 assert!(norm(state) <= 1.0 + 1e-9, "integrator grew past unit norm");
             }
-            assert!((norm(&bank.nodes[0].key) - 1.0).abs() < 1e-9, "key is not unit norm");
+            assert!(
+                (norm(&bank.nodes[0].key) - 1.0).abs() < 1e-9,
+                "key is not unit norm"
+            );
         }
     }
 
@@ -740,7 +784,10 @@ mod tests {
         for (e, x) in out.emitted.iter().zip(&q) {
             assert!((e - x).abs() < 1e-12, "fresh node altered the payload");
         }
-        assert_eq!(out.surprise, 0.0, "nothing was predicted, so nothing was missed");
+        assert_eq!(
+            out.surprise, 0.0,
+            "nothing was predicted, so nothing was missed"
+        );
     }
 
     #[test]
@@ -776,7 +823,10 @@ mod tests {
         bank.process(&t, 0, &a);
         bank.publish(0);
         let alignment = dot(bank.expectation(0), &b);
-        assert!(alignment > 0.8, "expectation points at {alignment} of the way to b");
+        assert!(
+            alignment > 0.8,
+            "expectation points at {alignment} of the way to b"
+        );
     }
 
     #[test]
@@ -806,7 +856,10 @@ mod tests {
             .max_by(|x, y| x.1.total_cmp(y.1))
             .map(|(i, _)| i)
             .unwrap();
-        assert_eq!(best, 2, "mass should go to the edge whose target expects this");
+        assert_eq!(
+            best, 2,
+            "mass should go to the edge whose target expects this"
+        );
     }
 
     #[test]

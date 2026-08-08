@@ -102,7 +102,10 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let rows: Vec<Row> = jobs
         .par_iter()
         .map(|&(exponent, contacts, side)| {
-            let spec = SmallWorld { long_range: contacts, exponent };
+            let spec = SmallWorld {
+                long_range: contacts,
+                exponent,
+            };
             Row {
                 exponent,
                 contacts,
@@ -114,7 +117,10 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         .collect();
 
     println!("topology — decentralised greedy routing on a 2-D torus");
-    println!("  sides={:?} pairs/config={} seed={}", cfg.sides, cfg.pairs, cfg.seed);
+    println!(
+        "  sides={:?} pairs/config={} seed={}",
+        cfg.sides, cfg.pairs, cfg.seed
+    );
     println!();
 
     println!("mean greedy hops, one long-range contact per node");
@@ -147,13 +153,20 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     println!();
 
     // At the critical exponent, hops should be linear in (ln N)^2.
-    let critical: Vec<&Row> =
-        rows.iter().filter(|r| r.exponent == 2.0 && r.contacts == 1).collect();
+    let critical: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.exponent == 2.0 && r.contacts == 1)
+        .collect();
     if critical.len() >= 2 {
         println!("alpha = 2: hops against (ln N)^2");
         for r in &critical {
             let l2 = (r.nodes as f64).ln().powi(2);
-            println!("  N={:<8} hops={:<8.2} hops/(ln N)^2 = {:.4}", r.nodes, r.hops, r.hops / l2);
+            println!(
+                "  N={:<8} hops={:<8.2} hops/(ln N)^2 = {:.4}",
+                r.nodes,
+                r.hops,
+                r.hops / l2
+            );
         }
         println!("  a constant ratio is the polylogarithmic regime; a rising one is not.");
         println!();
@@ -205,7 +218,10 @@ mod tests {
         // Published in the lattice side; halved here because we fit against N.
         assert!((predicted_beta(0.0).unwrap() - 1.0 / 3.0).abs() < 1e-12);
         assert!((predicted_beta(1.0).unwrap() - 1.0 / 6.0).abs() < 1e-12);
-        assert!(predicted_beta(2.0).is_none(), "the critical point has no power law");
+        assert!(
+            predicted_beta(2.0).is_none(),
+            "the critical point has no power law"
+        );
         assert!((predicted_beta(3.0).unwrap() - 0.25).abs() < 1e-12);
         assert!((predicted_beta(4.0).unwrap() - 1.0 / 3.0).abs() < 1e-12);
     }
@@ -222,8 +238,24 @@ mod tests {
     #[test]
     fn more_contacts_never_lengthen_a_greedy_route() {
         // Adding out-edges can only widen the choice greedy makes at each step.
-        let sparse = mean_hops(24, SmallWorld { long_range: 1, exponent: 2.0 }, 400, 4);
-        let dense = mean_hops(24, SmallWorld { long_range: 8, exponent: 2.0 }, 400, 4);
+        let sparse = mean_hops(
+            24,
+            SmallWorld {
+                long_range: 1,
+                exponent: 2.0,
+            },
+            400,
+            4,
+        );
+        let dense = mean_hops(
+            24,
+            SmallWorld {
+                long_range: 8,
+                exponent: 2.0,
+            },
+            400,
+            4,
+        );
         assert!(dense < sparse, "sparse {sparse} vs dense {dense}");
     }
 }

@@ -43,8 +43,13 @@ pub enum MemSpec {
     /// Single matrix, no forgetting. The palimpsest baseline.
     Plain,
     /// Single matrix with per-event decay, the incumbent this has to beat.
-    Exponential { decay: f64 },
-    Ladder { schedule: Schedule, rungs: usize },
+    Exponential {
+        decay: f64,
+    },
+    Ladder {
+        schedule: Schedule,
+        rungs: usize,
+    },
 }
 
 impl MemSpec {
@@ -52,10 +57,16 @@ impl MemSpec {
         match *self {
             MemSpec::Plain => "plain".to_string(),
             MemSpec::Exponential { decay } => format!("exp/tau={:.0}", 1.0 / (1.0 - decay)),
-            MemSpec::Ladder { schedule: Schedule::Uniform { g }, rungs } => {
+            MemSpec::Ladder {
+                schedule: Schedule::Uniform { g },
+                rungs,
+            } => {
                 format!("uniform/g={g}/m={rungs}")
             }
-            MemSpec::Ladder { schedule: Schedule::Geometric { r, .. }, rungs } => {
+            MemSpec::Ladder {
+                schedule: Schedule::Geometric { r, .. },
+                rungs,
+            } => {
                 format!("geo/r={r:.0}/m={rungs}")
             }
         }
@@ -105,10 +116,15 @@ impl Config {
     /// `~r^(2m)`.
     pub fn specs(&self) -> Vec<MemSpec> {
         let horizon = self.horizon as f64;
-        let geo = |r: f64| Schedule::Geometric { r, g1: self.g1_geometric };
+        let geo = |r: f64| Schedule::Geometric {
+            r,
+            g1: self.g1_geometric,
+        };
         let mut specs = vec![MemSpec::Plain];
         for tau in [30.0, 100.0, 300.0, 1_000.0, 3_000.0, 10_000.0, 30_000.0] {
-            specs.push(MemSpec::Exponential { decay: 1.0 - 1.0 / tau });
+            specs.push(MemSpec::Exponential {
+                decay: 1.0 - 1.0 / tau,
+            });
         }
         let matched_rungs = geo(2.0).rungs_for_horizon(horizon);
         specs.push(MemSpec::Ladder {
@@ -116,7 +132,10 @@ impl Config {
             rungs: matched_rungs,
         });
         for r in [2.0, 4.0, 8.0] {
-            specs.push(MemSpec::Ladder { schedule: geo(r), rungs: geo(r).rungs_for_horizon(horizon) });
+            specs.push(MemSpec::Ladder {
+                schedule: geo(r),
+                rungs: geo(r).rungs_for_horizon(horizon),
+            });
         }
         specs
     }
@@ -152,7 +171,11 @@ struct PatternStream {
 
 impl PatternStream {
     fn new(seed: u64, d: usize) -> Self {
-        Self { rng: Rng::new(seed), key: vec![0.0; d], value: vec![0.0; d] }
+        Self {
+            rng: Rng::new(seed),
+            key: vec![0.0; d],
+            value: vec![0.0; d],
+        }
     }
 
     fn advance(&mut self) {
@@ -235,7 +258,10 @@ fn ripple_at(x: &[f64], y: &[f64], omega: f64) -> Option<Ripple> {
     // sinusoid coefficient carries variance ~2 s2/n. Good enough for a
     // detection threshold, not for a published error bar.
     let stderr = (2.0 * s2 / x.len() as f64).sqrt();
-    Some(Ripple { amplitude: (c[3] * c[3] + c[4] * c[4]).sqrt(), stderr })
+    Some(Ripple {
+        amplitude: (c[3] * c[3] + c[4] * c[4]).sqrt(),
+        stderr,
+    })
 }
 
 /// Age at which SNR first falls through `threshold`, interpolated in log-log.
@@ -294,7 +320,11 @@ fn retention_trial(spec: MemSpec, cfg: &Config, ages: &[u64], seed: u64) -> Vec<
             next += 1;
         }
     }
-    assert_eq!(out.len(), ages.len(), "every requested age must be measured");
+    assert_eq!(
+        out.len(),
+        ages.len(),
+        "every requested age must be measured"
+    );
     out
 }
 
@@ -314,7 +344,9 @@ fn run_retention(cfg: &Config, specs: &[MemSpec]) -> Vec<RetentionResult> {
             let trials: Vec<Vec<f64>> = (0..cfg.trials)
                 .into_par_iter()
                 // Seeded by trial only: the stream is shared across specs.
-                .map(|t| retention_trial(*spec, cfg, &ages, cfg.seed ^ (t.wrapping_mul(0x9E37_79B9))))
+                .map(|t| {
+                    retention_trial(*spec, cfg, &ages, cfg.seed ^ (t.wrapping_mul(0x9E37_79B9)))
+                })
                 .collect();
             let (mut snr_mean, mut snr_stderr) = (Vec::new(), Vec::new());
             for i in 0..ages.len() {
@@ -385,7 +417,9 @@ fn zipf_trial(spec: MemSpec, cfg: &Config, seed: u64) -> (Vec<f64>, Vec<f64>) {
         mem.relax();
     }
 
-    let snrs = (0..cfg.patterns).map(|i| snr(&mut mem, &keys[i], &values[i], &decoys)).collect();
+    let snrs = (0..cfg.patterns)
+        .map(|i| snr(&mut mem, &keys[i], &values[i], &decoys))
+        .collect();
     (snrs, visits)
 }
 
@@ -407,7 +441,11 @@ fn rank_buckets(n: usize, count: usize) -> Vec<(usize, usize)> {
         .collect();
     edges[0] = 0;
     edges.dedup();
-    edges.windows(2).map(|w| (w[0], w[1])).filter(|(lo, hi)| hi > lo).collect()
+    edges
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .filter(|(lo, hi)| hi > lo)
+        .collect()
 }
 
 fn run_zipf(cfg: &Config, specs: &[MemSpec]) -> Vec<ZipfResult> {
@@ -420,7 +458,8 @@ fn run_zipf(cfg: &Config, specs: &[MemSpec]) -> Vec<ZipfResult> {
                 .map(|t| zipf_trial(*spec, cfg, cfg.seed ^ (t.wrapping_mul(0x85EB_CA6B))))
                 .collect();
 
-            let (mut visits_mean, mut snr_mean, mut recalled) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut visits_mean, mut snr_mean, mut recalled) =
+                (Vec::new(), Vec::new(), Vec::new());
             for &(lo, hi) in &buckets {
                 let mut v = 0.0;
                 let mut s = 0.0;
@@ -486,10 +525,22 @@ fn run_spectrum(cfg: &Config, specs: &[MemSpec]) -> Vec<SpectrumResult> {
                 tau.push(l.relaxation_time(k));
                 power.push(l.rung(k).dist_sq(l.rung(k + 1)) / n);
             }
-            let logs: (Vec<f64>, Vec<f64>) =
-                tau.iter().zip(&power).map(|(t, p)| (t.ln(), p.max(1e-300).ln())).unzip();
-            let slope = if logs.0.len() >= 2 { linear_fit(&logs.0, &logs.1).0 } else { f64::NAN };
-            SpectrumResult { label: spec.label(), tau, power, slope }
+            let logs: (Vec<f64>, Vec<f64>) = tau
+                .iter()
+                .zip(&power)
+                .map(|(t, p)| (t.ln(), p.max(1e-300).ln()))
+                .unzip();
+            let slope = if logs.0.len() >= 2 {
+                linear_fit(&logs.0, &logs.1).0
+            } else {
+                f64::NAN
+            };
+            SpectrumResult {
+                label: spec.label(),
+                tau,
+                power,
+                slope,
+            }
         })
         .collect()
 }
@@ -532,7 +583,10 @@ fn run_impulse(cfg: &Config) -> Vec<ImpulseResult> {
     // r = 32 is a null everywhere.
     let mut schedules: Vec<Schedule> = vec![Schedule::Uniform { g: cfg.g_uniform }];
     for r in [2.0, 4.0, 8.0, 16.0, 32.0] {
-        schedules.push(Schedule::Geometric { r, g1: cfg.g1_geometric });
+        schedules.push(Schedule::Geometric {
+            r,
+            g1: cfg.g1_geometric,
+        });
     }
 
     schedules
@@ -564,11 +618,19 @@ fn run_impulse(cfg: &Config) -> Vec<ImpulseResult> {
                 .filter(|(t, v)| **t >= lo && **t <= hi && **v > 0.0)
                 .map(|(t, v)| ((*t as f64).ln(), v.ln()))
                 .unzip();
-            let slope = if x.len() >= 5 { linear_fit(&x, &y).0 } else { f64::NAN };
+            let slope = if x.len() >= 5 {
+                linear_fit(&x, &y).0
+            } else {
+                f64::NAN
+            };
             let (pred, decoy) = match schedule {
                 Schedule::Geometric { r, .. } => (
                     ripple_at(&x, &y, std::f64::consts::TAU / r.ln()),
-                    ripple_at(&x, &y, std::f64::consts::TAU / (r.ln() * std::f64::consts::SQRT_2)),
+                    ripple_at(
+                        &x,
+                        &y,
+                        std::f64::consts::TAU / (r.ln() * std::f64::consts::SQRT_2),
+                    ),
                 ),
                 Schedule::Uniform { .. } => (None, None),
             };
@@ -612,7 +674,10 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let specs = cfg.specs();
 
     println!("E0 — consolidation ladder bench");
-    println!("  d={} horizon={} warmup={} trials={}", cfg.d, cfg.horizon, cfg.warmup, cfg.trials);
+    println!(
+        "  d={} horizon={} warmup={} trials={}",
+        cfg.d, cfg.horizon, cfg.warmup, cfg.trials
+    );
     println!("  seed={} schemes={}", cfg.seed, specs.len());
     println!();
 
@@ -650,13 +715,16 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             "  {:<20} {:>10.2} {:>12} {:>8} {:>9.3} {:>7}",
             r.label,
             r.snr_mean[0],
-            life.map(|l| format!("{l:.0}")).unwrap_or_else(|| format!(">{}", cfg.horizon)),
+            life.map(|l| format!("{l:.0}"))
+                .unwrap_or_else(|| format!(">{}", cfg.horizon)),
             floor,
             slope,
             n,
         );
     }
-    println!("  floor: first age where the mean is within 3 stderr of zero. Nothing past it is signal.");
+    println!(
+        "  floor: first age where the mean is within 3 stderr of zero. Nothing past it is signal."
+    );
     println!("  slope: local log-log slope inside [10, floor]. A power-law ladder sits near -0.5.");
     println!();
 
@@ -666,9 +734,16 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     // column fits the same model at an unpredicted period; without a clear
     // separation between the two there is no detection, only curvature.
     println!("E0-a  log-periodic ripple (predicted period ln r)");
-    println!("  {:<20} {:>10} {:>18} {:>18}", "scheme", "pts/period", "amp @ ln r", "amp @ decoy");
+    println!(
+        "  {:<20} {:>10} {:>18} {:>18}",
+        "scheme", "pts/period", "amp @ ln r", "amp @ decoy"
+    );
     for r in &retention {
-        let MemSpec::Ladder { schedule: Schedule::Geometric { r: ratio, .. }, .. } = r.spec else {
+        let MemSpec::Ladder {
+            schedule: Schedule::Geometric { r: ratio, .. },
+            ..
+        } = r.spec
+        else {
             continue;
         };
         let floor = measurement_floor(&r.ages, &r.snr_mean, &r.snr_stderr);
@@ -687,8 +762,14 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         let per_period = x.len() as f64 * ratio.ln() / span;
         // sqrt(2) is irrational, so the decoy period cannot alias onto the
         // predicted one or any of its harmonics.
-        let fits = [ripple_at(&x, &y, std::f64::consts::TAU / ratio.ln()),
-                    ripple_at(&x, &y, std::f64::consts::TAU / (ratio.ln() * std::f64::consts::SQRT_2))];
+        let fits = [
+            ripple_at(&x, &y, std::f64::consts::TAU / ratio.ln()),
+            ripple_at(
+                &x,
+                &y,
+                std::f64::consts::TAU / (ratio.ln() * std::f64::consts::SQRT_2),
+            ),
+        ];
         let show = |f: &Option<Ripple>| {
             f.as_ref()
                 .map(|r| format!("{:.4} +/- {:.4}", r.amplitude, r.stderr))
@@ -742,15 +823,26 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     println!("E0-c  white-noise power spectrum (null model: flat for geometric)");
     for s in &spectrum {
         let levels: Vec<String> = s.power.iter().map(|p| format!("{p:.1e}")).collect();
-        println!("  {:<20} slope = {:>7.3}   rungs: {}", s.label, s.slope, levels.join(" "));
+        println!(
+            "  {:<20} slope = {:>7.3}   rungs: {}",
+            s.label,
+            s.slope,
+            levels.join(" ")
+        );
     }
     println!();
 
     // --- E0-b summary -----------------------------------------------------
     // The practical question: after a scale-free stream of revisits, how deep
     // into the frequency tail is anything still recallable?
-    println!("E0-b  capacity under Zipf revisits ({} patterns)", cfg.patterns);
-    println!("  {:<20} {:>14} {:>16}", "scheme", "usable ranks", "recalled overall");
+    println!(
+        "E0-b  capacity under Zipf revisits ({} patterns)",
+        cfg.patterns
+    );
+    println!(
+        "  {:<20} {:>14} {:>16}",
+        "scheme", "usable ranks", "recalled overall"
+    );
     for z in &zipf {
         // Highest rank whose bucket still averages SNR >= 1.
         let usable = z
@@ -814,7 +906,14 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let mut csv = String::from("scheme,rung,tau,power\n");
     for s in &spectrum {
         for k in 0..s.tau.len() {
-            let _ = writeln!(csv, "{},{},{:.6e},{:.6e}", s.label, k + 1, s.tau[k], s.power[k]);
+            let _ = writeln!(
+                csv,
+                "{},{},{:.6e},{:.6e}",
+                s.label,
+                k + 1,
+                s.tau[k],
+                s.power[k]
+            );
         }
     }
     write_csv(out_dir, "e0c_spectrum.csv", csv)?;
@@ -854,7 +953,11 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         gu = cfg.g_uniform,
         g1 = cfg.g1_geometric,
         seed = cfg.seed,
-        schemes = specs.iter().map(|s| format!("\"{}\"", s.label())).collect::<Vec<_>>().join(", "),
+        schemes = specs
+            .iter()
+            .map(|s| format!("\"{}\"", s.label()))
+            .collect::<Vec<_>>()
+            .join(", "),
     );
     write_csv(out_dir, "manifest.json", manifest)?;
     Ok(())
@@ -895,7 +998,10 @@ mod tests {
         let b = rank_buckets(2000, 10);
         assert_eq!(b[0].0, 0);
         assert_eq!(b.last().unwrap().1, 2000);
-        assert!(b.windows(2).all(|w| w[0].1 == w[1].0), "buckets must be contiguous");
+        assert!(
+            b.windows(2).all(|w| w[0].1 == w[1].0),
+            "buckets must be contiguous"
+        );
     }
 
     #[test]
@@ -907,7 +1013,10 @@ mod tests {
             counts[z.sample(&mut rng)] += 1;
         }
         assert!(counts[0] > counts[1], "rank 1 must be the most frequent");
-        assert!(counts[0] > 4 * counts[9], "1/k should make rank 1 ~10x rank 10");
+        assert!(
+            counts[0] > 4 * counts[9],
+            "1/k should make rank 1 ~10x rank 10"
+        );
         assert!(counts.iter().sum::<u32>() == 200_000);
         assert!(counts[99] > 0, "the tail must still be reachable");
     }
@@ -966,12 +1075,20 @@ mod tests {
         let ages = log_spaced(c.horizon, 8);
         let plain = retention_trial(MemSpec::Plain, &c, &ages, 42);
         let ladder = retention_trial(
-            MemSpec::Ladder { schedule: Schedule::Geometric { r: 4.0, g1: 0.5 }, rungs: 4 },
+            MemSpec::Ladder {
+                schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
+                rungs: 4,
+            },
             &c,
             &ages,
             42,
         );
-        assert!(ladder[0] > plain[0], "ladder {} vs plain {}", ladder[0], plain[0]);
+        assert!(
+            ladder[0] > plain[0],
+            "ladder {} vs plain {}",
+            ladder[0],
+            plain[0]
+        );
     }
 
     #[test]
@@ -982,7 +1099,14 @@ mod tests {
         // Detectability threshold is SNR = 1. The margin above it grows with d;
         // these tests use d = 16, where a single interfering write already
         // overlaps the probe key by ~1/sqrt(d) = 0.25.
-        assert!(snr[0] > 2.0, "one-shot storage should clear threshold: {}", snr[0]);
-        assert!(snr[0] > *snr.last().unwrap(), "SNR must decay with interference");
+        assert!(
+            snr[0] > 2.0,
+            "one-shot storage should clear threshold: {}",
+            snr[0]
+        );
+        assert!(
+            snr[0] > *snr.last().unwrap(),
+            "SNR must decay with interference"
+        );
     }
 }

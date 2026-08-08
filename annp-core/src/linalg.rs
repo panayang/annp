@@ -18,7 +18,11 @@ pub struct Mat {
 impl Mat {
     pub fn zeros(rows: usize, cols: usize) -> Self {
         assert!(rows > 0 && cols > 0, "matrix dimensions must be positive");
-        Self { rows, cols, data: vec![0.0; rows * cols] }
+        Self {
+            rows,
+            cols,
+            data: vec![0.0; rows * cols],
+        }
     }
 
     #[inline]
@@ -58,7 +62,11 @@ impl Mat {
     /// `out <- self * x`.
     pub fn mul_vec(&self, x: &[f64], out: &mut [f64]) {
         assert_eq!(x.len(), self.cols, "mul_vec: input length must equal cols");
-        assert_eq!(out.len(), self.rows, "mul_vec: output length must equal rows");
+        assert_eq!(
+            out.len(),
+            self.rows,
+            "mul_vec: output length must equal rows"
+        );
         for (i, o) in out.iter_mut().enumerate() {
             let row = &self.data[i * self.cols..(i + 1) * self.cols];
             *o = row.iter().zip(x).map(|(a, b)| a * b).sum();
@@ -103,7 +111,11 @@ impl Mat {
     /// `||self - other||_F^2`.
     pub fn dist_sq(&self, other: &Mat) -> f64 {
         assert_eq!(self.shape(), other.shape(), "dist_sq: shape mismatch");
-        self.data.iter().zip(&other.data).map(|(a, b)| (a - b) * (a - b)).sum()
+        self.data
+            .iter()
+            .zip(&other.data)
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum()
     }
 
     #[inline]
@@ -164,7 +176,10 @@ pub fn linear_fit(x: &[f64], y: &[f64]) -> (f64, f64) {
 pub fn least_squares(design: &[Vec<f64>], y: &[f64]) -> Option<Vec<f64>> {
     assert_eq!(design.len(), y.len(), "least_squares: row count mismatch");
     let k = design.first()?.len();
-    assert!(design.iter().all(|r| r.len() == k), "least_squares: ragged design");
+    assert!(
+        design.iter().all(|r| r.len() == k),
+        "least_squares: ragged design"
+    );
     if design.len() < k {
         return None;
     }
@@ -307,10 +322,14 @@ mod tests {
         // basis column is accidentally orthogonalised into agreement.
         let want = [2.0, -3.0, 0.5, 4.0, -1.5];
         let xs: Vec<f64> = (0..40).map(|i| 0.13 * i as f64).collect();
-        let design: Vec<Vec<f64>> =
-            xs.iter().map(|&x| vec![1.0, x, x * x, x.cos(), x.sin()]).collect();
-        let y: Vec<f64> =
-            design.iter().map(|r| r.iter().zip(want).map(|(a, b)| a * b).sum()).collect();
+        let design: Vec<Vec<f64>> = xs
+            .iter()
+            .map(|&x| vec![1.0, x, x * x, x.cos(), x.sin()])
+            .collect();
+        let y: Vec<f64> = design
+            .iter()
+            .map(|r| r.iter().zip(want).map(|(a, b)| a * b).sum())
+            .collect();
         let got = least_squares(&design, &y).expect("well-conditioned design");
         for (g, w) in got.iter().zip(want) {
             assert!((g - w).abs() < 1e-8, "{got:?} != {want:?}");

@@ -96,8 +96,14 @@ impl Ladder {
         assert!(m >= 2, "a ladder needs at least two rungs");
         let capacity: Vec<f64> = (0..m).map(|k| schedule.capacity(k)).collect();
         let conductance: Vec<f64> = (0..m - 1).map(|k| schedule.conductance(k)).collect();
-        assert!(capacity.iter().all(|c| *c > 0.0), "capacities must be positive");
-        assert!(conductance.iter().all(|g| *g > 0.0), "conductances must be positive");
+        assert!(
+            capacity.iter().all(|c| *c > 0.0),
+            "capacities must be positive"
+        );
+        assert!(
+            conductance.iter().all(|g| *g > 0.0),
+            "conductances must be positive"
+        );
 
         // Explicit Euler at dt = 1 is monotone only if each rung's total
         // outflow rate stays below 1. Above 1 the integration oscillates and
@@ -169,7 +175,11 @@ impl Ladder {
     /// Writes `values` into every rung, leaving the chain at equilibrium.
     pub fn initialise(&mut self, values: &[f64]) {
         for rung in self.rungs.iter_mut() {
-            assert_eq!(values.len(), rung.as_slice().len(), "initialise: size mismatch");
+            assert_eq!(
+                values.len(),
+                rung.as_slice().len(),
+                "initialise: size mismatch"
+            );
             rung.as_mut_slice().copy_from_slice(values);
         }
     }
@@ -182,7 +192,15 @@ impl Ladder {
 
     /// Advances the diffusion by one event.
     pub fn relax(&mut self) {
-        let Self { rungs, inv_capacity, conductance, n, flux_prev, flux_cur, .. } = self;
+        let Self {
+            rungs,
+            inv_capacity,
+            conductance,
+            n,
+            flux_prev,
+            flux_cur,
+            ..
+        } = self;
         let m = rungs.len();
         flux_prev.fill(0.0);
 
@@ -222,7 +240,10 @@ enum State {
     /// One matrix with per-event multiplicative decay. `decay == 1.0` is the
     /// no-forgetting baseline; `decay < 1.0` is exponential forgetting with
     /// characteristic time `1 / (1 - decay)`.
-    Single { w: Mat, decay: f64 },
+    Single {
+        w: Mat,
+        decay: f64,
+    },
     Ladder(Ladder),
 }
 
@@ -246,14 +267,24 @@ impl AssocMemory {
     /// Single matrix with per-event decay factor `decay` in `(0, 1]`.
     pub fn single(d: usize, decay: f64) -> Self {
         assert!(decay > 0.0 && decay <= 1.0, "decay must lie in (0, 1]");
-        Self { state: State::Single { w: Mat::zeros(d, d), decay }, pred: vec![0.0; d], resid: vec![0.0; d] }
+        Self {
+            state: State::Single {
+                w: Mat::zeros(d, d),
+                decay,
+            },
+            pred: vec![0.0; d],
+            resid: vec![0.0; d],
+        }
     }
 
     /// Rectangular single matrix, for measuring what the ladder costs.
     pub fn single_rect(rows: usize, cols: usize, decay: f64) -> Self {
         assert!(decay > 0.0 && decay <= 1.0, "decay must lie in (0, 1]");
         Self {
-            state: State::Single { w: Mat::zeros(rows, cols), decay },
+            state: State::Single {
+                w: Mat::zeros(rows, cols),
+                decay,
+            },
             pred: vec![0.0; rows],
             resid: vec![0.0; rows],
         }
@@ -285,7 +316,11 @@ impl AssocMemory {
     pub fn initialise(&mut self, values: &[f64]) {
         match &mut self.state {
             State::Single { w, .. } => {
-                assert_eq!(values.len(), w.as_slice().len(), "initialise: size mismatch");
+                assert_eq!(
+                    values.len(),
+                    w.as_slice().len(),
+                    "initialise: size mismatch"
+                );
                 w.as_mut_slice().copy_from_slice(values);
             }
             State::Ladder(l) => l.initialise(values),
@@ -387,7 +422,10 @@ mod tests {
             l.relax();
         }
         let after = l.conserved_total();
-        assert!((after - before).abs() < 1e-9 * before.abs().max(1.0), "{before} -> {after}");
+        assert!(
+            (after - before).abs() < 1e-9 * before.abs().max(1.0),
+            "{before} -> {after}"
+        );
     }
 
     #[test]
@@ -428,8 +466,15 @@ mod tests {
         // rungs would freeze and the ladder would look inert. In f64 it moves.
         let (r, m) = (4.0f64, 8usize);
         let step = (0.5 * r.powi(-(m as i32 - 2))) / r.powi(m as i32 - 1);
-        assert!(step < f32::EPSILON as f64, "test premise: {step} should be below f32 eps");
-        assert_eq!(1.0f32 + step as f32, 1.0f32, "f32 cannot represent this increment");
+        assert!(
+            step < f32::EPSILON as f64,
+            "test premise: {step} should be below f32 eps"
+        );
+        assert_eq!(
+            1.0f32 + step as f32,
+            1.0f32,
+            "f32 cannot represent this increment"
+        );
 
         let mut l = Ladder::new(geo(r), m, 4, 4);
         let mut rng = Rng::new(17);
@@ -442,7 +487,10 @@ mod tests {
         for _ in 0..20_000 {
             l.relax();
             let deep = l.rung(m - 1).frob_sq();
-            assert!(deep >= last, "deepest rung must fill monotonically from a single input");
+            assert!(
+                deep >= last,
+                "deepest rung must fill monotonically from a single input"
+            );
             last = deep;
         }
         assert!(last > 0.0, "deepest rung never integrated anything");
@@ -475,13 +523,22 @@ mod tests {
         rng.fill_unit_vector(&mut v);
 
         let surprise = mem.write(&k, &v, 1.0);
-        assert!((surprise - 1.0).abs() < 1e-12, "first write of a unit value has surprise 1");
+        assert!(
+            (surprise - 1.0).abs() < 1e-12,
+            "first write of a unit value has surprise 1"
+        );
         assert!((mem.recall(&k, &v) - 1.0).abs() < 1e-12);
         for _ in 0..1_000 {
             mem.relax();
         }
-        assert!((mem.recall(&k, &v) - 1.0).abs() < 1e-12, "plain state must not decay");
-        assert!(mem.write(&k, &v, 1.0) < 1e-12, "a stored pattern is no longer surprising");
+        assert!(
+            (mem.recall(&k, &v) - 1.0).abs() < 1e-12,
+            "plain state must not decay"
+        );
+        assert!(
+            mem.write(&k, &v, 1.0) < 1e-12,
+            "a stored pattern is no longer surprising"
+        );
     }
 
     #[test]

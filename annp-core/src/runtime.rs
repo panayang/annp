@@ -226,13 +226,20 @@ impl Runtime {
         let cadence = self.bank.params().d_head as u64;
         let nodes = self.bank.len() as u32;
         for node in 0..nodes {
-            let Some((visits, _)) = self.bank.turnover_state(node) else { continue };
+            let Some((visits, _)) = self.bank.turnover_state(node) else {
+                continue;
+            };
             if visits < cadence {
                 continue;
             }
-            let Some(slot) = self.bank.coldest_plastic_slot(node, lattice) else { continue };
-            let candidates =
-                if self.blind_turnover { 1 } else { self.topology.plastic_slots(node).len().max(1) };
+            let Some(slot) = self.bank.coldest_plastic_slot(node, lattice) else {
+                continue;
+            };
+            let candidates = if self.blind_turnover {
+                1
+            } else {
+                self.topology.plastic_slots(node).len().max(1)
+            };
             let mut best: Option<(u32, u64)> = None;
             for _ in 0..candidates {
                 let Some(v) = self.topology.sample_contact(node, &mut self.turnover_rng) else {
@@ -287,7 +294,9 @@ impl Runtime {
     pub fn advance(&mut self, token: Option<u32>) -> Vec<Scored> {
         if let Some(token) = token {
             let position = self.position;
-            let shattered = self.model.shatter(self.topology.grid(), token, position as u64);
+            let shattered = self
+                .model
+                .shatter(self.topology.grid(), token, position as u64);
             self.engine.inject(position, &shattered.seeds);
             self.pending.insert(position, (token, shattered.scale));
             self.stream.insert(position, token);
@@ -335,7 +344,10 @@ impl Runtime {
     /// has been scored.
     fn collect(&mut self) -> Vec<Scored> {
         for position in self.engine.settled() {
-            let output = self.engine.take_output(position).expect("settled without output");
+            let output = self
+                .engine
+                .take_output(position)
+                .expect("settled without output");
             self.ready.insert(position, output);
         }
 
@@ -348,7 +360,10 @@ impl Runtime {
                 self.ready.insert(position, output);
                 break;
             };
-            let (token, scale) = self.pending.remove(&position).expect("scored without pending");
+            let (token, scale) = self
+                .pending
+                .remove(&position)
+                .expect("scored without pending");
 
             let assembled = if self.bypass {
                 self.model.embedding_of(token).to_vec()
@@ -430,7 +445,10 @@ mod tests {
                 rungs: 4,
                 context_scales: 1,
             },
-            EngineParams { mass_floor: 1e-3, slots: 8 },
+            EngineParams {
+                mass_floor: 1e-3,
+                slots: 8,
+            },
             &mut rng,
         )
     }
@@ -453,7 +471,10 @@ mod tests {
         // The final position has no successor, so it is never scored.
         assert_eq!(scored.len(), stream.len() - 1);
         for (i, s) in scored.iter().enumerate() {
-            assert_eq!(s.position as usize, i, "scoring must be strictly in stream order");
+            assert_eq!(
+                s.position as usize, i,
+                "scoring must be strictly in stream order"
+            );
             assert_eq!(s.token, stream[i]);
             assert_eq!(s.target, stream[i + 1]);
         }
@@ -481,7 +502,10 @@ mod tests {
         let stream: Vec<u32> = (0..200).map(|i| (i * 7 % 32) as u32).collect();
         feed(&mut rt, &stream);
         let (known, _, mean_move) = rt.model().ingress().drift();
-        assert_eq!(known, 0, "nothing should be remembered with the readout off");
+        assert_eq!(
+            known, 0,
+            "nothing should be remembered with the readout off"
+        );
         assert_eq!(mean_move, 0.0);
     }
 
@@ -493,36 +517,51 @@ mod tests {
         // partitioned the graph, which is the failure this project has hit
         // before.
         let mut rt = build(32, 41);
-        let before: Vec<usize> =
-            (0..rt.topology().grid().len() as u32).map(|n| rt.topology().degree(n)).collect();
+        let before: Vec<usize> = (0..rt.topology().grid().len() as u32)
+            .map(|n| rt.topology().degree(n))
+            .collect();
         let stream: Vec<u32> = (0..1_500).map(|i| (i * 7 % 32) as u32).collect();
         feed(&mut rt, &stream);
         assert!(rt.rewirings() > 0, "no rewiring happened at all");
 
         let t = rt.topology();
         for node in 0..t.grid().len() as u32 {
-            assert_eq!(t.degree(node), before[node as usize], "degree changed at {node}");
+            assert_eq!(
+                t.degree(node),
+                before[node as usize],
+                "degree changed at {node}"
+            );
             let lattice = t.grid().axis_neighbours(node);
-            assert_eq!(&t.out_edges(node)[..4], &lattice, "lattice edge rewired at {node}");
+            assert_eq!(
+                &t.out_edges(node)[..4],
+                &lattice,
+                "lattice edge rewired at {node}"
+            );
             assert!(!t.out_edges(node).contains(&node), "self-loop at {node}");
             let mut seen = t.out_edges(node).to_vec();
             seen.sort_unstable();
             seen.dedup();
             assert_eq!(seen.len(), t.degree(node), "duplicate edge at {node}");
         }
-        assert_eq!(t.reachable_count(0), t.grid().len(), "turnover partitioned the graph");
+        assert_eq!(
+            t.reachable_count(0),
+            t.grid().len(),
+            "turnover partitioned the graph"
+        );
     }
 
     #[test]
     fn turnover_can_be_switched_off() {
         let mut rt = build(32, 41);
         rt.set_turnover(false);
-        let before: Vec<u32> =
-            (0..rt.topology().grid().len() as u32).flat_map(|n| rt.topology().out_edges(n).to_vec()).collect();
+        let before: Vec<u32> = (0..rt.topology().grid().len() as u32)
+            .flat_map(|n| rt.topology().out_edges(n).to_vec())
+            .collect();
         let stream: Vec<u32> = (0..1_000).map(|i| (i * 7 % 32) as u32).collect();
         feed(&mut rt, &stream);
-        let after: Vec<u32> =
-            (0..rt.topology().grid().len() as u32).flat_map(|n| rt.topology().out_edges(n).to_vec()).collect();
+        let after: Vec<u32> = (0..rt.topology().grid().len() as u32)
+            .flat_map(|n| rt.topology().out_edges(n).to_vec())
+            .collect();
         assert_eq!(before, after);
         assert_eq!(rt.rewirings(), 0);
     }
@@ -624,8 +663,14 @@ mod tests {
         let last = mean(&scored[scored.len() - 200..]);
         assert!(last < first, "loss went {first} -> {last}");
 
-        let passthrough =
-            scored[scored.len() - 200..].iter().map(|x| x.passthrough_loss).sum::<f64>() / 200.0;
-        assert!(last < passthrough, "network scored {last} against passthrough {passthrough}");
+        let passthrough = scored[scored.len() - 200..]
+            .iter()
+            .map(|x| x.passthrough_loss)
+            .sum::<f64>()
+            / 200.0;
+        assert!(
+            last < passthrough,
+            "network scored {last} against passthrough {passthrough}"
+        );
     }
 }

@@ -146,7 +146,10 @@ pub struct SmallWorld {
 
 impl Default for SmallWorld {
     fn default() -> Self {
-        Self { long_range: 4, exponent: 2.0 }
+        Self {
+            long_range: 4,
+            exponent: 2.0,
+        }
     }
 }
 
@@ -223,7 +226,13 @@ impl Topology {
             target.extend_from_slice(&row);
         }
         start.push(target.len() as u32);
-        Self { grid, start, target, lattice_degree, distance_cdf: cdf }
+        Self {
+            grid,
+            start,
+            target,
+            lattice_degree,
+            distance_cdf: cdf,
+        }
     }
 
     #[inline]
@@ -243,7 +252,11 @@ impl Topology {
     pub fn sample_contact(&self, node: u32, rng: &mut Rng) -> Option<u32> {
         for _ in 0..64 {
             let u = rng.next_f64();
-            let d = self.distance_cdf.partition_point(|&c| c < u).min(self.distance_cdf.len() - 1) + 1;
+            let d = self
+                .distance_cdf
+                .partition_point(|&c| c < u)
+                .min(self.distance_cdf.len() - 1)
+                + 1;
             let v = self.grid.random_at_distance(node, d, rng);
             if v != node && !self.out_edges(node).contains(&v) {
                 return Some(v);
@@ -408,7 +421,11 @@ mod tests {
             let mut sorted = edges.to_vec();
             sorted.sort_unstable();
             sorted.dedup();
-            assert_eq!(sorted.len(), edges.len(), "node {node} has a duplicate edge");
+            assert_eq!(
+                sorted.len(),
+                edges.len(),
+                "node {node} has a duplicate edge"
+            );
         }
         assert_eq!(t.edge_count(), t.grid().len() * want);
     }
@@ -430,7 +447,10 @@ mod tests {
         let side = 33;
         let grid = Grid::new(side);
         let mut rng = Rng::new(11);
-        let spec = SmallWorld { long_range: 24, exponent: 2.0 };
+        let spec = SmallWorld {
+            long_range: 24,
+            exponent: 2.0,
+        };
         let t = Topology::small_world(grid, spec, &mut rng);
 
         let mut counts = vec![0.0; t.grid().max_distance() + 1];
@@ -442,10 +462,19 @@ mod tests {
         }
         let (x, y): (Vec<f64>, Vec<f64>) = (2..=t.grid().max_distance() / 2)
             .filter(|&d| counts[d] > 0.0)
-            .map(|d| ((d as f64).ln(), (counts[d] / t.grid().shell_size(d) as f64).ln()))
+            .map(|d| {
+                (
+                    (d as f64).ln(),
+                    (counts[d] / t.grid().shell_size(d) as f64).ln(),
+                )
+            })
             .unzip();
         let slope = crate::linalg::linear_fit(&x, &y).0;
-        assert!((slope + spec.exponent).abs() < 0.2, "recovered exponent {}", -slope);
+        assert!(
+            (slope + spec.exponent).abs() < 0.2,
+            "recovered exponent {}",
+            -slope
+        );
     }
 
     #[test]
