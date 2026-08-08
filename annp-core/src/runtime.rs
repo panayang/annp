@@ -136,11 +136,16 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// `structure_seed` is the one seed every structural stream derives from.
+    /// `rng` initialises the model; turnover gets a stream of its own salted
+    /// from the same seed, so that replicate runs vary *all* structural
+    /// randomness rather than all of it but one.
     pub fn new(
         topology: Topology,
         model_params: ModelParams,
         node_params: NodeParams,
         engine_params: EngineParams,
+        structure_seed: u64,
         rng: &mut crate::rng::Rng,
     ) -> Self {
         assert_eq!(
@@ -172,7 +177,7 @@ impl Runtime {
             mode: Mode::Serial,
             turnover: true,
             blind_turnover: false,
-            turnover_rng: crate::rng::Rng::new(0x7C_9E_2B_41_A0_53_D6_18),
+            turnover_rng: crate::rng::Rng::new(structure_seed ^ 0x7C_9E_2B_41_A0_53_D6_18),
             rewirings: 0,
             capture: false,
             bypass: false,
@@ -226,7 +231,7 @@ impl Runtime {
         let cadence = self.bank.params().d_head as u64;
         let nodes = self.bank.len() as u32;
         for node in 0..nodes {
-            let Some((visits, _)) = self.bank.turnover_state(node) else {
+            let Some(visits) = self.bank.turnover_visits(node) else {
                 continue;
             };
             if visits < cadence {
@@ -374,7 +379,7 @@ impl Runtime {
                 let e = self.model.embedding_of(token).to_vec();
                 self.model.cross_entropy(&e, target)
             };
-            let loss = self.model.learn(&assembled, target);
+            let loss = self.model.learn_centred(&assembled, token, target);
 
             // The anchor is a readout of the dynamics, not a second learner:
             // this token next enters wherever its own mass just came to rest.
@@ -427,6 +432,7 @@ mod tests {
         Runtime::new(
             topology,
             ModelParams {
+                centre_readout: false,
                 vocab,
                 d_head: 8,
                 slots: 8,
@@ -449,6 +455,7 @@ mod tests {
                 mass_floor: 1e-3,
                 slots: 8,
             },
+            seed,
             &mut rng,
         )
     }

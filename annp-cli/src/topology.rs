@@ -83,6 +83,7 @@ struct Row {
 }
 
 pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
+    crate::write_manifest(out_dir, "topology", cfg);
     std::fs::create_dir_all(out_dir)?;
 
     let mut jobs: Vec<(f64, usize, usize)> = Vec::new();

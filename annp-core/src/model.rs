@@ -51,6 +51,7 @@
 
 use crate::graph::Grid;
 use crate::ladder::{AssocMemory, Schedule};
+use crate::linalg::Mat;
 use crate::linalg::norm;
 use crate::rng::Rng;
 
@@ -352,6 +353,18 @@ pub struct ModelParams {
     /// `HeadKind::Lookup`, which has weights of its own.
     pub tied: bool,
     pub head_kind: HeadKind,
+    /// Subtract the running mean of the assembled vector for the current token
+    /// before the readout.
+    ///
+    /// The network does bind context — retrieval among needles sharing a key
+    /// symbol runs far above chance while a bypass control sits exactly at it
+    /// (DESIGN.md §31.4) — but the binding rides at a cosine margin of a few
+    /// thousandths on top of a component fixed by the current token, and the
+    /// readout cannot pull it out from under that. Removing the token's own
+    /// mean leaves the part that depends on everything else, which is the part
+    /// worth reading. The mean is a plain prequential average, so this adds no
+    /// constant to tune.
+    pub centre_readout: bool,
 }
 
 impl ModelParams {
@@ -371,6 +384,10 @@ pub struct Shattered {
 
 pub struct Model {
     params: ModelParams,
+    /// Running mean of the assembled vector per current token, and how many
+    /// observations are behind each row. `None` when centring is off.
+    centre: Option<Mat>,
+    centre_count: Vec<f64>,
     /// `vocab x d_model`, read for input. Also the output head when tied, in
     /// which case it is the only thing differentiated.
     embedding: AssocMemory,
@@ -424,13 +441,29 @@ impl Model {
         // break the moment anything else is constructed after this.
         let mut head_rng = Rng::new(rng.next_u64() ^ 0x4E_AD_5E_ED_00_11_22_33);
         let lookup = match params.head_kind {
-            HeadKind::Lookup { slots } => {
-                Some(LookupHead::new(params.vocab, d_model, slots, &mut head_rng))
-            }
+            HeadKind::Lookup { slots } => Some(LookupHead::new(
+                params.vocab,
+                d_model,
+                slots,
+                params.centre_readout,
+                &mut head_rng,
+            )),
             HeadKind::Linear => None,
+        };
+        // Centring costs one `vocab x d_model` accumulator and nothing else;
+        // built last so it cannot perturb any generator above it.
+        let (centre, centre_count) = if params.centre_readout {
+            (
+                Some(Mat::zeros(params.vocab, d_model)),
+                vec![0.0; params.vocab],
+            )
+        } else {
+            (None, Vec::new())
         };
         Self {
             params,
+            centre,
+            centre_count,
             embedding,
             head,
             lookup,
@@ -525,13 +558,57 @@ impl Model {
     /// `(p - y) e^T`, a rank-one outer product — the same shape the
     /// consolidation ladder already accepts, so the output head needs no
     /// machinery of its own. This is the only backward pass in the system.
+    /// `learn`, with the current token's running mean removed from `assembled`
+    /// first — the readout entry point for the assembled pipeline.
+    ///
+    /// The mean is updated *after* the loss is charged, so the average behind
+    /// the subtraction only ever contains earlier tokens and the loss stays a
+    /// valid prequential code length.
+    pub fn learn_centred(&mut self, assembled: &[f64], token: u32, target: u32) -> f64 {
+        let Some(centre) = self.centre.as_ref() else {
+            return self.learn(assembled, target);
+        };
+        let row = token as usize * assembled.len();
+        let centred: Vec<f64> = assembled
+            .iter()
+            .zip(&centre.as_slice()[row..row + assembled.len()])
+            .map(|(x, m)| x - m)
+            .collect();
+        let loss = self.learn_as(&centred, Some(token), target);
+        self.observe_centre(assembled, token);
+        loss
+    }
+
+    /// Folds one observation into the running mean for `token`.
+    fn observe_centre(&mut self, assembled: &[f64], token: u32) {
+        let Some(centre) = self.centre.as_mut() else {
+            return;
+        };
+        let n = &mut self.centre_count[token as usize];
+        *n += 1.0;
+        let blend = 1.0 / *n;
+        let row = token as usize * assembled.len();
+        for (m, x) in centre.as_mut_slice()[row..row + assembled.len()]
+            .iter_mut()
+            .zip(assembled)
+        {
+            *m += blend * (x - *m);
+        }
+    }
+
     pub fn learn(&mut self, assembled: &[f64], target: u32) -> f64 {
+        self.learn_as(assembled, None, target)
+    }
+
+    /// `learn`, telling the head which token the residual belongs to so the
+    /// per-token expert can take part. `None` leaves the head exactly as it was.
+    fn learn_as(&mut self, assembled: &[f64], token: Option<u32>, target: u32) -> f64 {
         if let Some(lookup) = self.lookup.as_mut() {
-            let loss = lookup.learn(assembled, target, self.params.learning_rate);
+            let loss = lookup.learn(assembled, token, target, self.params.learning_rate);
             self.logit_buf.copy_from_slice(lookup.last_mixture());
             return loss;
         }
-        let loss = self.cross_entropy(assembled, target);
+        let loss = self.cross_entropy_as(assembled, token, target);
         // `logit_buf` holds the softmax after `cross_entropy`; turn it into the
         // error signal in place.
         self.logit_buf[target as usize] -= 1.0;
@@ -546,6 +623,10 @@ impl Model {
     /// Cross-entropy without updating anything. Leaves the softmax in
     /// `logit_buf` for `learn` to reuse.
     pub fn cross_entropy(&mut self, assembled: &[f64], target: u32) -> f64 {
+        self.cross_entropy_as(assembled, None, target)
+    }
+
+    fn cross_entropy_as(&mut self, assembled: &[f64], token: Option<u32>, target: u32) -> f64 {
         assert_eq!(
             assembled.len(),
             self.params.d_model(),
@@ -556,7 +637,7 @@ impl Model {
             "target out of vocabulary"
         );
         if let Some(lookup) = self.lookup.as_mut() {
-            let loss = lookup.score(assembled, target);
+            let loss = lookup.score(assembled, token, target);
             self.logit_buf.copy_from_slice(lookup.last_mixture());
             return loss;
         }
@@ -589,8 +670,122 @@ impl Model {
 mod tests {
     use super::*;
 
+    #[test]
+    fn centring_off_is_exactly_the_old_path() {
+        // The flag has to be inert when off, or every number recorded before it
+        // existed stops being comparable.
+        let mut a = Model::new(params(), &mut Rng::new(7));
+        let mut p = params();
+        p.centre_readout = false;
+        let mut b = Model::new(p, &mut Rng::new(7));
+        let x: Vec<f64> = (0..a.params().d_model())
+            .map(|i| (i as f64 * 0.37).sin())
+            .collect();
+        for i in 0..40 {
+            let target = (i % 5) as u32;
+            let la = a.learn(&x, target);
+            let lb = b.learn_centred(&x, 3, target);
+            assert_eq!(la.to_bits(), lb.to_bits(), "step {i}: {la} vs {lb}");
+        }
+    }
+
+    #[test]
+    fn centring_removes_what_the_token_alone_predicts() {
+        // Feed one token a constant vector. Its running mean converges to that
+        // vector, so what reaches the head goes to zero: exactly the component
+        // the token fixes, and nothing else, is what gets subtracted.
+        let mut p = params();
+        p.centre_readout = true;
+        let mut m = Model::new(p, &mut Rng::new(11));
+        let x: Vec<f64> = (0..m.params().d_model())
+            .map(|i| (i as f64 * 0.11).cos())
+            .collect();
+        for _ in 0..200 {
+            m.learn_centred(&x, 4, 1);
+        }
+        let mean = m.centre.as_ref().expect("centring on").as_slice();
+        let d = x.len();
+        let gap: f64 = x
+            .iter()
+            .zip(&mean[4 * d..5 * d])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        assert!(gap < 1e-6, "running mean did not converge: {gap}");
+    }
+
+    #[test]
+    fn the_per_token_expert_carries_what_centring_removed() {
+        // Hold the assembled vector constant. Its running mean converges to it,
+        // so the residual reaching the slots goes to zero and they can only
+        // predict uniformly. Anything learned past uniform has to have come
+        // through the per-token channel — which is the whole point of adding it,
+        // since centring is what took that evidence away.
+        let mut p = params();
+        p.centre_readout = true;
+        p.head_kind = HeadKind::Lookup { slots: 8 };
+        p.learning_rate = 1.0;
+        let mut m = Model::new(p, &mut Rng::new(5));
+        let d = m.params().d_model();
+        let x: Vec<f64> = (0..d).map(|i| (i as f64 * 0.29).sin()).collect();
+        // Two tokens, two different targets: a bigram no context can supply.
+        let pairs = [(2u32, 7u32), (3, 1)];
+        let mut last = 0.0;
+        for i in 0..600 {
+            let (t, y) = pairs[i % 2];
+            last = m.learn_centred(&x, t, y);
+        }
+        let uniform = (m.params().vocab as f64).ln();
+        assert!(
+            last < 0.25 * uniform,
+            "per-token expert did not learn the bigram: {last} against uniform {uniform}"
+        );
+    }
+
+    #[test]
+    fn the_per_token_expert_wins_mass_against_real_competitors() {
+        // The companion test above forces every slot to predict uniformly, which
+        // is exactly why it could not see that a gate logit of zero left this
+        // expert with `exp(-2 ln M)` of the softmax mass — four parts in a
+        // million at 512 slots, too little responsibility for the gradient to
+        // ever lift it. A guard for that bug has to leave the slots as genuine
+        // competitors: varying, informative input that they can and do learn
+        // from, with the token carrying evidence they cannot reach.
+        let mut p = params();
+        p.centre_readout = true;
+        p.head_kind = HeadKind::Lookup { slots: 64 };
+        p.learning_rate = 1.0;
+        let mut m = Model::new(p, &mut Rng::new(23));
+        let d = m.params().d_model();
+        let vocab = m.params().vocab;
+        let mut rng = Rng::new(91);
+        let draw = |rng: &mut Rng, phase: usize| -> Vec<f64> {
+            (0..d)
+                .map(|i| ((i + phase) as f64 * 0.19).sin() + 0.05 * rng.next_normal())
+                .collect()
+        };
+        for i in 0..3000 {
+            // Context decides most of the target; the token shifts it. A slot
+            // reading the residual can learn the first part and never the second.
+            let phase = i % 4;
+            let token = (i % 3) as u32;
+            let target = ((phase * 3 + token as usize) % vocab) as u32;
+            let x = draw(&mut rng, phase);
+            m.learn_centred(&x, token, target);
+        }
+        let x = draw(&mut rng, 1);
+        m.learn_centred(&x, 2, 0);
+        let won = m.lookup.as_ref().expect("lookup head").token_weight;
+        assert!(
+            won > 0.01,
+            "per-token expert won only {won} of the gate against live slots; \
+             a zero gate logit would give about exp(-2 ln 64) = {:e}",
+            (-2.0f64 * 64.0f64.ln()).exp()
+        );
+    }
+
     fn params() -> ModelParams {
         ModelParams {
+            centre_readout: false,
             vocab: 64,
             d_head: 8,
             slots: 8,
@@ -1086,10 +1281,31 @@ pub struct LookupHead {
     component: Vec<f64>,
     mixture: Vec<f64>,
     responsibility: Vec<f64>,
+    /// One extra expert per current token, present only when the readout is
+    /// centred.
+    ///
+    /// Centring removes the component the current token fixes, and that
+    /// component *is* the order-1 evidence — the most useful single thing the
+    /// readout had. Subtracting it without giving it back makes the readout
+    /// strictly poorer, which is what the first measurement showed. So it comes
+    /// back on its own channel: `token_values[t]` is a distribution learned for
+    /// token `t` alone, mixed in probability space alongside the slots with a
+    /// gate of its own, which keeps §24's mixture intact rather than folding an
+    /// additive term into log space.
+    ///
+    /// `vocab * vocab` here. Fine at benchmark scale; a real vocabulary would
+    /// want this factored or sparse.
+    token_values: Vec<f64>,
+    token_gate: Vec<f64>,
+    token_component: Vec<f64>,
+    /// The token whose expert took part in the last `forward`.
+    last_token: Option<usize>,
+    /// Gate mass the per-token expert won in the last `forward`.
+    token_weight: f64,
 }
 
 impl LookupHead {
-    fn new(vocab: usize, width: usize, slots: usize, rng: &mut Rng) -> Self {
+    fn new(vocab: usize, width: usize, slots: usize, per_token: bool, rng: &mut Rng) -> Self {
         assert!(slots >= 1, "a lookup head needs at least one slot");
         let sigma = (2.0 * (slots as f64).max(2.0).ln()).sqrt();
         Self {
@@ -1107,7 +1323,39 @@ impl LookupHead {
             component: vec![0.0; slots * vocab],
             mixture: vec![0.0; vocab],
             responsibility: vec![0.0; slots],
+            token_values: if per_token {
+                vec![0.0; vocab * vocab]
+            } else {
+                Vec::new()
+            },
+            // Starts level with the *winning* slot, not at zero.
+            //
+            // Slot keys are drawn at `sigma = sqrt(2 ln M)` against a unit query,
+            // so a slot logit is `N(0, 2 ln M)` and the largest of `M` of them
+            // sits near `sigma sqrt(2 ln M) = 2 ln M`. A gate logit of zero
+            // against that is `exp(-2 ln M)` of the mass — for 512 slots, four
+            // parts in a million. That is not a weak start but a structural
+            // exclusion: the expert can never win enough responsibility to learn
+            // its way up. The derivation that fixed `sigma` in §24 fixes this
+            // too, so it is a derived quantity and not a knob.
+            token_gate: if per_token {
+                vec![2.0 * (slots as f64).max(2.0).ln(); vocab]
+            } else {
+                Vec::new()
+            },
+            token_component: if per_token {
+                vec![0.0; vocab]
+            } else {
+                Vec::new()
+            },
+            last_token: None,
+            token_weight: 0.0,
         }
+    }
+
+    #[inline]
+    fn per_token(&self) -> bool {
+        !self.token_gate.is_empty()
     }
 
     /// The mixture from the last `score` or `learn`.
@@ -1115,7 +1363,7 @@ impl LookupHead {
         &self.mixture
     }
 
-    fn forward(&mut self, x: &[f64]) {
+    fn forward(&mut self, x: &[f64], token: Option<u32>) {
         debug_assert_eq!(x.len(), self.width);
         let len = norm(x);
         let scale = if len > 1e-12 { 1.0 / len } else { 0.0 };
@@ -1126,8 +1374,35 @@ impl LookupHead {
             let key = &self.keys[m * self.width..(m + 1) * self.width];
             self.gate[m] = crate::linalg::dot(&self.query, key);
         }
-        softmax(&mut self.gate);
+        // The per-token expert competes for the same gate mass as the slots, so
+        // its logit joins the softmax rather than being blended in afterwards.
+        self.last_token = match (self.per_token(), token) {
+            (true, Some(t)) => Some(t as usize),
+            _ => None,
+        };
+        let token_weight = match self.last_token {
+            Some(t) => {
+                self.gate.push(self.token_gate[t]);
+                softmax(&mut self.gate);
+                let w = self.gate.pop().expect("just pushed");
+                let lo = t * self.vocab;
+                self.token_component
+                    .copy_from_slice(&self.token_values[lo..lo + self.vocab]);
+                softmax(&mut self.token_component);
+                w
+            }
+            None => {
+                softmax(&mut self.gate);
+                0.0
+            }
+        };
         self.mixture.fill(0.0);
+        if let Some(_t) = self.last_token {
+            for (mix, &p) in self.mixture.iter_mut().zip(&self.token_component) {
+                *mix += token_weight * p;
+            }
+        }
+        self.token_weight = token_weight;
         for m in 0..self.slots {
             let lo = m * self.vocab;
             let slice = &mut self.component[lo..lo + self.vocab];
@@ -1140,13 +1415,13 @@ impl LookupHead {
         }
     }
 
-    fn score(&mut self, x: &[f64], target: u32) -> f64 {
-        self.forward(x);
+    fn score(&mut self, x: &[f64], token: Option<u32>, target: u32) -> f64 {
+        self.forward(x, token);
         -self.mixture[target as usize].max(f64::MIN_POSITIVE).ln()
     }
 
-    fn learn(&mut self, x: &[f64], target: u32, lr: f64) -> f64 {
-        let loss = self.score(x, target);
+    fn learn(&mut self, x: &[f64], token: Option<u32>, target: u32, lr: f64) -> f64 {
+        let loss = self.score(x, token, target);
         let y = target as usize;
         let total = self.mixture[y].max(f64::MIN_POSITIVE);
         // Posterior responsibility of each component for the observed target;
@@ -1170,6 +1445,19 @@ impl LookupHead {
                     *k -= lr * g * q;
                 }
             }
+        }
+        // The per-token expert takes the identical pair of updates: its
+        // distribution moves by its own responsibility, and its gate logit by
+        // how much better it explained the target than its weight assumed. No
+        // new rule, just one more component.
+        if let Some(t) = self.last_token {
+            let r = self.token_weight * self.token_component[y] / total;
+            let lo = t * self.vocab;
+            for v in 0..self.vocab {
+                let g = r * (self.token_component[v] - if v == y { 1.0 } else { 0.0 });
+                self.token_values[lo + v] -= lr * g;
+            }
+            self.token_gate[t] -= lr * (self.token_weight - r);
         }
         loss
     }

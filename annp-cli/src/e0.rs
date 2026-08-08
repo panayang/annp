@@ -959,7 +959,8 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             .collect::<Vec<_>>()
             .join(", "),
     );
-    write_csv(out_dir, "manifest.json", manifest)?;
+    write_csv(out_dir, "e0_manifest.json", manifest)?;
+    crate::write_manifest(out_dir, "E0", cfg);
     Ok(())
 }
 

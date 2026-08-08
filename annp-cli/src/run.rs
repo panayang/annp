@@ -41,7 +41,6 @@ use annp_core::runtime::{Mode, Runtime, Scored};
 /// something and an architecture built to accumulate it has something to earn.
 pub struct MarkovSource {
     vocab: usize,
-    order: usize,
     /// Contexts are the last `order` tokens, most recent in the lowest digit.
     contexts: usize,
     successors: Vec<Vec<u32>>,
@@ -79,17 +78,11 @@ impl MarkovSource {
         }
         Self {
             vocab,
-            order,
             contexts,
             successors,
             probabilities,
             context: 0,
         }
-    }
-
-    #[inline]
-    pub fn order(&self) -> usize {
-        self.order
     }
 
     /// Context reached by appending `next` and dropping the oldest token.
@@ -669,6 +662,13 @@ pub struct Config {
     /// value is fixed by a *pair* of keys, which an order-1 model cannot
     /// resolve. See `Needles`.
     pub needle_key_symbols: usize,
+    /// Subtract the current token's running mean from the assembled vector
+    /// before the readout; see `ModelParams::centre_readout`.
+    pub centre_readout: bool,
+    /// Real text instead of the synthetic chain: a JSON corpus of `input_text`
+    /// records, and the SentencePiece model to segment it with.
+    pub corpus: Option<std::path::PathBuf>,
+    pub tokenizer: Option<std::path::PathBuf>,
     pub fanout: usize,
     pub d_head: usize,
     pub slots: usize,
@@ -700,8 +700,10 @@ pub struct Config {
     /// Rewire to the first candidate drawn rather than the least-visited.
     pub blind_turnover: bool,
     /// Give the output head its own weights instead of reusing the embedding
-    /// table. Removes the symmetry the tied head imposes.
-    pub untied: bool,
+    /// Tie the output head to the embedding table. `E E^T` is symmetric and
+    /// positive semi-definite, so a tied head provably cannot express an
+    /// asymmetric bigram (§11.2); untied is the default for that reason.
+    pub tied: bool,
     pub head_kind: HeadKind,
     pub ingress: IngressMode,
     /// Send every token to the same anchor, ignoring content.
@@ -730,8 +732,19 @@ fn window(scored: &[Scored], from: f64, to: f64, f: impl Fn(&Scored) -> f64) -> 
 }
 
 pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
+    crate::write_manifest(out_dir, "run", cfg);
     std::fs::create_dir_all(out_dir)?;
-    let mut rng = Rng::new(cfg.structure_seed);
+    // Independent structural streams off one seed, each with a fixed salt.
+    //
+    // Sharing one generator is how a sweep silently changes what it is not
+    // sweeping: `Topology::small_world` consumes a number of draws that depends
+    // on `long_range`, so with a shared stream every point of a long-range sweep
+    // also got a different embedding table, rotation and ingress plane, and the
+    // measured effect was topology plus a different random architecture. Salting
+    // keeps each knob's effect its own. Turnover gets its own stream inside
+    // `Runtime::new`, from the same seed, for the same reason.
+    let mut topology_rng = Rng::new(cfg.structure_seed ^ 0x7090_1067_5EED_0001);
+    let mut rng = Rng::new(cfg.structure_seed ^ 0x0DE1_5EED_0000_0002);
     let schedule = Schedule::Geometric {
         r: cfg.ladder_ratio,
         g1: 0.5,
@@ -743,11 +756,12 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             long_range: cfg.long_range,
             exponent: cfg.exponent,
         },
-        &mut rng,
+        &mut topology_rng,
     );
     let mut runtime = Runtime::new(
         topology,
         ModelParams {
+            centre_readout: cfg.centre_readout,
             vocab: cfg.vocab,
             d_head: cfg.d_head,
             slots: cfg.slots,
@@ -755,7 +769,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             schedule,
             embed_rungs: cfg.embed_rungs,
             learning_rate: cfg.learning_rate,
-            tied: !cfg.untied,
+            tied: cfg.tied,
             head_kind: cfg.head_kind,
         },
         NodeParams {
@@ -770,6 +784,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             mass_floor: cfg.mass_floor,
             slots: cfg.slots,
         },
+        cfg.structure_seed,
         &mut rng,
     );
 
@@ -782,7 +797,9 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         Mode::Serial
     });
     runtime.set_ingress_mode(cfg.ingress);
-    runtime.capture_representations(cfg.probe);
+    // The needle geometry below reads assembled vectors, so capture them
+    // whenever needles are on even if the probes are not wanted.
+    runtime.capture_representations(cfg.probe || cfg.needles > 0);
 
     // The sources get their own generator. Drawing them from the one the model
     // construction just used would make the data depend on the architecture:
@@ -796,6 +813,40 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let mut source_rng = Rng::new(cfg.seed ^ 0x50_17_CE_50_17_CE_00);
     // Needle symbols are carved off the top of the vocabulary so the source can
     // never emit one; see `Config::needles`.
+    // Real text, if asked for. Done before anything sizes itself on `vocab`,
+    // because the corpus decides what the vocabulary actually is.
+    let corpus_stream = match (&cfg.corpus, &cfg.tokenizer) {
+        (Some(c), Some(t)) => {
+            let st = crate::corpus::stream(c, t, cfg.tokens, cfg.vocab)?;
+            println!("corpus: {}", c.display());
+            println!(
+                "  {} documents, {} tokens, {} distinct pieces before truncation",
+                st.documents,
+                st.tokens.len(),
+                st.distinct_pieces
+            );
+            println!(
+                "  kept the {} most frequent; {:.2}% of tokens fell into the catch-all id",
+                cfg.vocab - 1,
+                100.0 * st.unknown_share
+            );
+            println!("  commonest pieces: {:?}", st.commonest);
+            println!();
+            Some(st)
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            panic!("--corpus and --tokenizer go together")
+        }
+        (None, None) => None,
+    };
+    if corpus_stream.is_some() {
+        assert!(cfg.needles == 0, "needles are for the synthetic source");
+        assert!(
+            cfg.domains <= 1,
+            "domain cycling is for the synthetic source"
+        );
+    }
+
     let plan = Needles::plan(cfg.needles, cfg.needle_key_symbols);
     let needles = plan.len();
     assert!(
@@ -820,7 +871,16 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let mut probes_cur: Vec<Probe> = (0..3).map(|_| Probe::new(cfg.vocab, d_model)).collect();
     let mut probe_previous: std::collections::BTreeMap<u32, u32> = Default::default();
     let mut readout_linear = Probe::new(cfg.vocab, d_model);
-    let mut oracle = OracleCoder::new(cfg.vocab, Probe::new(cfg.vocab, 1).rate_count());
+    // The absolute yardsticks are tables over the vocabulary and grow as
+    // `V^(order+1)`. That is nothing at `V = 16` and impossible on real text —
+    // an order-2 counting coder at `V = 4096` would want half a terabyte — so
+    // each one is built only if it fits a fixed budget and is reported as
+    // unavailable rather than silently skipped.
+    const CELL_BUDGET: usize = 1 << 27;
+    let affords = |cells: usize| cells <= CELL_BUDGET;
+    let oracle_cells = cfg.vocab.saturating_pow(3);
+    let mut oracle = affords(oracle_cells)
+        .then(|| OracleCoder::new(cfg.vocab, Probe::new(cfg.vocab, 1).rate_count()));
     let mut decoded: Vec<u32> = Vec::new();
     let mut readout_nonlinear = NonlinearProbe::new(
         cfg.vocab,
@@ -828,14 +888,22 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         d_model,
         &mut Rng::new(cfg.seed ^ 0x9A_7C_11_05),
     );
-    let mut additive = AdditiveCoder::new(cfg.vocab);
+    let mut additive = affords(cfg.vocab.saturating_pow(2)).then(|| AdditiveCoder::new(cfg.vocab));
     let mut previous_token: Option<u32> = None;
-    let mut coders = [
-        CountingCoder::new(cfg.vocab, 1),
-        CountingCoder::new(cfg.vocab, cfg.order),
-    ];
-    let mut coder_nats = [0.0f64; 2];
-    let mut coder_tail = [0.0f64; 2];
+    let mut coders: Vec<(usize, CountingCoder)> = [1, cfg.order]
+        .into_iter()
+        .filter(|k| affords(cfg.vocab.saturating_pow(*k as u32 + 1)))
+        .map(|k| (k, CountingCoder::new(cfg.vocab, k)))
+        .collect();
+    let mut coder_nats = vec![0.0f64; coders.len()];
+    let mut coder_tail = vec![0.0f64; coders.len()];
+    // Order of a coder -> its slot, so a missing yardstick is a lookup miss
+    // rather than an index into the wrong table.
+    let coder_slot: std::collections::HashMap<usize, usize> = coders
+        .iter()
+        .enumerate()
+        .map(|(i, (k, _))| (*k, i))
+        .collect();
     let domains = cfg.domains.max(1);
     let span = cfg.domain_span.max(1);
     let swap_at = if cfg.fresh_domain_at > 0.0 && cfg.fresh_domain_at < 1.0 {
@@ -864,6 +932,18 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     // 0 for the matched half, 1 for the null half; assigned by teaching
     // position rather than by needle index, see below.
     let mut role: Vec<u8> = vec![0; needles];
+    // Assembled vector at each needle's last teaching, and at its query.
+    //
+    // This is the learner-free half of the diagnosis. A probe that fails to
+    // read something out is only a lower bound (§23), so asking whether the
+    // binding survives at all is asked as a geometric question instead: among
+    // the needles sharing a second key symbol, is a query vector closest to its
+    // own teaching vector? Chance is `1 / P`. At chance no readout of any kind
+    // could recover the binding and the gap is in the network; above chance the
+    // information is present and separable and the gap is in the readout.
+    let mut taught_vec: HashMap<usize, Vec<f64>> = HashMap::new();
+    let mut asked_vec: HashMap<usize, Vec<f64>> = HashMap::new();
+    let mut last_teach: HashMap<usize, usize> = HashMap::new();
     // Which needle's value each query actually asks for: the needle's own for
     // the matched half, another needle's for the null half.
     let mut answer: HashMap<usize, usize> = HashMap::new();
@@ -897,6 +977,8 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
                 teach(&mut forced, at + r * stride, i, i);
             }
             taught_at[i] = at;
+            // Scored slot of the final teaching repetition.
+            last_teach.insert(at + (repeats - 1) * stride + stride - 2, i);
             // Matched and foil alternate along *position*, so the two halves
             // still span the same distances after the permutation.
             role[i] = (slot % 2) as u8;
@@ -935,17 +1017,22 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             }
         }
         let domain = (i / span) % domains;
-        let token = match forced.get(&i) {
-            // Spliced in, not substituted: the chain is not advanced, so the
-            // source sequence the model sees is still a valid sample of it.
-            Some(t) => *t,
-            None => sources[domain].next(&mut stream_rng),
+        let token = match corpus_stream.as_ref() {
+            // Real text is already segmented; the synthetic paths below are what
+            // the needle and domain machinery attach to.
+            Some(st) => st.tokens[i],
+            None => match forced.get(&i) {
+                // Spliced in, not substituted: the chain is not advanced, so the
+                // source sequence the model sees is still a valid sample of it.
+                Some(t) => *t,
+                None => sources[domain].next(&mut stream_rng),
+            },
         };
-        if let Some(prev) = previous_token {
-            additive.observe(prev, token, i * 10 >= cfg.tokens * 9);
+        if let (Some(prev), Some(a)) = (previous_token, additive.as_mut()) {
+            a.observe(prev, token, i * 10 >= cfg.tokens * 9);
         }
         previous_token = Some(token);
-        for (k, coder) in coders.iter_mut().enumerate() {
+        for (k, (_, coder)) in coders.iter_mut().enumerate() {
             let nats = coder.observe(token);
             coder_nats[k] += nats;
             if i * 10 >= cfg.tokens * 9 {
@@ -955,7 +1042,15 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         let pass = (i / (span * domains)).min(reentry.len() - 1);
         let within = i % span;
         for mut s in runtime.advance(Some(token)) {
+            if let (Some(&n), Some(reps)) =
+                (last_teach.get(&(s.position as usize)), s.reps.as_ref())
+            {
+                taught_vec.insert(n, reps.assembled.clone());
+            }
             if let Some(&n) = asked.get(&(s.position as usize)) {
+                if let Some(reps) = s.reps.as_ref() {
+                    asked_vec.insert(n, reps.assembled.clone());
+                }
                 // Guard the alignment rather than trusting it: `Scored` charges
                 // for the token *after* `position`, so scoring the key's slot is
                 // only recall of the value if these line up.
@@ -1019,7 +1114,9 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
                     for r in 0..probes_prev[2].rate_count() {
                         decoded.push(probes_prev[2].argmax(&reps.assembled, r));
                     }
-                    oracle.observe(s.token, &decoded, *prev, s.target, in_tail);
+                    if let Some(o) = oracle.as_mut() {
+                        o.observe(s.token, &decoded, *prev, s.target, in_tail);
+                    }
                 }
             }
             probe_previous.insert(s.position + 1, s.token);
@@ -1084,35 +1181,57 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             window(&scored, from, to, |s| s.loss) * nats_to_bits
         );
     }
-    println!(
-        "  {:<26} {:>8.4}   <- ceiling on any context-free model",
-        "order-1 counting coder",
-        coder_tail[0] / tail_count * nats_to_bits
-    );
-    println!(
-        "  {:<26} {:>8.4}   <- ceiling on anything",
-        format!("order-{} counting coder", sources[0].order()),
-        coder_tail[1] / tail_count * nats_to_bits
-    );
-    println!(
-        "  {:<26} {:>8.4}   <- ceiling on additive (non-interacting) models",
-        "log-linear order-2",
-        additive.best_tail() / tail_count * nats_to_bits
-    );
-    println!(
-        "  {:<26} {:>8.4}",
-        "source entropy rate",
-        entropy_rate * nats_to_bits
-    );
-    println!(
-        "  context is worth {:.4} bits/token: everything between the two coders",
-        (coder_tail[0] - coder_tail[1]) / tail_count * nats_to_bits
-    );
+    // A yardstick that did not fit the budget is said to be missing, never
+    // quietly replaced by a different one.
+    let yardstick = |k: usize| coder_slot.get(&k).map(|i| coder_tail[*i] / tail_count);
+    match yardstick(1) {
+        Some(v) => println!(
+            "  {:<26} {:>8.4}   <- ceiling on any context-free model",
+            "order-1 counting coder",
+            v * nats_to_bits
+        ),
+        None => println!("  order-1 counting coder      unavailable at this vocabulary"),
+    }
+    match yardstick(cfg.order) {
+        Some(v) => println!(
+            "  {:<26} {:>8.4}   <- ceiling on anything",
+            format!("order-{} counting coder", cfg.order),
+            v * nats_to_bits
+        ),
+        None => println!(
+            "  order-{} counting coder      unavailable at this vocabulary",
+            cfg.order
+        ),
+    }
+    if let Some(a) = additive.as_ref() {
+        println!(
+            "  {:<26} {:>8.4}   <- ceiling on additive (non-interacting) models",
+            "log-linear order-2",
+            a.best_tail() / tail_count * nats_to_bits
+        );
+    }
+    if corpus_stream.is_none() {
+        println!(
+            "  {:<26} {:>8.4}",
+            "source entropy rate",
+            entropy_rate * nats_to_bits
+        );
+    }
+    if let (Some(a), Some(b)) = (yardstick(1), yardstick(cfg.order)) {
+        println!(
+            "  context is worth {:.4} bits/token: everything between the two coders",
+            (a - b) * nats_to_bits
+        );
+    }
     println!(
         "  prequential total: {:.1} bits over {} tokens   (bigram coder: {:.1})",
         scored.iter().map(|s| s.loss).sum::<f64>() * nats_to_bits,
         scored.len(),
-        coder_nats[1] * nats_to_bits
+        coder_slot
+            .get(&1)
+            .map(|i| coder_nats[*i])
+            .unwrap_or(f64::NAN)
+            * nats_to_bits
     );
     println!();
 
@@ -1170,16 +1289,18 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             "one-hidden-layer probe",
             readout_nonlinear.best_tail() / tail_count * nats_to_bits
         );
-        let (oracle_tail, accuracy) = oracle.best();
-        println!(
-            "  {:<26} {:>8.4}   <- lookup on (current, previous decoded from it)",
-            "decode-then-look-up",
-            oracle_tail / tail_count * nats_to_bits
-        );
-        println!(
-            "  previous token decoded correctly {:.1}% of the time",
-            100.0 * accuracy
-        );
+        if let Some(o) = oracle.as_ref() {
+            let (oracle_tail, accuracy) = o.best();
+            println!(
+                "  {:<26} {:>8.4}   <- lookup on (current, previous decoded from it)",
+                "decode-then-look-up",
+                oracle_tail / tail_count * nats_to_bits
+            );
+            println!(
+                "  previous token decoded correctly {:.1}% of the time",
+                100.0 * accuracy
+            );
+        }
         println!();
     }
 
@@ -1218,6 +1339,128 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             );
         }
         println!();
+    }
+
+    if needles > 0 && cfg.needle_key_symbols >= 2 {
+        // Nearest-neighbour retrieval among the needles that share a second key
+        // symbol. Learner-free: it asks whether the binding is *there*, not
+        // whether something managed to learn it.
+        let p = cfg.needle_key_symbols;
+        let cos = |a: &[f64], b: &[f64]| {
+            let (mut d, mut na, mut nb) = (0.0, 0.0, 0.0);
+            for (x, y) in a.iter().zip(b) {
+                d += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            if na <= 0.0 || nb <= 0.0 {
+                0.0
+            } else {
+                d / (na.sqrt() * nb.sqrt())
+            }
+        };
+        // Retrieval is also run on vectors with the group mean removed. Within a
+        // group every needle shares the second key symbol, so the group mean *is*
+        // the component determined by the current token, and subtracting it
+        // leaves exactly the part that depends on the first symbol. If accuracy
+        // jumps, the binding is present but buried under a token-determined
+        // component; if it does not, burial is the wrong explanation.
+        let centre = |v: &HashMap<usize, Vec<f64>>, group: &[usize]| -> Vec<f64> {
+            let mut m = vec![0.0; v.values().next().map_or(0, |x| x.len())];
+            let mut n = 0.0;
+            for j in group {
+                if let Some(x) = v.get(j) {
+                    for (a, b) in m.iter_mut().zip(x) {
+                        *a += b;
+                    }
+                    n += 1.0;
+                }
+            }
+            if n > 0.0 {
+                for a in m.iter_mut() {
+                    *a /= n;
+                }
+            }
+            m
+        };
+        let less =
+            |x: &[f64], m: &[f64]| -> Vec<f64> { x.iter().zip(m).map(|(a, b)| a - b).collect() };
+        let (mut chits, mut cmargin) = (0usize, 0.0f64);
+        let (mut hits, mut total, mut margin) = (0usize, 0usize, 0.0f64);
+        for i in 0..needles {
+            let Some(q) = asked_vec.get(&i) else { continue };
+            // Needles sharing this second key symbol are the confusable set.
+            let group: Vec<usize> = (0..needles).filter(|j| j % p == i % p).collect();
+            let mut best = (f64::NEG_INFINITY, usize::MAX);
+            let mut own = f64::NEG_INFINITY;
+            for &j in &group {
+                let Some(t) = taught_vec.get(&j) else {
+                    continue;
+                };
+                let c = cos(q, t);
+                if j == i {
+                    own = c;
+                }
+                if c > best.0 {
+                    best = (c, j);
+                }
+            }
+            if best.1 == usize::MAX || own == f64::NEG_INFINITY {
+                continue;
+            }
+            let runner = group
+                .iter()
+                .filter(|&&j| j != i)
+                .filter_map(|j| taught_vec.get(j).map(|t| cos(q, t)))
+                .fold(f64::NEG_INFINITY, f64::max);
+            total += 1;
+            margin += own - runner;
+            if best.1 == i {
+                hits += 1;
+            }
+
+            let tm = centre(&taught_vec, &group);
+            let qm = centre(&asked_vec, &group);
+            let qc = less(q, &qm);
+            let mut cbest = (f64::NEG_INFINITY, usize::MAX);
+            let (mut cown, mut crunner) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for &j in &group {
+                let Some(t) = taught_vec.get(&j) else {
+                    continue;
+                };
+                let c = cos(&qc, &less(t, &tm));
+                if j == i {
+                    cown = c;
+                } else if c > crunner {
+                    crunner = c;
+                }
+                if c > cbest.0 {
+                    cbest = (c, j);
+                }
+            }
+            if cbest.1 == i {
+                chits += 1;
+            }
+            if cown > f64::NEG_INFINITY && crunner > f64::NEG_INFINITY {
+                cmargin += cown - crunner;
+            }
+        }
+        if total > 0 {
+            println!("needle geometry: is a query vector closest to its own teaching vector?");
+            println!(
+                "  {hits}/{total} correct, chance is 1/{p} = {:.1}%; mean margin over the runner-up {:+.4}",
+                100.0 / p as f64,
+                margin / total as f64
+            );
+            println!(
+                "  at chance the binding is not in the representation and no readout can recover it"
+            );
+            println!(
+                "  with the token-determined group mean removed: {chits}/{total} correct, margin {:+.4}",
+                cmargin / total as f64
+            );
+            println!();
+        }
     }
 
     if needles > 0 {

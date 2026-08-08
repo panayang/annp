@@ -189,7 +189,6 @@ pub struct Node {
     plastic_usage: Vec<f64>,
     /// Visits since the last rewiring, and the surprise accumulated over them.
     turnover_visits: u64,
-    turnover_surprise: f64,
 }
 
 impl Node {
@@ -250,7 +249,6 @@ impl Node {
         let weights = self.route(ctx, &emitted, surprise, scratch);
 
         self.turnover_visits += 1;
-        self.turnover_surprise += surprise;
         let lattice = degree - self.plastic_usage.len();
         for (used, w) in self.plastic_usage.iter_mut().zip(&weights[lattice..degree]) {
             *used += w;
@@ -430,7 +428,6 @@ impl NodeBank {
                 has_fired: false,
                 plastic_usage: vec![0.0; topology.plastic_slots(i as u32).len()],
                 turnover_visits: 0,
-                turnover_surprise: 0.0,
             })
             .collect();
         Self {
@@ -495,18 +492,17 @@ impl NodeBank {
         out
     }
 
-    /// Mean surprise a node has seen since its last rewiring, and how many
-    /// visits that covers. `None` before it has fired at all.
-    pub fn turnover_state(&self, node: u32) -> Option<(u64, f64)> {
+    /// Visits a node has taken since its last rewiring. `None` before it has
+    /// fired at all.
+    ///
+    /// Cadence, not surprise: §18.1 settled that a node rewires every `d_head`
+    /// visits rather than on a surprise threshold. A mean-surprise accumulator
+    /// used to be returned alongside this and was discarded at the only call
+    /// site, so it was costing an add per visit to compute a number nothing
+    /// read.
+    pub fn turnover_visits(&self, node: u32) -> Option<u64> {
         let n = &self.nodes[node as usize];
-        if n.turnover_visits == 0 {
-            None
-        } else {
-            Some((
-                n.turnover_visits,
-                n.turnover_surprise / n.turnover_visits as f64,
-            ))
-        }
+        (n.turnover_visits > 0).then_some(n.turnover_visits)
     }
 
     /// Plastic slot that carried the least mass since the last rewiring, as an
@@ -525,7 +521,6 @@ impl NodeBank {
         let n = &mut self.nodes[node as usize];
         n.plastic_usage.fill(0.0);
         n.turnover_visits = 0;
-        n.turnover_surprise = 0.0;
     }
 
     /// Publishes node `i`'s current expectation for the next tick to route

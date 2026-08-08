@@ -4,11 +4,51 @@
 //! recording the git revision and every parameter that went into the numbers,
 //! so any result in the paper can be regenerated from one line.
 
+mod corpus;
 mod e0;
+
+/// Git revision, or `unknown` outside a checkout.
+pub fn git_revision() -> String {
+    std::process::Command::new("git")
+        .args(["describe", "--always", "--dirty", "--abbrev=12"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Record what produced a result directory: the revision, the exact argv, and
+/// the resolved configuration.
+///
+/// Argv alone would be the "reproduce from one line" claim, but it is not
+/// enough on its own, because a run that relied on a default is only
+/// reproducible while that default holds — and the defaults in this file have
+/// already drifted away from the configuration the design document calls
+/// current (they were three versions stale when this was written). So the
+/// resolved config goes in too, via `Debug`, which means a field added later is
+/// recorded without anyone remembering to update this function. The hand-written
+/// per-field manifest in `e0.rs` is exactly what rots.
+pub fn write_manifest(out_dir: &Path, experiment: &str, resolved: &impl std::fmt::Debug) {
+    let argv: Vec<String> = std::env::args().collect();
+    let body = format!(
+        "{{\n  \"experiment\": {experiment:?},\n  \"git\": {:?},\n  \"argv\": {:?},\n  \"resolved\": {:?}\n}}\n",
+        git_revision(),
+        argv,
+        format!("{resolved:#?}"),
+    );
+    if let Err(e) = std::fs::create_dir_all(out_dir)
+        .and_then(|_| std::fs::write(out_dir.join("manifest.json"), body))
+    {
+        eprintln!("could not write manifest to {}: {e}", out_dir.display());
+    }
+}
+
 mod run;
 mod topology;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use annp_core::model::IngressMode;
 use annp_core::node::AbsorbRule;
@@ -151,6 +191,16 @@ enum Command {
         /// keys, which an order-1 model provably cannot resolve.
         #[arg(long, default_value_t = 0)]
         needle_key_symbols: usize,
+        /// Subtract the current token's running mean from the assembled vector
+        /// before the readout.
+        #[arg(long)]
+        centre_readout: bool,
+        /// JSON corpus of `input_text` records. Requires --tokenizer.
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+        /// SentencePiece model used to segment --corpus.
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
         /// Successors per context. Lower means a more predictable source.
         #[arg(long, default_value_t = 3)]
         fanout: usize,
@@ -171,19 +221,19 @@ enum Command {
         rungs: usize,
         /// Timescales in a node's context key. 1 is the last input alone,
         /// which is exactly the behaviour before this existed.
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 6)]
         context_scales: usize,
         /// Run linear probes along the path and report where context lives.
         #[arg(long, default_value_t = false)]
         probe: bool,
-        /// Rungs behind the tied table; 1 means a plain matrix.
-        #[arg(long, default_value_t = 3)]
+        /// Rungs behind the output table; 1 means a plain matrix.
+        #[arg(long, default_value_t = 1)]
         embed_rungs: usize,
         #[arg(long, default_value_t = 1e-3)]
         mass_floor: f64,
         #[arg(long, default_value_t = 1.0)]
         eta: f64,
-        #[arg(long, default_value_t = 0.05)]
+        #[arg(long, default_value_t = 1.0)]
         learning_rate: f64,
         /// Ladder ratio r. E0-d measured the usable range as 2..=8.
         #[arg(long, default_value_t = 4.0)]
@@ -206,15 +256,15 @@ enum Command {
         /// several. Separates found structure from mere randomisation.
         #[arg(long, default_value_t = false)]
         blind_turnover: bool,
-        /// Give the output head its own weights. A tied head's scores are
-        /// E E^T, which is symmetric and PSD and cannot express an asymmetric
-        /// bigram at all.
+        /// Tie the output head to the embedding table. Provably cannot express
+        /// an asymmetric bigram (§11.2), so it is off by default and this flag
+        /// exists to reproduce the tied comparison.
         #[arg(long, default_value_t = false)]
-        untied: bool,
+        tied: bool,
         /// Slots in the lookup readout. Zero selects the linear head. This is a
         /// genuine new hyperparameter — the capacity of the readout — with no
         /// derivation behind it yet (DESIGN.md §23.5).
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, default_value_t = 512)]
         head_slots: usize,
 
         /// Admit one token per tick regardless of what is still in flight.
@@ -223,7 +273,7 @@ enum Command {
         #[arg(long, default_value_t = false)]
         overlapped: bool,
         /// How a token's entry point is chosen.
-        #[arg(long, value_enum, default_value_t = IngressArg::Content)]
+        #[arg(long, value_enum, default_value_t = IngressArg::Cursor)]
         ingress: IngressArg,
         /// How a node decides whether to forward a particle at all.
         #[arg(long, value_enum, default_value_t = AbsorbArg::Surprise)]
@@ -302,6 +352,9 @@ fn main() -> std::io::Result<()> {
             needles,
             needle_repeats,
             needle_key_symbols,
+            centre_readout,
+            corpus,
+            tokenizer,
             fanout,
             d_head,
             slots,
@@ -321,7 +374,7 @@ fn main() -> std::io::Result<()> {
             bypass,
             frozen_topology,
             blind_turnover,
-            untied,
+            tied,
             head_slots,
             overlapped,
             ingress,
@@ -338,6 +391,9 @@ fn main() -> std::io::Result<()> {
                 needles,
                 needle_repeats,
                 needle_key_symbols,
+                centre_readout,
+                corpus,
+                tokenizer,
                 fanout,
                 d_head,
                 slots,
@@ -357,7 +413,7 @@ fn main() -> std::io::Result<()> {
                 bypass,
                 frozen_topology,
                 blind_turnover,
-                untied,
+                tied,
                 head_kind: if head_slots == 0 {
                     annp_core::model::HeadKind::Linear
                 } else {
