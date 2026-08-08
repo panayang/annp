@@ -193,6 +193,10 @@ enum Command {
         needle_key_symbols: usize,
         /// Subtract the current token's running mean from the assembled vector
         /// before the readout.
+        /// Components the lookup readout evaluates per token. 0 keeps the ones
+        /// above a uniform share; a positive value keeps exactly that many.
+        #[arg(long, default_value_t = 0)]
+        head_top_k: usize,
         #[arg(long)]
         centre_readout: bool,
         /// JSON corpus of `input_text` records. Requires --tokenizer.
@@ -352,6 +356,7 @@ fn main() -> std::io::Result<()> {
             needles,
             needle_repeats,
             needle_key_symbols,
+            head_top_k,
             centre_readout,
             corpus,
             tokenizer,
@@ -391,6 +396,7 @@ fn main() -> std::io::Result<()> {
                 needles,
                 needle_repeats,
                 needle_key_symbols,
+                head_top_k,
                 centre_readout,
                 corpus,
                 tokenizer,

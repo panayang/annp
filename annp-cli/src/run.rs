@@ -664,6 +664,8 @@ pub struct Config {
     pub needle_key_symbols: usize,
     /// Subtract the current token's running mean from the assembled vector
     /// before the readout; see `ModelParams::centre_readout`.
+    /// Components the lookup readout evaluates per token; 0 is adaptive.
+    pub head_top_k: usize,
     pub centre_readout: bool,
     /// Real text instead of the synthetic chain: a JSON corpus of `input_text`
     /// records, and the SentencePiece model to segment it with.
@@ -762,6 +764,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         topology,
         ModelParams {
             centre_readout: cfg.centre_readout,
+            head_top_k: cfg.head_top_k,
             vocab: cfg.vocab,
             d_head: cfg.d_head,
             slots: cfg.slots,
@@ -1131,8 +1134,15 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let uniform = (cfg.vocab as f64).ln();
     let nats_to_bits = 1.0 / std::f64::consts::LN_2;
 
+    // Name the source that actually ran. A header that says "synthetic Markov
+    // source" over a run on real text is the same failure as a comment that
+    // describes what the code was going to do.
     println!(
-        "run — synthetic Markov source, {} tokens{}",
+        "run — {}, {} tokens{}",
+        match &cfg.corpus {
+            Some(path) => format!("corpus {}", path.display()),
+            None => "synthetic Markov source".to_string(),
+        },
         scored.len(),
         if cfg.bypass { "  [BYPASS]" } else { "" }
     );
@@ -1145,11 +1155,15 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             "serial — one token in flight, loss is a valid compression bound"
         }
     );
+    // Order and fanout describe the synthetic chain and mean nothing over a
+    // corpus, so they are printed only when they are real.
+    let source_shape = match &cfg.corpus {
+        Some(_) => String::new(),
+        None => format!(" order={} fanout={}", cfg.order, cfg.fanout),
+    };
     println!(
-        "  vocab={} order={} fanout={} d_head={} slots={} grid={}x{} deg={} floor={}",
+        "  vocab={}{source_shape} d_head={} slots={} grid={}x{} deg={} floor={}",
         cfg.vocab,
-        cfg.order,
-        cfg.fanout,
         cfg.d_head,
         cfg.slots,
         cfg.grid_side,
@@ -1521,14 +1535,24 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         println!();
     }
 
+    if let Some(c) = runtime.readout_coverage() {
+        println!(
+            "readout: {:.1}% of components ever won gate mass",
+            100.0 * c
+        );
+        println!("  below 100% with --head-top-k means slots are frozen out of the competition");
+        println!();
+    }
+
     let mut visits = runtime.engine().visits().to_vec();
     let total: u64 = visits.iter().sum();
     visits.sort_unstable();
     let idle = visits.iter().filter(|c| **c == 0).count();
     let decile = visits.len() * 9 / 10;
     println!(
-        "load across {} nodes, with content-addressed ingress",
-        visits.len()
+        "load across {} nodes, ingress {:?}",
+        visits.len(),
+        cfg.ingress
     );
     println!(
         "  never visited      {idle} ({:.1}%)",

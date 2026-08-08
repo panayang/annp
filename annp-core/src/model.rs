@@ -353,6 +353,11 @@ pub struct ModelParams {
     /// `HeadKind::Lookup`, which has weights of its own.
     pub tied: bool,
     pub head_kind: HeadKind,
+    /// Components the lookup readout evaluates per token. Zero keeps the ones
+    /// above a uniform share, which needs no constant; a positive value keeps
+    /// exactly that many. The full mixture is `O(M V)` a token and dominates the
+    /// network's own cost once the vocabulary is real.
+    pub head_top_k: usize,
     /// Subtract the running mean of the assembled vector for the current token
     /// before the readout.
     ///
@@ -445,6 +450,7 @@ impl Model {
                 params.vocab,
                 d_model,
                 slots,
+                params.head_top_k,
                 params.centre_readout,
                 &mut head_rng,
             )),
@@ -472,6 +478,13 @@ impl Model {
             embed_buf: vec![0.0; d_model],
             logit_buf: vec![0.0; params.vocab],
         }
+    }
+
+    /// Share of readout components that have ever won gate mass. Below one with
+    /// `head_top_k` on means slots are frozen out of the competition and the
+    /// effective capacity is smaller than it looks.
+    pub fn readout_coverage(&self) -> Option<f64> {
+        self.lookup.as_ref().map(|l| l.coverage())
     }
 
     #[inline]
@@ -783,9 +796,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn keeping_every_component_is_the_untouched_mixture() {
+        // Truncation has to be inert when it keeps everything, or numbers taken
+        // before it existed stop being comparable to ones taken after. What
+        // makes it inert is that the renormalisation divides by one, so that is
+        // what gets asserted rather than a downstream loss that could match by
+        // luck.
+        let mut p = params();
+        p.head_kind = HeadKind::Lookup { slots: 16 };
+        p.head_top_k = 16;
+        let mut m = Model::new(p, &mut Rng::new(31));
+        let d = m.params().d_model();
+        let mut rng = Rng::new(77);
+        for i in 0..200 {
+            let x: Vec<f64> = (0..d).map(|_| rng.next_normal()).collect();
+            m.learn(&x, (i % m.params().vocab) as u32);
+        }
+        let head = m.lookup.as_ref().expect("lookup head");
+        assert_eq!(head.active.len(), head.slots, "a component was dropped");
+        let mass: f64 = head.active.iter().map(|k| head.gate[*k]).sum();
+        assert!(
+            (mass - 1.0).abs() < 1e-12,
+            "renormalisation was not the identity: {mass}"
+        );
+        assert_eq!(m.readout_coverage(), Some(1.0));
+    }
+
+    #[test]
+    fn truncation_leaves_the_mixture_a_distribution() {
+        // Dropping components loses their gate mass. If what is kept were not
+        // renormalised the mixture would sum to less than one, every loss would
+        // be inflated by the same silent factor, and nothing would ever fail.
+        let mut p = params();
+        p.head_kind = HeadKind::Lookup { slots: 32 };
+        p.head_top_k = 4;
+        let mut m = Model::new(p, &mut Rng::new(13));
+        let d = m.params().d_model();
+        let mut rng = Rng::new(101);
+        for i in 0..200 {
+            let x: Vec<f64> = (0..d).map(|_| rng.next_normal()).collect();
+            m.learn(&x, (i % m.params().vocab) as u32);
+            let head = m.lookup.as_ref().expect("lookup head");
+            assert!(head.active.len() <= 4, "kept more than asked");
+            let total: f64 = head.mixture.iter().sum();
+            assert!(
+                (total - 1.0).abs() < 1e-9,
+                "step {i}: mixture sums to {total}"
+            );
+        }
+    }
+
     fn params() -> ModelParams {
         ModelParams {
             centre_readout: false,
+            head_top_k: 0,
             vocab: 64,
             d_head: 8,
             slots: 8,
@@ -1302,10 +1367,30 @@ pub struct LookupHead {
     last_token: Option<usize>,
     /// Gate mass the per-token expert won in the last `forward`.
     token_weight: f64,
+    /// Components that took part in the last `forward`.
+    ///
+    /// The mixture costs `O(M V)` a token because every component softmaxes over
+    /// the whole vocabulary. At `V = 16` that is nothing; on real text it makes
+    /// the readout cost an order of magnitude more than the network it is
+    /// reading. Gate mass concentrates, so evaluating only the components that
+    /// won any is a cheap approximation — but a component that is never chosen
+    /// is never updated either, and a slot frozen out of the competition is the
+    /// same structural exclusion that made the per-token expert inert, so
+    /// `ever_active` is tracked and reported rather than assumed away.
+    active: Vec<usize>,
+    ever_active: Vec<bool>,
+    top_k: usize,
 }
 
 impl LookupHead {
-    fn new(vocab: usize, width: usize, slots: usize, per_token: bool, rng: &mut Rng) -> Self {
+    fn new(
+        vocab: usize,
+        width: usize,
+        slots: usize,
+        top_k: usize,
+        per_token: bool,
+        rng: &mut Rng,
+    ) -> Self {
         assert!(slots >= 1, "a lookup head needs at least one slot");
         let sigma = (2.0 * (slots as f64).max(2.0).ln()).sqrt();
         Self {
@@ -1350,6 +1435,9 @@ impl LookupHead {
             },
             last_token: None,
             token_weight: 0.0,
+            active: Vec::with_capacity(slots),
+            ever_active: vec![false; slots],
+            top_k,
         }
     }
 
@@ -1396,14 +1484,51 @@ impl LookupHead {
                 0.0
             }
         };
+        // Choose the components worth evaluating. Zero means adaptive: keep the
+        // ones that beat a uniform share, which is a derived line rather than a
+        // tuned one — a component below `1/M` is contributing less than an
+        // average component and cannot move the mixture much.
+        self.active.clear();
+        if self.top_k == 0 {
+            let floor = 1.0 / self.slots as f64;
+            self.active
+                .extend((0..self.slots).filter(|m| self.gate[*m] >= floor));
+            if self.active.is_empty() {
+                let best = (0..self.slots)
+                    .max_by(|a, b| self.gate[*a].total_cmp(&self.gate[*b]))
+                    .unwrap_or(0);
+                self.active.push(best);
+            }
+        } else if self.top_k >= self.slots {
+            self.active.extend(0..self.slots);
+        } else {
+            let mut order: Vec<usize> = (0..self.slots).collect();
+            order
+                .select_nth_unstable_by(self.top_k, |a, b| self.gate[*b].total_cmp(&self.gate[*a]));
+            order.truncate(self.top_k);
+            order.sort_unstable();
+            self.active.extend(order);
+        }
+        // Dropping components loses their gate mass, so what is kept is
+        // renormalised: the mixture stays a distribution, and a responsibility
+        // still sums to one over the components that were actually evaluated.
+        let kept: f64 = self.active.iter().map(|m| self.gate[*m]).sum::<f64>() + token_weight;
+        let renorm = if kept > 0.0 { 1.0 / kept } else { 0.0 };
+        for m in &self.active {
+            self.gate[*m] *= renorm;
+            self.ever_active[*m] = true;
+        }
+        let token_weight = token_weight * renorm;
+
         self.mixture.fill(0.0);
-        if let Some(_t) = self.last_token {
+        if self.last_token.is_some() {
             for (mix, &p) in self.mixture.iter_mut().zip(&self.token_component) {
                 *mix += token_weight * p;
             }
         }
         self.token_weight = token_weight;
-        for m in 0..self.slots {
+        for k in 0..self.active.len() {
+            let m = self.active[k];
             let lo = m * self.vocab;
             let slice = &mut self.component[lo..lo + self.vocab];
             slice.copy_from_slice(&self.values[lo..lo + self.vocab]);
@@ -1413,6 +1538,13 @@ impl LookupHead {
                 *mix += w * p;
             }
         }
+    }
+
+    /// Share of components that have ever won gate mass. Below one means slots
+    /// are frozen out and the effective capacity is smaller than `M`.
+    pub fn coverage(&self) -> f64 {
+        let seen = self.ever_active.iter().filter(|x| **x).count();
+        seen as f64 / self.ever_active.len().max(1) as f64
     }
 
     fn score(&mut self, x: &[f64], token: Option<u32>, target: u32) -> f64 {
@@ -1426,10 +1558,15 @@ impl LookupHead {
         let total = self.mixture[y].max(f64::MIN_POSITIVE);
         // Posterior responsibility of each component for the observed target;
         // these sum to one.
-        for m in 0..self.slots {
+        // Only the components that were evaluated hold a valid `component` row,
+        // and only they carry gate mass, so the responsibilities are over the
+        // active set and still sum to one.
+        for k in 0..self.active.len() {
+            let m = self.active[k];
             self.responsibility[m] = self.gate[m] * self.component[m * self.vocab + y] / total;
         }
-        for m in 0..self.slots {
+        for k in 0..self.active.len() {
+            let m = self.active[k];
             let r = self.responsibility[m];
             let lo = m * self.vocab;
             for v in 0..self.vocab {

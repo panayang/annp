@@ -280,6 +280,11 @@ impl Runtime {
     }
 
     #[inline]
+    /// See `Model::readout_coverage`.
+    pub fn readout_coverage(&self) -> Option<f64> {
+        self.model.readout_coverage()
+    }
+
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
@@ -433,6 +438,7 @@ mod tests {
             topology,
             ModelParams {
                 centre_readout: false,
+                head_top_k: 0,
                 vocab,
                 d_head: 8,
                 slots: 8,
