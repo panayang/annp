@@ -114,6 +114,15 @@ pub struct TokenOutput {
     /// cost, and the quantity DESIGN.md §1.6 claims is independent of how far
     /// into the sequence the token sits.
     pub visits: u64,
+    /// Every node this token's mass passed through, with repeats. Deduplicated
+    /// by the caller.
+    ///
+    /// `visits` counts work; this says *where* the work happened. With roughly
+    /// 540 visits on a 576-node grid the two questions come apart: a token can
+    /// be sampling a selected few nodes many times, or smearing itself over the
+    /// whole network. In the second case the reassembled vector is a
+    /// network-wide average and cannot be specific to anything.
+    pub touched: Vec<u32>,
     /// `sum_i mass_i * payload_i` over the children created on the token's
     /// very first tick, laid out like `accumulated`. Diagnostic only: it is
     /// what the reassembly would have been after exactly one hop, and comparing
@@ -285,6 +294,7 @@ impl Engine {
                 absorbed_mass: 0.0,
                 hop_mass: 0.0,
                 visits: 0,
+                touched: Vec::new(),
                 anchor_cos: [0.0; 2],
                 anchor_sin: [0.0; 2],
                 injected_tick: self.tick,
@@ -313,9 +323,10 @@ impl Engine {
         }
 
         // Charge this tick's work to the tokens that caused it.
-        for &token in &self.current.token {
+        for (&token, &node) in self.current.token.iter().zip(&self.current.node) {
             if let Some(out) = self.outputs.get_mut(&token) {
                 out.visits += 1;
+                out.touched.push(node);
             }
         }
 
@@ -540,6 +551,7 @@ mod tests {
                 schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
                 rungs: 4,
                 context_scales: 1,
+                key_echo: 0,
             },
         );
         (t, bank)
@@ -597,6 +609,7 @@ mod tests {
             absorbed_mass: 0.0,
             hop_mass: 0.0,
             visits: 0,
+            touched: Vec::new(),
             anchor_cos: [0.0; 2],
             anchor_sin: [0.0; 2],
             injected_tick: 0,
@@ -632,6 +645,7 @@ mod tests {
             absorbed_mass: 0.0,
             hop_mass: 0.0,
             visits: 0,
+            touched: Vec::new(),
             anchor_cos: [0.0; 2],
             anchor_sin: [0.0; 2],
             injected_tick: 0,

@@ -197,6 +197,9 @@ enum Command {
         /// above a uniform share; a positive value keeps exactly that many.
         #[arg(long, default_value_t = 0)]
         head_top_k: usize,
+        /// Past keys each node keeps for the key-echo diagnostic. 0 is off.
+        #[arg(long, default_value_t = 0)]
+        key_echo: usize,
         #[arg(long)]
         centre_readout: bool,
         /// JSON corpus of `input_text` records. Requires --tokenizer.
@@ -357,6 +360,7 @@ fn main() -> std::io::Result<()> {
             needle_repeats,
             needle_key_symbols,
             head_top_k,
+            key_echo,
             centre_readout,
             corpus,
             tokenizer,
@@ -397,6 +401,7 @@ fn main() -> std::io::Result<()> {
                 needle_repeats,
                 needle_key_symbols,
                 head_top_k,
+                key_echo,
                 centre_readout,
                 corpus,
                 tokenizer,

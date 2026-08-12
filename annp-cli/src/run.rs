@@ -666,6 +666,8 @@ pub struct Config {
     /// before the readout; see `ModelParams::centre_readout`.
     /// Components the lookup readout evaluates per token; 0 is adaptive.
     pub head_top_k: usize,
+    /// Past keys each node keeps for the key-echo diagnostic; 0 is off.
+    pub key_echo: usize,
     pub centre_readout: bool,
     /// Real text instead of the synthetic chain: a JSON corpus of `input_text`
     /// records, and the SentencePiece model to segment it with.
@@ -782,6 +784,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             schedule,
             rungs: cfg.rungs,
             context_scales: cfg.context_scales,
+            key_echo: cfg.key_echo,
         },
         EngineParams {
             mass_floor: cfg.mass_floor,
@@ -1009,6 +1012,50 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             answer.insert(i, value);
         }
     }
+    // Where a token's mass went, and whether that depends on the token.
+    //
+    // The visit count alone cannot separate two questions. `coverage` is the
+    // share of the grid one token touches: near one and the reassembled vector
+    // is a network-wide average, which cannot be specific to anything, and no
+    // change of geometry makes it specific while the token still walks
+    // everywhere. `selectivity` is paired — overlap between the node sets of
+    // two occurrences of the *same* token, minus overlap between two
+    // *different* tokens at a matched time distance. Same grid, same recency,
+    // differing only in content, so geometry cancels and what is left is
+    // whether the trajectory is content-driven at all.
+    //
+    // Neither reads without the other: at saturated coverage, selectivity is
+    // zero by arithmetic rather than by dynamics.
+    struct Trail {
+        position: u32,
+        token: u32,
+        nodes: Vec<u32>,
+    }
+    let mut trails: std::collections::VecDeque<Trail> = std::collections::VecDeque::new();
+    let (mut cover_sum, mut cover_n) = (0.0f64, 0u64);
+    let (mut same_sum, mut same_n) = (0.0f64, 0u64);
+    let (mut other_sum, mut other_n) = (0.0f64, 0u64);
+    fn jaccard(a: &[u32], b: &[u32]) -> f64 {
+        let (mut i, mut j, mut hit) = (0usize, 0usize, 0usize);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    hit += 1;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        let union = a.len() + b.len() - hit;
+        if union == 0 {
+            0.0
+        } else {
+            hit as f64 / union as f64
+        }
+    }
+
     let mut needle_loss: Vec<f64> = vec![f64::NAN; needles];
     for i in 0..cfg.tokens {
         if let Some(at) = swap_at {
@@ -1045,6 +1092,36 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         let pass = (i / (span * domains)).min(reentry.len() - 1);
         let within = i % span;
         for mut s in runtime.advance(Some(token)) {
+            {
+                let nodes = std::mem::take(&mut s.touched);
+                cover_sum += nodes.len() as f64 / (cfg.grid_side * cfg.grid_side) as f64;
+                cover_n += 1;
+                if let Some(prev) = trails.iter().rev().find(|t| t.token == s.token) {
+                    let gap = s.position - prev.position;
+                    same_sum += jaccard(&nodes, &prev.nodes);
+                    same_n += 1;
+                    // The control: a different token as close to the same time
+                    // distance as the ring allows. Matching the gap matters
+                    // because trails drift as the topology rewires, so an
+                    // unmatched control would be measuring drift, not content.
+                    if let Some(other) = trails
+                        .iter()
+                        .filter(|t| t.token != s.token)
+                        .min_by_key(|t| s.position.abs_diff(t.position).abs_diff(gap))
+                    {
+                        other_sum += jaccard(&nodes, &other.nodes);
+                        other_n += 1;
+                    }
+                }
+                if trails.len() >= 512 {
+                    trails.pop_front();
+                }
+                trails.push_back(Trail {
+                    position: s.position,
+                    token: s.token,
+                    nodes,
+                });
+            }
             if let (Some(&n), Some(reps)) =
                 (last_teach.get(&(s.position as usize)), s.reps.as_ref())
             {
@@ -1541,6 +1618,45 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             100.0 * c
         );
         println!("  below 100% with --head-top-k means slots are frozen out of the competition");
+        println!();
+    }
+
+    if cover_n > 0 {
+        println!("where a token's mass goes");
+        println!(
+            "  coverage, share of the grid one token touches  {:.4}",
+            cover_sum / cover_n as f64
+        );
+        if same_n > 0 && other_n > 0 {
+            let (same, other) = (same_sum / same_n as f64, other_sum / other_n as f64);
+            println!("  node-set overlap, same token again             {same:.4}");
+            println!("  node-set overlap, a different token            {other:.4}");
+            println!(
+                "  selectivity, the difference                   {:+.4}",
+                same - other
+            );
+        }
+        println!("  coverage near 1 means the assembled vector is a network-wide average,");
+        println!("  and selectivity then reads zero by arithmetic rather than by dynamics");
+        println!();
+    }
+
+    if let Some((surprise, added)) = runtime.visit_stats() {
+        println!("what a visit adds to the payload, per visit");
+        println!("  magnitude of tanh(Wq)      {added:>8.4}   (the payload has norm 1)");
+        println!("  surprise, how wrong it was {surprise:>8.4}");
+        println!("  large and wrong is what would make more visits cost rather than pay");
+        println!();
+    }
+
+    if let Some((mean, hits)) = runtime.key_echo() {
+        println!("key echo: does a node's context key ever come back?");
+        println!(
+            "  closest previous key, mean cosine {mean:.4}; {:.1}% of visits above 0.5",
+            100.0 * hits
+        );
+        println!("  a node's memory is addressed by this key, so a low echo means");
+        println!("  the write went somewhere the read never returns to");
         println!();
     }
 

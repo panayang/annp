@@ -89,6 +89,13 @@ pub struct NodeParams {
     /// Timescales in a node's context key. `1` means the key is the last input
     /// alone, which is exactly the original behaviour.
     pub context_scales: usize,
+    /// Past keys each node remembers, for the key-echo diagnostic. Zero is off.
+    ///
+    /// A node's memory is addressed by its context key, so retrieval only pays
+    /// when a key comes back. This measures whether it does: the cosine between
+    /// the key a visit reads with and the closest key that node has read with
+    /// before. Diagnostic only — nothing in the dynamics reads it.
+    pub key_echo: usize,
 }
 
 /// How a node decides whether to forward a particle at all.
@@ -182,6 +189,29 @@ pub struct Node {
     context: Vec<Vec<f64>>,
     /// Normalised sum of `context`, cached because every visit needs it twice.
     key: Vec<f64>,
+    /// Ring of past read keys, and where the next one goes.
+    echo_past: Vec<Vec<f64>>,
+    echo_at: usize,
+    /// Sum and count of "closest previous key" cosines, and how many landed
+    /// above a half — a key that similar has genuinely been seen before.
+    echo_sum: f64,
+    echo_count: u64,
+    echo_hits: u64,
+    /// What the node adds to a payload, and how wrong it was.
+    ///
+    /// A visit does `u = q + tanh(Wq)`: the memory's guess at what follows this
+    /// context is added to the payload unconditionally, with nothing deciding
+    /// whether the guess is worth trusting. `pred_sum` is the magnitude of that
+    /// addition against a unit-norm payload, so it says how much is being mixed
+    /// in; `surprise_sum` is the delta rule's own report of how far the guess
+    /// was from what actually arrived. Large and wrong is the combination that
+    /// would explain §34.5.
+    ///
+    /// Both are consumed by the run report. The accumulator this replaces was
+    /// removed in §32.2 precisely because nothing read it.
+    surprise_sum: f64,
+    pred_sum: f64,
+    visit_count: u64,
     has_fired: bool,
     /// Mass forwarded through each plastic out-edge since the last rewiring.
     /// Structural bookkeeping only — it plays no part in routing, which is a
@@ -224,6 +254,31 @@ impl Node {
         self.absorb_into_context(q);
         self.memory.relax();
 
+        // Key echo, before the current key joins the ring so a key is never
+        // compared against itself.
+        if params.key_echo > 0 {
+            let mut best = -1.0f64;
+            for old in &self.echo_past {
+                let dot: f64 = old.iter().zip(&self.key).map(|(a, b)| a * b).sum();
+                if dot > best {
+                    best = dot;
+                }
+            }
+            if !self.echo_past.is_empty() {
+                self.echo_sum += best;
+                self.echo_count += 1;
+                if best > 0.5 {
+                    self.echo_hits += 1;
+                }
+            }
+            if self.echo_past.len() < params.key_echo {
+                self.echo_past.push(self.key.clone());
+            } else {
+                self.echo_past[self.echo_at].copy_from_slice(&self.key);
+                self.echo_at = (self.echo_at + 1) % params.key_echo;
+            }
+        }
+
         // Predict, from the context including what just arrived. This is also
         // what neighbours route against once published.
         self.memory.read().mul_vec(&self.key, &mut scratch.pred);
@@ -232,9 +287,15 @@ impl Node {
         // annihilating. Renormalised because unit-norm payloads are the
         // invariant keeping every d_head-sized product in range.
         let mut emitted = vec![0.0; d];
+        let mut added = 0.0;
         for (e, (&qi, &p)) in emitted.iter_mut().zip(q.iter().zip(&scratch.pred)) {
-            *e = qi + p.tanh();
+            let g = p.tanh();
+            added += g * g;
+            *e = qi + g;
         }
+        self.surprise_sum += surprise;
+        self.pred_sum += added.sqrt();
+        self.visit_count += 1;
         let len = norm(&emitted);
         if len > 1e-12 {
             for e in emitted.iter_mut() {
@@ -425,6 +486,14 @@ impl NodeBank {
                 },
                 context: vec![vec![0.0; d]; params.context_scales.max(1)],
                 key: vec![0.0; d],
+                echo_past: Vec::new(),
+                echo_at: 0,
+                echo_sum: 0.0,
+                echo_count: 0,
+                echo_hits: 0,
+                surprise_sum: 0.0,
+                pred_sum: 0.0,
+                visit_count: 0,
                 has_fired: false,
                 plastic_usage: vec![0.0; topology.plastic_slots(i as u32).len()],
                 turnover_visits: 0,
@@ -492,6 +561,34 @@ impl NodeBank {
         out
     }
 
+    /// Mean surprise and mean magnitude of what a visit adds to the payload,
+    /// against a payload of norm one. `None` before anything has fired.
+    pub fn visit_stats(&self) -> Option<(f64, f64)> {
+        let n: u64 = self.nodes.iter().map(|x| x.visit_count).sum();
+        if n == 0 {
+            return None;
+        }
+        let s: f64 = self.nodes.iter().map(|x| x.surprise_sum).sum();
+        let p: f64 = self.nodes.iter().map(|x| x.pred_sum).sum();
+        Some((s / n as f64, p / n as f64))
+    }
+
+    /// Mean "closest previous key" cosine across every visit that had a past to
+    /// compare against, and the share of those above a half. `None` when the
+    /// diagnostic is off.
+    ///
+    /// A node's memory is addressed by this key, so a low echo means retrieval
+    /// has nothing to retrieve: the write went to a key that never comes back.
+    pub fn key_echo(&self) -> Option<(f64, f64)> {
+        let total: u64 = self.nodes.iter().map(|n| n.echo_count).sum();
+        if total == 0 {
+            return None;
+        }
+        let sum: f64 = self.nodes.iter().map(|n| n.echo_sum).sum();
+        let hits: u64 = self.nodes.iter().map(|n| n.echo_hits).sum();
+        Some((sum / total as f64, hits as f64 / total as f64))
+    }
+
     /// Visits a node has taken since its last rewiring. `None` before it has
     /// fired at all.
     ///
@@ -552,6 +649,7 @@ mod tests {
             schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
             rungs: 4,
             context_scales: 1,
+            key_echo: 0,
         };
         let bank = NodeBank::new(&t, p);
         (t, bank)
@@ -596,6 +694,7 @@ mod tests {
                 schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
                 rungs: 4,
                 context_scales: 1,
+                key_echo: 0,
             },
         );
         // The very first arrival at a node has no predecessor, so surprise is
@@ -670,6 +769,7 @@ mod tests {
                 schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
                 rungs: 4,
                 context_scales: 1,
+                key_echo: 0,
             };
             (NodeBank::new(&t, p), t)
         };
@@ -706,6 +806,7 @@ mod tests {
                 schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
                 rungs: 4,
                 context_scales: scales,
+                key_echo: 0,
             };
             (NodeBank::new(&t, p), t)
         };
@@ -751,6 +852,7 @@ mod tests {
             schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
             rungs: 4,
             context_scales: 6,
+            key_echo: 0,
         };
         let mut bank = NodeBank::new(&t, p);
         let mut rng = Rng::new(63);

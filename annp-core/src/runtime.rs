@@ -88,6 +88,8 @@ pub struct Scored {
     /// this to have contributed anything at all (DESIGN.md §11.2 ①).
     pub passthrough_loss: f64,
     pub visits: u64,
+    /// Distinct nodes this token's mass passed through, ascending.
+    pub touched: Vec<u32>,
     pub mean_hops: f64,
     pub absorbed_mass: f64,
     /// How far this token's ingress anchor moved when its resting place was
@@ -280,6 +282,16 @@ impl Runtime {
     }
 
     #[inline]
+    /// See `NodeBank::visit_stats`.
+    pub fn visit_stats(&self) -> Option<(f64, f64)> {
+        self.bank.visit_stats()
+    }
+
+    /// See `NodeBank::key_echo`.
+    pub fn key_echo(&self) -> Option<(f64, f64)> {
+        self.bank.key_echo()
+    }
+
     /// See `Model::readout_coverage`.
     pub fn readout_coverage(&self) -> Option<f64> {
         self.model.readout_coverage()
@@ -362,7 +374,7 @@ impl Runtime {
         }
 
         let mut scored = Vec::new();
-        while let Some(output) = self.ready.remove(&self.next_to_score) {
+        while let Some(mut output) = self.ready.remove(&self.next_to_score) {
             let position = self.next_to_score;
             // The last token of a stream never gets a target; hold its output
             // in case more tokens arrive later.
@@ -406,6 +418,12 @@ impl Runtime {
                 loss,
                 passthrough_loss,
                 visits: output.visits,
+                touched: {
+                    let mut t = std::mem::take(&mut output.touched);
+                    t.sort_unstable();
+                    t.dedup();
+                    t
+                },
                 mean_hops: output.mean_hops(),
                 absorbed_mass: output.absorbed_mass,
                 anchor_move,
@@ -456,6 +474,7 @@ mod tests {
                 schedule,
                 rungs: 4,
                 context_scales: 1,
+                key_echo: 0,
             },
             EngineParams {
                 mass_floor: 1e-3,
