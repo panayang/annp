@@ -138,6 +138,22 @@ pub struct Outcome {
     pub surprise: f64,
     /// Routing weights over `out_edges ++ [absorb]`, summing to 1.
     pub weights: Vec<f64>,
+    /// What this node contributed, `tanh(W k)`, before it was added to the
+    /// payload. The emitted payload is the sum of the two, and the sum is
+    /// dominated by the payload — a unit-norm arrival against a contribution of
+    /// magnitude about 0.4 — so a readout that averages emitted payloads is
+    /// mostly averaging its own input. Kept separately so the two can be
+    /// deposited apart and weighted by whatever is reading them.
+    pub answer: Vec<f64>,
+    /// `max(0, 1 - surprise)`: the share of the arriving payload this node's
+    /// memory actually explained.
+    ///
+    /// Surprise is `||v - W k||` against a unit target, so zero means the memory
+    /// predicted exactly, one means it predicted nothing, and above one means it
+    /// pointed the wrong way. The clamp therefore silences a node that knows
+    /// nothing rather than letting it vote negatively, which makes weighting by
+    /// this quantity a soft version of picking the experts that know something.
+    pub confidence: f64,
 }
 
 /// Everything a node reads during a tick and never writes.
@@ -312,6 +328,8 @@ impl Node {
             emitted.copy_from_slice(q);
         }
 
+        let answer: Vec<f64> = scratch.pred.iter().map(|p| p.tanh()).collect();
+        let confidence = (1.0 - surprise).max(0.0);
         let weights = self.route(ctx, &emitted, surprise, scratch);
 
         self.turnover_visits += 1;
@@ -322,6 +340,8 @@ impl Node {
 
         Outcome {
             emitted,
+            answer,
+            confidence,
             surprise,
             weights,
         }

@@ -336,6 +336,15 @@ pub struct ModelParams {
     /// `HeadKind::Lookup`, which has weights of its own.
     pub tied: bool,
     pub head_kind: HeadKind,
+    /// Deposit the payload and the node's answer into separate halves of the
+    /// reassembly buffer rather than summing them.
+    ///
+    /// The emitted payload is `q + tanh(Wq)` renormalised, and the two terms
+    /// have magnitudes 1 and about 0.4, so averaging emitted payloads is mostly
+    /// averaging the input. Splitting them keeps an untrained node transparent —
+    /// its answer is zero, and the payload half is unaffected — while letting
+    /// the readout learn what the answers are worth.
+    pub split_deposit: bool,
     /// Components the lookup readout evaluates per token. Zero keeps the ones
     /// above a uniform share, which needs no constant; a positive value keeps
     /// exactly that many. The full mixture is `O(M V)` a token and dominates the
@@ -359,6 +368,14 @@ impl ModelParams {
     #[inline]
     pub fn d_model(&self) -> usize {
         self.slots * self.d_head
+    }
+
+    /// Width the readout sees. Twice `d_model` when the payload and the nodes'
+    /// answers are deposited apart, so the head can weigh them itself instead of
+    /// being handed a fixed 1-to-0.4 sum of the two.
+    #[inline]
+    pub fn readout_width(&self) -> usize {
+        self.d_model() * if self.split_deposit { 2 } else { 1 }
     }
 }
 
@@ -407,11 +424,20 @@ impl Model {
             .collect();
         embedding.initialise(&init);
 
+        // The readout is as wide as what it is handed, which is twice `d_model`
+        // when the payload and the answers arrive separately. The embedding
+        // stays `d_model` because it is what gets shattered into slots, so a
+        // tied head cannot express a split readout at all.
+        let readout = params.readout_width();
+        assert!(
+            !(params.tied && params.split_deposit),
+            "a tied head is d_model wide and cannot read a split deposit"
+        );
         let head = (!params.tied).then(|| {
             if params.embed_rungs <= 1 {
-                AssocMemory::single_rect(params.vocab, d_model, 1.0)
+                AssocMemory::single_rect(params.vocab, readout, 1.0)
             } else {
-                AssocMemory::ladder_rect(params.vocab, d_model, params.schedule, params.embed_rungs)
+                AssocMemory::ladder_rect(params.vocab, readout, params.schedule, params.embed_rungs)
             }
         });
 
@@ -431,7 +457,7 @@ impl Model {
         let lookup = match params.head_kind {
             HeadKind::Lookup { slots } => Some(LookupHead::new(
                 params.vocab,
-                d_model,
+                readout,
                 slots,
                 params.head_top_k,
                 params.centre_readout,
@@ -443,7 +469,7 @@ impl Model {
         // built last so it cannot perturb any generator above it.
         let (centre, centre_count) = if params.centre_readout {
             (
-                Some(Mat::zeros(params.vocab, d_model)),
+                Some(Mat::zeros(params.vocab, readout)),
                 vec![0.0; params.vocab],
             )
         } else {
@@ -542,9 +568,19 @@ impl Model {
     /// Undoes the shatter: rescale, concatenate, rotate back.
     pub fn assemble(&self, accumulated: &[f64], scale: f64) -> Vec<f64> {
         let d_model = self.params.d_model();
-        assert_eq!(accumulated.len(), d_model, "accumulator width mismatch");
+        assert_eq!(
+            accumulated.len(),
+            self.params.readout_width(),
+            "accumulator width mismatch"
+        );
         let mut v: Vec<f64> = accumulated.iter().map(|x| x * scale).collect();
-        self.rotation.inverse(&mut v);
+        // The rotation is defined on one `d_model` block, so each half is
+        // undone on its own; running it across the pair would mix the payload
+        // into the answers and undo the point of separating them.
+        self.rotation.inverse(&mut v[..d_model]);
+        if self.params.split_deposit {
+            self.rotation.inverse(&mut v[d_model..]);
+        }
         v
     }
 
@@ -625,7 +661,7 @@ impl Model {
     fn cross_entropy_as(&mut self, assembled: &[f64], token: Option<u32>, target: u32) -> f64 {
         assert_eq!(
             assembled.len(),
-            self.params.d_model(),
+            self.params.readout_width(),
             "assembled width mismatch"
         );
         assert!(
@@ -834,6 +870,7 @@ mod tests {
         ModelParams {
             centre_readout: false,
             head_top_k: 0,
+            split_deposit: false,
             vocab: 64,
             d_head: 8,
             slots: 8,

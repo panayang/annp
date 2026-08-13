@@ -200,6 +200,21 @@ enum Command {
         /// Past keys each node keeps for the key-echo diagnostic. 0 is off.
         /// Ladder rung the forward pass reads. 0 is the fastest, which is what
         /// the design has always used.
+        /// Weight a deposit by how much of the arriving payload that node's
+        /// memory explained, not only by how much mass stopped there.
+        #[arg(long)]
+        confidence_weighted: bool,
+        /// Deposit the payload and the node's answer into separate halves of
+        /// the reassembly buffer instead of summing them.
+        #[arg(long)]
+        split_deposit: bool,
+        /// One child down the strongest option, carrying the whole mass,
+        /// instead of one child per edge sharing it out.
+        #[arg(long)]
+        walk: bool,
+        /// Hops after which a walker is absorbed. Placeholder termination.
+        #[arg(long, default_value_t = 64)]
+        hop_cap: u64,
         #[arg(long, default_value_t = 0)]
         read_rung: usize,
         #[arg(long, default_value_t = 0)]
@@ -371,6 +386,10 @@ fn main() -> std::io::Result<()> {
             needle_repeats,
             needle_key_symbols,
             head_top_k,
+            confidence_weighted,
+            split_deposit,
+            walk,
+            hop_cap,
             read_rung,
             key_echo,
             lag_probe,
@@ -414,6 +433,10 @@ fn main() -> std::io::Result<()> {
                 needle_repeats,
                 needle_key_symbols,
                 head_top_k,
+                confidence_weighted,
+                split_deposit,
+                walk,
+                hop_cap,
                 read_rung,
                 key_echo,
                 lag_probe,

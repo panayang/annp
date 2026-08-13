@@ -170,6 +170,28 @@ impl TokenOutput {
     }
 }
 
+/// How a particle spends its mass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Motion {
+    /// One child per edge, each carrying a share of the mass. Mass conserves,
+    /// but a particle that travels `h` hops has divided its mass `h` times, so
+    /// distance and weight are anti-correlated by construction and
+    /// exponentially: at a peak routing weight of 0.5, eight hops leaves four
+    /// parts in a thousand. On a torus where everything useful sat within three
+    /// hops that coupling was invisible. On a ring whose chords put useful
+    /// things eight hops away it is fatal — the far mass arrives, and its vote
+    /// is negligible (DESIGN.md §38).
+    Branch,
+    /// One child, down whichever option the routing weights favour most,
+    /// carrying the whole mass. The weights are the same ones `Branch` divides
+    /// along; the only change is taking the largest rather than splitting among
+    /// all, so this adds no rule and no constant. Distance now costs nothing in
+    /// weight, `1 / mass_floor` no longer has to cap a branching front, and the
+    /// process is an absorbing Markov chain in the literal sense rather than a
+    /// branching one.
+    Walk,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct EngineParams {
     /// Children below this mass are absorbed instead of forwarded, which caps
@@ -177,6 +199,38 @@ pub struct EngineParams {
     pub mass_floor: f64,
     /// Payload slots per token, needed to lay out the reassembly buffer.
     pub slots: usize,
+    pub motion: Motion,
+    /// Weight a deposit by the depositing node's confidence as well as its mass.
+    ///
+    /// Mass is a flow quantity — how much stopped here — and confidence is a
+    /// relevance one. The readout has been averaging by flow, which is the
+    /// mixture-of-experts arrangement with the gate score replaced by traffic.
+    pub confidence_weighted: bool,
+    /// Deposit payload and node answer into separate halves; see
+    /// `ModelParams::split_deposit`.
+    pub split_deposit: bool,
+    /// Hops after which a walker is absorbed wherever it stands.
+    ///
+    /// **Placeholder, not a design.** `Branch` terminates on its own because
+    /// mass decays; a walk has no such guarantee and can circle. Every
+    /// termination rule that suggests itself — stop on revisiting, stop when
+    /// surprise stops falling — needs the particle to remember something, which
+    /// is the fifth semantic field the design forbids. This cap exists so the
+    /// decoupling can be measured before that question is settled, and any
+    /// result that depends on its value is a result about the cap.
+    pub hop_cap: u64,
+}
+
+/// One particle coming to rest, with everything the reassembly needs to weigh
+/// it: what arrived, what the node answered, and how much of the arrival that
+/// node's memory could account for.
+struct Absorbed {
+    token: u32,
+    slot: u16,
+    mass: f64,
+    payload: Vec<f64>,
+    answer: Vec<f64>,
+    confidence: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -196,7 +250,7 @@ struct GroupOutput {
     /// `(target, token, slot, mass, payload)`
     children: Vec<(u32, u32, u16, f64, Vec<f64>)>,
     /// `(token, slot, mass, payload)`
-    absorbed: Vec<(u32, u16, f64, Vec<f64>)>,
+    absorbed: Vec<Absorbed>,
     surprise_sum: f64,
     visits: u64,
 }
@@ -286,8 +340,8 @@ impl Engine {
         self.outputs.insert(
             token,
             TokenOutput {
-                accumulated: vec![0.0; self.params.slots * self.d_head],
-                after_one_hop: vec![0.0; self.params.slots * self.d_head],
+                accumulated: vec![0.0; self.readout_width()],
+                after_one_hop: vec![0.0; self.readout_width()],
                 absorbed_mass: 0.0,
                 hop_mass: 0.0,
                 visits: 0,
@@ -326,6 +380,20 @@ impl Engine {
                 out.touched.push(node);
             }
         }
+
+        // Age of the particles about to move, in hops. Serial mode has one
+        // token in flight and injects all of its particles on one tick, so the
+        // whole swarm shares an age and it can be read off the tick instead of
+        // riding along on every particle.
+        let oldest = self
+            .current
+            .token
+            .iter()
+            .filter_map(|t| self.outputs.get(t))
+            .map(|o| o.injected_tick)
+            .min()
+            .unwrap_or(self.tick);
+        let age = self.tick.saturating_sub(oldest);
 
         // 1. Deterministic order: by node, then by creation rank.
         self.order.clear();
@@ -386,6 +454,38 @@ impl Engine {
 
                     let (token, slot, mass) = (current.token[i], current.slot[i], current.mass[i]);
                     // The absorb option is the last weight, past every edge.
+                    if params.motion == Motion::Walk {
+                        // Serial mode injects a token's particles on one tick and
+                        // advances them one hop per tick, so age is the hop count
+                        // and no counter has to ride along on the particle.
+                        let capped = age >= params.hop_cap;
+                        let best = outcome
+                            .weights
+                            .iter()
+                            .enumerate()
+                            .max_by(|a, b| a.1.total_cmp(b.1))
+                            .map(|(e, _)| e)
+                            .unwrap_or(edges.len());
+                        if capped || best >= edges.len() {
+                            out.absorbed.push(Absorbed {
+                                token,
+                                slot,
+                                mass,
+                                payload: outcome.emitted.clone(),
+                                answer: outcome.answer.clone(),
+                                confidence: outcome.confidence,
+                            });
+                        } else {
+                            out.children.push((
+                                edges[best],
+                                token,
+                                slot,
+                                mass,
+                                outcome.emitted.clone(),
+                            ));
+                        }
+                        continue;
+                    }
                     let mut kept = 0.0;
                     for (e, &w) in outcome.weights[..edges.len()].iter().enumerate() {
                         if w <= 0.0 {
@@ -395,8 +495,14 @@ impl Engine {
                         if child < params.mass_floor {
                             // Too faint to be worth a hop; absorb it here so the
                             // mass is still accounted for.
-                            out.absorbed
-                                .push((token, slot, child, outcome.emitted.clone()));
+                            out.absorbed.push(Absorbed {
+                                token,
+                                slot,
+                                mass: child,
+                                payload: outcome.emitted.clone(),
+                                answer: outcome.answer.clone(),
+                                confidence: outcome.confidence,
+                            });
                         } else {
                             kept += child;
                             out.children.push((
@@ -411,8 +517,14 @@ impl Engine {
                     let _ = kept;
                     let absorb = mass * outcome.weights[edges.len()];
                     if absorb > 0.0 {
-                        out.absorbed
-                            .push((token, slot, absorb, outcome.emitted.clone()));
+                        out.absorbed.push(Absorbed {
+                            token,
+                            slot,
+                            mass: absorb,
+                            payload: outcome.emitted.clone(),
+                            answer: outcome.answer.clone(),
+                            confidence: outcome.confidence,
+                        });
                     }
                 }
                 Some(out)
@@ -452,9 +564,9 @@ impl Engine {
                 stats.forwarded_mass += mass;
                 stats.spawned += 1;
             }
-            for (token, slot, mass, payload) in &g.absorbed {
-                self.deposit(*token, *slot, *mass, payload, g.node as usize, nodes);
-                stats.absorbed_mass += mass;
+            for a in &g.absorbed {
+                stats.absorbed_mass += a.mass;
+                self.deposit(a, g.node as usize, nodes);
             }
         }
         stats.mean_surprise = if stats.processed > 0 {
@@ -474,24 +586,40 @@ impl Engine {
         stats
     }
 
-    fn deposit(
-        &mut self,
-        token: u32,
-        slot: u16,
-        mass: f64,
-        payload: &[f64],
-        at: usize,
-        nodes: usize,
-    ) {
+    /// Width of a reassembly buffer: one `d_model` block, or two when payload
+    /// and answer are kept apart.
+    fn readout_width(&self) -> usize {
+        self.params.slots * self.d_head * if self.params.split_deposit { 2 } else { 1 }
+    }
+
+    fn deposit(&mut self, a: &Absorbed, at: usize, nodes: usize) {
         let d = self.d_head;
         let tick = self.tick;
+        let split = self.params.split_deposit;
+        let width = self.params.slots * d;
+        // Confidence multiplies the mass rather than replacing it: mass is still
+        // what conserves, and a node that explained nothing simply stops voting.
+        let weight = if self.params.confidence_weighted {
+            a.mass * a.confidence
+        } else {
+            a.mass
+        };
+        let (mass, token, slot, payload) = (a.mass, a.token, a.slot, &a.payload);
         let out = self
             .outputs
             .get_mut(&token)
             .expect("absorbed a particle of an unknown token");
         let lo = slot as usize * d;
-        for (a, &p) in out.accumulated[lo..lo + d].iter_mut().zip(payload) {
-            *a += mass * p;
+        for (acc, &p) in out.accumulated[lo..lo + d].iter_mut().zip(payload) {
+            *acc += weight * p;
+        }
+        if split {
+            for (acc, &p) in out.accumulated[width + lo..width + lo + d]
+                .iter_mut()
+                .zip(&a.answer)
+            {
+                *acc += weight * p;
+            }
         }
         out.absorbed_mass += mass;
         out.hop_mass += mass * (tick - out.injected_tick + 1) as f64;
@@ -570,6 +698,10 @@ mod tests {
         EngineParams {
             mass_floor: 1e-3,
             slots: SLOTS,
+            motion: Motion::Branch,
+            confidence_weighted: false,
+            split_deposit: false,
+            hop_cap: u64::MAX,
         }
     }
 

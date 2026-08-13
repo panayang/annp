@@ -388,12 +388,18 @@ impl Runtime {
                 .expect("scored without pending");
 
             let assembled = if self.bypass {
-                self.model.embedding_of(token).to_vec()
+                // The control has to be the same width as what it replaces, so
+                // with a split deposit the answer half is simply absent — which
+                // is exactly what "no network" means here.
+                let mut e = self.model.embedding_of(token).to_vec();
+                e.resize(self.model.params().readout_width(), 0.0);
+                e
             } else {
                 self.model.assemble(&output.accumulated, scale)
             };
             let passthrough_loss = {
-                let e = self.model.embedding_of(token).to_vec();
+                let mut e = self.model.embedding_of(token).to_vec();
+                e.resize(self.model.params().readout_width(), 0.0);
                 self.model.cross_entropy(&e, target)
             };
             let loss = self.model.learn_centred(&assembled, token, target);
@@ -457,6 +463,7 @@ mod tests {
             ModelParams {
                 centre_readout: false,
                 head_top_k: 0,
+                split_deposit: false,
                 vocab,
                 d_head: 8,
                 slots: 8,
@@ -480,6 +487,10 @@ mod tests {
             EngineParams {
                 mass_floor: 1e-3,
                 slots: 8,
+                motion: crate::engine::Motion::Branch,
+                confidence_weighted: false,
+                split_deposit: false,
+                hop_cap: u64::MAX,
             },
             seed,
             &mut rng,

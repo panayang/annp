@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use annp_core::engine::EngineParams;
+use annp_core::engine::{EngineParams, Motion};
 use annp_core::graph::{Ring, SmallWorld, Topology};
 use annp_core::ladder::Schedule;
 use annp_core::model::{HeadKind, IngressMode, ModelParams};
@@ -668,6 +668,16 @@ pub struct Config {
     pub head_top_k: usize,
     /// Past keys each node keeps for the key-echo diagnostic; 0 is off.
     /// Ladder rung the forward pass reads.
+    /// Weight a deposit by how much of the arriving payload that node's
+    /// memory explained, not only by how much mass stopped there.
+    pub confidence_weighted: bool,
+    /// Deposit the payload and the node's answer into separate halves of
+    /// the reassembly buffer instead of summing them.
+    pub split_deposit: bool,
+    /// Take the largest routing weight instead of splitting along all of them.
+    pub walk: bool,
+    /// Placeholder termination for `walk`; see `EngineParams::hop_cap`.
+    pub hop_cap: u64,
     pub read_rung: usize,
     pub key_echo: usize,
     /// Measure how far back the assembled vector still names a token: a linear
@@ -780,6 +790,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         ModelParams {
             centre_readout: cfg.centre_readout,
             head_top_k: cfg.head_top_k,
+            split_deposit: cfg.split_deposit,
             vocab: cfg.vocab,
             d_head: cfg.d_head,
             slots: cfg.slots,
@@ -803,6 +814,14 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         EngineParams {
             mass_floor: cfg.mass_floor,
             slots: cfg.slots,
+            motion: if cfg.walk {
+                Motion::Walk
+            } else {
+                Motion::Branch
+            },
+            hop_cap: cfg.hop_cap,
+            confidence_weighted: cfg.confidence_weighted,
+            split_deposit: cfg.split_deposit,
         },
         cfg.structure_seed,
         &mut rng,
@@ -878,10 +897,35 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     );
     let source_vocab = cfg.vocab - plan.reserved;
     let base = source_vocab as u32;
-    let mut sources: Vec<MarkovSource> = (0..cfg.domains.max(1))
-        .map(|_| MarkovSource::new(source_vocab, cfg.order, cfg.fanout, &mut source_rng))
-        .collect();
-    let entropy_rate = sources.iter().map(|s| s.entropy_rate()).sum::<f64>() / sources.len() as f64;
+    // The absolute yardsticks are tables over the vocabulary and grow as
+    // `V^(order+1)`. That is nothing at `V = 16` and impossible on real text —
+    // an order-2 counting coder at `V = 4096` would want half a terabyte — so
+    // each one is built only if it fits a fixed budget and is reported as
+    // unavailable rather than silently skipped.
+    const CELL_BUDGET: usize = 1 << 27;
+    let affords = |cells: usize| cells <= CELL_BUDGET;
+
+    // The synthetic chain is not built at all when the stream comes from a
+    // corpus. It used to be, and its entropy rate was computed too: a power
+    // iteration of twenty thousand sweeps over `vocab^order` contexts, which is
+    // six times ten to the tenth at `vocab = 1024` and four times ten to the
+    // twelfth at 8192. Every "real text is too slow to run at scale" reading
+    // taken today was measuring that, for a number the corpus path never uses.
+    let mut sources: Vec<MarkovSource> = if corpus_stream.is_some() {
+        Vec::new()
+    } else {
+        (0..cfg.domains.max(1))
+            .map(|_| MarkovSource::new(source_vocab, cfg.order, cfg.fanout, &mut source_rng))
+            .collect()
+    };
+    // Same budget rule as the yardsticks: an entropy rate that does not fit is
+    // reported as unavailable rather than waited for.
+    let entropy_rate =
+        if sources.is_empty() || !affords(source_vocab.saturating_pow(cfg.order as u32)) {
+            f64::NAN
+        } else {
+            sources.iter().map(|s| s.entropy_rate()).sum::<f64>() / sources.len() as f64
+        };
 
     let started = std::time::Instant::now();
     let mut scored: Vec<Scored> = Vec::with_capacity(cfg.tokens);
@@ -916,13 +960,6 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         .collect();
     let mut history: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
     let mut readout_linear = Probe::new(cfg.vocab, d_model);
-    // The absolute yardsticks are tables over the vocabulary and grow as
-    // `V^(order+1)`. That is nothing at `V = 16` and impossible on real text —
-    // an order-2 counting coder at `V = 4096` would want half a terabyte — so
-    // each one is built only if it fits a fixed budget and is reported as
-    // unavailable rather than silently skipped.
-    const CELL_BUDGET: usize = 1 << 27;
-    let affords = |cells: usize| cells <= CELL_BUDGET;
     let oracle_cells = cfg.vocab.saturating_pow(3);
     let mut oracle = affords(oracle_cells)
         .then(|| OracleCoder::new(cfg.vocab, Probe::new(cfg.vocab, 1).rate_count()));
@@ -1358,11 +1395,15 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         );
     }
     if corpus_stream.is_none() {
-        println!(
-            "  {:<26} {:>8.4}",
-            "source entropy rate",
-            entropy_rate * nats_to_bits
-        );
+        if entropy_rate.is_finite() {
+            println!(
+                "  {:<26} {:>8.4}",
+                "source entropy rate",
+                entropy_rate * nats_to_bits
+            );
+        } else {
+            println!("  source entropy rate         unavailable at this vocabulary");
+        }
     }
     if let (Some(a), Some(b)) = (yardstick(1), yardstick(cfg.order)) {
         println!(
