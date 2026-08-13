@@ -198,6 +198,10 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         head_top_k: usize,
         /// Past keys each node keeps for the key-echo diagnostic. 0 is off.
+        /// Ladder rung the forward pass reads. 0 is the fastest, which is what
+        /// the design has always used.
+        #[arg(long, default_value_t = 0)]
+        read_rung: usize,
         #[arg(long, default_value_t = 0)]
         key_echo: usize,
         /// Probe how far back the assembled vector still names a token.
@@ -363,6 +367,7 @@ fn main() -> std::io::Result<()> {
             needle_repeats,
             needle_key_symbols,
             head_top_k,
+            read_rung,
             key_echo,
             lag_probe,
             centre_readout,
@@ -405,6 +410,7 @@ fn main() -> std::io::Result<()> {
                 needle_repeats,
                 needle_key_symbols,
                 head_top_k,
+                read_rung,
                 key_echo,
                 lag_probe,
                 centre_readout,

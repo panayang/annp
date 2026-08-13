@@ -330,9 +330,24 @@ impl AssocMemory {
     /// The matrix the forward pass sees: rung 1 for a ladder, the single matrix
     /// otherwise.
     pub fn read(&self) -> &Mat {
+        self.read_at(0)
+    }
+
+    /// The rung the forward pass reads, clamped to what exists.
+    ///
+    /// Reading rung 0 only was a deliberate choice: the ladder was built as a
+    /// *consolidation* mechanism, so the slow rungs exist to protect what was
+    /// learned, not to be consulted. That decision was taken before anything
+    /// measured how far back the assembled vector can still name a token, and
+    /// §36 puts that at about three. Meanwhile `tau_k ~ r^(2(k-1))/g1` makes the
+    /// rungs a geometric ladder of timescales — 2, 32, 512, 8192 writes at
+    /// `r = 4, g1 = 0.5` — and a node takes roughly one write per token. The
+    /// spectrum the reach is missing is therefore already being maintained and
+    /// never read, which is worth measuring before it is worth arguing about.
+    pub fn read_at(&self, rung: usize) -> &Mat {
         match &self.state {
             State::Single { w, .. } => w,
-            State::Ladder(l) => l.rung(0),
+            State::Ladder(l) => l.rung(rung.min(l.num_rungs() - 1)),
         }
     }
 

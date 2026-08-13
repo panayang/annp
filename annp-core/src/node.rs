@@ -89,6 +89,9 @@ pub struct NodeParams {
     /// Timescales in a node's context key. `1` means the key is the last input
     /// alone, which is exactly the original behaviour.
     pub context_scales: usize,
+    /// Which ladder rung the forward pass reads. Zero is the fastest and is
+    /// what the design has always used; see `AssocMemory::read_at`.
+    pub read_rung: usize,
     /// Past keys each node remembers, for the key-echo diagnostic. Zero is off.
     ///
     /// A node's memory is addressed by its context key, so retrieval only pays
@@ -281,7 +284,9 @@ impl Node {
 
         // Predict, from the context including what just arrived. This is also
         // what neighbours route against once published.
-        self.memory.read().mul_vec(&self.key, &mut scratch.pred);
+        self.memory
+            .read_at(params.read_rung)
+            .mul_vec(&self.key, &mut scratch.pred);
 
         // Emit. Residual, so an untrained node is transparent rather than
         // annihilating. Renormalised because unit-norm payloads are the
@@ -438,7 +443,9 @@ impl Node {
             return;
         }
         scratch.pred.resize(params.d_head, 0.0);
-        self.memory.read().mul_vec(&self.key, &mut scratch.pred);
+        self.memory
+            .read_at(params.read_rung)
+            .mul_vec(&self.key, &mut scratch.pred);
         let len = norm(&scratch.pred);
         if len > 1e-12 {
             for (o, &p) in out.iter_mut().zip(&scratch.pred) {
@@ -650,6 +657,7 @@ mod tests {
             rungs: 4,
             context_scales: 1,
             key_echo: 0,
+            read_rung: 0,
         };
         let bank = NodeBank::new(&t, p);
         (t, bank)
@@ -695,6 +703,7 @@ mod tests {
                 rungs: 4,
                 context_scales: 1,
                 key_echo: 0,
+                read_rung: 0,
             },
         );
         // The very first arrival at a node has no predecessor, so surprise is
@@ -770,6 +779,7 @@ mod tests {
                 rungs: 4,
                 context_scales: 1,
                 key_echo: 0,
+                read_rung: 0,
             };
             (NodeBank::new(&t, p), t)
         };
@@ -807,6 +817,7 @@ mod tests {
                 rungs: 4,
                 context_scales: scales,
                 key_echo: 0,
+                read_rung: 0,
             };
             (NodeBank::new(&t, p), t)
         };
@@ -853,6 +864,7 @@ mod tests {
             rungs: 4,
             context_scales: 6,
             key_echo: 0,
+            read_rung: 0,
         };
         let mut bank = NodeBank::new(&t, p);
         let mut rng = Rng::new(63);

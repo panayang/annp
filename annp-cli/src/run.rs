@@ -667,6 +667,8 @@ pub struct Config {
     /// Components the lookup readout evaluates per token; 0 is adaptive.
     pub head_top_k: usize,
     /// Past keys each node keeps for the key-echo diagnostic; 0 is off.
+    /// Ladder rung the forward pass reads.
+    pub read_rung: usize,
     pub key_echo: usize,
     /// Measure how far back the assembled vector still names a token: a linear
     /// probe per lag, against the token that many positions earlier.
@@ -796,6 +798,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             rungs: cfg.rungs,
             context_scales: cfg.context_scales,
             key_echo: cfg.key_echo,
+            read_rung: cfg.read_rung,
         },
         EngineParams {
             mass_floor: cfg.mass_floor,

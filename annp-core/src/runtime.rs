@@ -475,6 +475,7 @@ mod tests {
                 rungs: 4,
                 context_scales: 1,
                 key_echo: 0,
+                read_rung: 0,
             },
             EngineParams {
                 mass_floor: 1e-3,

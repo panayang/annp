@@ -552,6 +552,7 @@ mod tests {
                 rungs: 4,
                 context_scales: 1,
                 key_echo: 0,
+                read_rung: 0,
             },
         );
         (t, bank)
