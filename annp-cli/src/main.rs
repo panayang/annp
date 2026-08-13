@@ -200,6 +200,9 @@ enum Command {
         /// Past keys each node keeps for the key-echo diagnostic. 0 is off.
         #[arg(long, default_value_t = 0)]
         key_echo: usize,
+        /// Probe how far back the assembled vector still names a token.
+        #[arg(long)]
+        lag_probe: bool,
         #[arg(long)]
         centre_readout: bool,
         /// JSON corpus of `input_text` records. Requires --tokenizer.
@@ -361,6 +364,7 @@ fn main() -> std::io::Result<()> {
             needle_key_symbols,
             head_top_k,
             key_echo,
+            lag_probe,
             centre_readout,
             corpus,
             tokenizer,
@@ -402,6 +406,7 @@ fn main() -> std::io::Result<()> {
                 needle_key_symbols,
                 head_top_k,
                 key_echo,
+                lag_probe,
                 centre_readout,
                 corpus,
                 tokenizer,

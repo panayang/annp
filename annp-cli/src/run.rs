@@ -668,6 +668,17 @@ pub struct Config {
     pub head_top_k: usize,
     /// Past keys each node keeps for the key-echo diagnostic; 0 is off.
     pub key_echo: usize,
+    /// Measure how far back the assembled vector still names a token: a linear
+    /// probe per lag, against the token that many positions earlier.
+    ///
+    /// The cursor maps a one-dimensional stream onto a two-dimensional torus,
+    /// so stream lag becomes spatial distance along only two scales — one step
+    /// in x is lag 1, one step in y is lag `grid_side`. Every other lag aliases
+    /// onto those. On an order-2 chain that costs nothing, because lag 1 is the
+    /// only lag carrying anything. Real text needs a continuum, and a lag that
+    /// has been aliased cannot be recovered downstream by any parameter. This
+    /// measures the spectrum directly instead of inferring it.
+    pub lag_probe: bool,
     pub centre_readout: bool,
     /// Real text instead of the synthetic chain: a JSON corpus of `input_text`
     /// records, and the SentencePiece model to segment it with.
@@ -876,6 +887,22 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let mut probes_prev: Vec<Probe> = (0..3).map(|_| Probe::new(cfg.vocab, d_model)).collect();
     let mut probes_cur: Vec<Probe> = (0..3).map(|_| Probe::new(cfg.vocab, d_model)).collect();
     let mut probe_previous: std::collections::BTreeMap<u32, u32> = Default::default();
+    // Lags chosen to straddle the two scales the cursor can express: 1, the
+    // grid side, and a spread either way.
+    let lags: Vec<usize> = if cfg.lag_probe {
+        let g = cfg.grid_side;
+        let mut v = vec![1usize, 2, 3, 4, 6, 8, 12, 16, g, g + 1, 2 * g, 4 * g];
+        v.sort_unstable();
+        v.dedup();
+        v
+    } else {
+        Vec::new()
+    };
+    let mut lag_probes: Vec<Probe> = lags
+        .iter()
+        .map(|_| Probe::new(cfg.vocab, d_model))
+        .collect();
+    let mut history: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
     let mut readout_linear = Probe::new(cfg.vocab, d_model);
     // The absolute yardsticks are tables over the vocabulary and grow as
     // `V^(order+1)`. That is nothing at `V = 16` and impossible on real text —
@@ -1121,6 +1148,23 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
                     token: s.token,
                     nodes,
                 });
+            }
+            if !lags.is_empty()
+                && let Some(reps) = s.reps.as_ref()
+            {
+                for (probe, lag) in lag_probes.iter_mut().zip(&lags) {
+                    // `history` holds tokens before this one, most recent last.
+                    if history.len() >= *lag {
+                        let target = history[history.len() - *lag];
+                        let in_tail = s.position as usize * 10 >= cfg.tokens * 9;
+                        probe.observe(&reps.assembled, target, in_tail);
+                    }
+                }
+                let cap = lags.last().copied().unwrap_or(1) + 1;
+                if history.len() >= cap {
+                    history.pop_front();
+                }
+                history.push_back(s.token);
             }
             if let (Some(&n), Some(reps)) =
                 (last_teach.get(&(s.position as usize)), s.reps.as_ref())
@@ -1618,6 +1662,23 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             100.0 * c
         );
         println!("  below 100% with --head-top-k means slots are frozen out of the competition");
+        println!();
+    }
+
+    if !lags.is_empty() {
+        println!("how far back the assembled vector still names a token");
+        println!(
+            "  chance is {:.4} bits; the cursor can express lag 1 and lag {} and aliases the rest",
+            (cfg.vocab as f64).ln() * nats_to_bits,
+            cfg.grid_side
+        );
+        println!("  {:>5} {:>10}", "lag", "bits");
+        for (probe, lag) in lag_probes.iter().zip(&lags) {
+            println!(
+                "  {lag:>5} {:>10.4}",
+                probe.best_tail() / tail_count * nats_to_bits
+            );
+        }
         println!();
     }
 
