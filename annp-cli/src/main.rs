@@ -238,13 +238,15 @@ enum Command {
         /// Particles per token. d_model = slots * d_head must be a power of two.
         #[arg(long, default_value_t = 8)]
         slots: usize,
-        #[arg(long, default_value_t = 24)]
+        #[arg(long, default_value_t = 1024)]
         nodes: usize,
         #[arg(long, default_value_t = 4)]
         long_range: usize,
         /// Long-range contact exponent; 0 makes them distance-independent, so
-        /// the grid metric contributes nothing to routing.
-        #[arg(long, default_value_t = 2.0)]
+        /// the ring metric contributes nothing to routing. The default follows
+        /// the lattice dimension, 1 on a ring; it was 2 for the torus, which on
+        /// a ring is past the critical point.
+        #[arg(long, default_value_t = 1.0)]
         exponent: f64,
         #[arg(long, default_value_t = 4)]
         rungs: usize,
