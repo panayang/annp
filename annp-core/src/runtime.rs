@@ -483,11 +483,13 @@ mod tests {
                 context_scales: 1,
                 key_echo: 0,
                 read_rung: 0,
+                query_read: false,
             },
             EngineParams {
                 mass_floor: 1e-3,
                 slots: 8,
                 motion: crate::engine::Motion::Branch,
+                carry_query: false,
                 confidence_weighted: false,
                 split_deposit: false,
                 hop_cap: u64::MAX,

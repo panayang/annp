@@ -200,6 +200,12 @@ enum Command {
         /// Past keys each node keeps for the key-echo diagnostic. 0 is off.
         /// Ladder rung the forward pass reads. 0 is the fastest, which is what
         /// the design has always used.
+        /// Give each particle an immutable query and a fuel tank. Nodes answer
+        /// the query instead of their own context, so every node on a route
+        /// answers the same question, and a hop costs fuel linearly instead of
+        /// dividing the particle's weight away.
+        #[arg(long)]
+        carry_query: bool,
         /// Weight a deposit by how much of the arriving payload that node's
         /// memory explained, not only by how much mass stopped there.
         #[arg(long)]
@@ -388,6 +394,7 @@ fn main() -> std::io::Result<()> {
             needle_repeats,
             needle_key_symbols,
             head_top_k,
+            carry_query,
             confidence_weighted,
             split_deposit,
             walk,
@@ -435,6 +442,7 @@ fn main() -> std::io::Result<()> {
                 needle_repeats,
                 needle_key_symbols,
                 head_top_k,
+                carry_query,
                 confidence_weighted,
                 split_deposit,
                 walk,

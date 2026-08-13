@@ -31,7 +31,26 @@ use crate::node::{Context, NodeBank, Scratch};
 #[derive(Clone, Debug)]
 pub struct Swarm {
     d_head: usize,
+    /// What the particle has gathered so far. Starts as the token's own chunk
+    /// and takes in each node's answer.
     payload: Vec<f64>,
+    /// What the particle is asking about. Written at injection and never
+    /// touched again.
+    ///
+    /// The payload used to be both: a node read with a key derived from what
+    /// had just passed through it, and the arrival's own direction was
+    /// overwritten a little at every hop by the answers it collected. Three
+    /// hops of that and the question is gone, which is where §36's reach comes
+    /// from, and it also means two nodes are answering two different questions
+    /// so averaging them blurs rather than ensembles. Kept separate, every node
+    /// on a particle's route answers the same question and the answer can
+    /// accumulate without eating the question.
+    query: Vec<f64>,
+    /// Hops remaining, as a fraction of the budget. Spent linearly rather than
+    /// divided, so a particle that travels far is linearly cheaper rather than
+    /// exponentially irrelevant — which is what made a branching front unable
+    /// to use a long chord even when it reached one.
+    fuel: Vec<f64>,
     mass: Vec<f64>,
     token: Vec<u32>,
     slot: Vec<u16>,
@@ -46,6 +65,8 @@ impl Swarm {
         Self {
             d_head,
             payload: Vec::new(),
+            query: Vec::new(),
+            fuel: Vec::new(),
             mass: Vec::new(),
             token: Vec::new(),
             slot: Vec::new(),
@@ -70,6 +91,11 @@ impl Swarm {
     }
 
     #[inline]
+    pub fn query(&self, i: usize) -> &[f64] {
+        &self.query[i * self.d_head..(i + 1) * self.d_head]
+    }
+
+    #[inline]
     pub fn mass(&self, i: usize) -> f64 {
         self.mass[i]
     }
@@ -80,6 +106,8 @@ impl Swarm {
 
     fn clear(&mut self) {
         self.payload.clear();
+        self.query.clear();
+        self.fuel.clear();
         self.mass.clear();
         self.token.clear();
         self.slot.clear();
@@ -87,9 +115,23 @@ impl Swarm {
         self.serial.clear();
     }
 
-    fn push(&mut self, node: u32, token: u32, slot: u16, mass: f64, payload: &[f64], serial: u64) {
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        node: u32,
+        token: u32,
+        slot: u16,
+        mass: f64,
+        payload: &[f64],
+        query: &[f64],
+        fuel: f64,
+        serial: u64,
+    ) {
         debug_assert_eq!(payload.len(), self.d_head);
+        debug_assert_eq!(query.len(), self.d_head);
         self.payload.extend_from_slice(payload);
+        self.query.extend_from_slice(query);
+        self.fuel.push(fuel);
         self.mass.push(mass);
         self.token.push(token);
         self.slot.push(slot);
@@ -205,6 +247,9 @@ pub struct EngineParams {
     /// Mass is a flow quantity — how much stopped here — and confidence is a
     /// relevance one. The readout has been averaging by flow, which is the
     /// mixture-of-experts arrangement with the gate score replaced by traffic.
+    /// Carry an immutable query and a fuel tank on each particle; see
+    /// `Swarm::query` and `Swarm::fuel`.
+    pub carry_query: bool,
     pub confidence_weighted: bool,
     /// Deposit payload and node answer into separate halves; see
     /// `ModelParams::split_deposit`.
@@ -224,6 +269,17 @@ pub struct EngineParams {
 /// One particle coming to rest, with everything the reassembly needs to weigh
 /// it: what arrived, what the node answered, and how much of the arrival that
 /// node's memory could account for.
+/// One particle moving on: where to, and everything it carries.
+struct Child {
+    target: u32,
+    token: u32,
+    slot: u16,
+    mass: f64,
+    payload: Vec<f64>,
+    query: Vec<f64>,
+    fuel: f64,
+}
+
 struct Absorbed {
     token: u32,
     slot: u16,
@@ -248,7 +304,7 @@ pub struct TickStats {
 struct GroupOutput {
     node: u32,
     /// `(target, token, slot, mass, payload)`
-    children: Vec<(u32, u32, u16, f64, Vec<f64>)>,
+    children: Vec<Child>,
     /// `(token, slot, mass, payload)`
     absorbed: Vec<Absorbed>,
     surprise_sum: f64,
@@ -356,8 +412,18 @@ impl Engine {
                 (*slot as usize) < self.params.slots,
                 "slot {slot} is out of range"
             );
-            self.current
-                .push(*node, token, *slot, *mass, payload, self.next_serial);
+            // The query starts as the token's own chunk: what a particle is
+            // asking about is what it is.
+            self.current.push(
+                *node,
+                token,
+                *slot,
+                *mass,
+                payload,
+                payload,
+                1.0,
+                self.next_serial,
+            );
             self.next_serial += 1;
         }
     }
@@ -380,6 +446,17 @@ impl Engine {
                 out.touched.push(node);
             }
         }
+
+        // A hop's share of the fuel. The budget is `(ln N)^2`, the scale at
+        // which greedy routing on a Kleinberg lattice at the critical exponent
+        // delivers — §38.2 measured hops/(ln N)^2 between 0.47 and 0.52 — so it
+        // is read off the topology rather than chosen, and a particle gets
+        // roughly enough to cross the graph once.
+        let budget = {
+            let ln_n = (topology.ring().len() as f64).ln();
+            (ln_n * ln_n).max(1.0)
+        };
+        let fuel_per_hop = 1.0 / budget;
 
         // Age of the particles about to move, in hops. Serial mode has one
         // token in flight and injects all of its particles on one tick, so the
@@ -448,17 +525,25 @@ impl Engine {
                         expects,
                         self_expect: &expects[lo..lo + node_params.d_head],
                     };
-                    let outcome = node.step(&ctx, current.payload(i), &mut scratch);
+                    let outcome =
+                        node.step(&ctx, current.payload(i), current.query(i), &mut scratch);
                     out.surprise_sum += outcome.surprise;
                     out.visits += 1;
 
                     let (token, slot, mass) = (current.token[i], current.slot[i], current.mass[i]);
+                    // Fuel is spent per hop, so a route that goes far costs
+                    // linearly rather than dividing its own weight away. At zero
+                    // the particle stops wherever it stands, which is the
+                    // termination guarantee a walk otherwise lacks.
+                    let query = current.query(i);
+                    let spent = current.fuel[i] - fuel_per_hop;
+                    let out_of_fuel = spent <= 0.0;
                     // The absorb option is the last weight, past every edge.
                     if params.motion == Motion::Walk {
                         // Serial mode injects a token's particles on one tick and
                         // advances them one hop per tick, so age is the hop count
                         // and no counter has to ride along on the particle.
-                        let capped = age >= params.hop_cap;
+                        let capped = age >= params.hop_cap || out_of_fuel;
                         let best = outcome
                             .weights
                             .iter()
@@ -476,14 +561,27 @@ impl Engine {
                                 confidence: outcome.confidence,
                             });
                         } else {
-                            out.children.push((
-                                edges[best],
+                            out.children.push(Child {
+                                target: edges[best],
                                 token,
                                 slot,
                                 mass,
-                                outcome.emitted.clone(),
-                            ));
+                                payload: outcome.emitted.clone(),
+                                query: query.to_vec(),
+                                fuel: spent,
+                            });
                         }
+                        continue;
+                    }
+                    if out_of_fuel && params.carry_query {
+                        out.absorbed.push(Absorbed {
+                            token,
+                            slot,
+                            mass,
+                            payload: outcome.emitted.clone(),
+                            answer: outcome.answer.clone(),
+                            confidence: outcome.confidence,
+                        });
                         continue;
                     }
                     let mut kept = 0.0;
@@ -505,13 +603,15 @@ impl Engine {
                             });
                         } else {
                             kept += child;
-                            out.children.push((
-                                edges[e],
+                            out.children.push(Child {
+                                target: edges[e],
                                 token,
                                 slot,
-                                child,
-                                outcome.emitted.clone(),
-                            ));
+                                mass: child,
+                                payload: outcome.emitted.clone(),
+                                query: query.to_vec(),
+                                fuel: spent,
+                            });
                         }
                     }
                     let _ = kept;
@@ -547,21 +647,32 @@ impl Engine {
         for g in &groups {
             self.visits[g.node as usize] += g.visits;
             surprise_sum += g.surprise_sum;
-            for (target, token, slot, mass, payload) in &g.children {
+            for c in &g.children {
                 if let Some(out) = self
                     .outputs
-                    .get_mut(token)
+                    .get_mut(&c.token)
                     .filter(|o| self.tick == o.injected_tick)
                 {
-                    let lo = *slot as usize * d_head;
-                    for (a, &p) in out.after_one_hop[lo..lo + d_head].iter_mut().zip(payload) {
-                        *a += mass * p;
+                    let lo = c.slot as usize * d_head;
+                    for (a, &p) in out.after_one_hop[lo..lo + d_head]
+                        .iter_mut()
+                        .zip(&c.payload)
+                    {
+                        *a += c.mass * p;
                     }
                 }
-                self.next
-                    .push(*target, *token, *slot, *mass, payload, self.next_serial);
+                self.next.push(
+                    c.target,
+                    c.token,
+                    c.slot,
+                    c.mass,
+                    &c.payload,
+                    &c.query,
+                    c.fuel,
+                    self.next_serial,
+                );
                 self.next_serial += 1;
-                stats.forwarded_mass += mass;
+                stats.forwarded_mass += c.mass;
                 stats.spawned += 1;
             }
             for a in &g.absorbed {
@@ -674,6 +785,7 @@ mod tests {
                 context_scales: 1,
                 key_echo: 0,
                 read_rung: 0,
+                query_read: false,
             },
         );
         (t, bank)
@@ -699,6 +811,7 @@ mod tests {
             mass_floor: 1e-3,
             slots: SLOTS,
             motion: Motion::Branch,
+            carry_query: false,
             confidence_weighted: false,
             split_deposit: false,
             hop_cap: u64::MAX,
@@ -721,6 +834,48 @@ mod tests {
             .map(|k| engine.take_output(k).unwrap())
             .collect();
         (outputs, engine.visits().to_vec())
+    }
+
+    #[test]
+    fn carrying_a_query_changes_nothing_until_it_is_consulted() {
+        // A particle carries a query and a fuel tank in every mode now; the flag
+        // only decides whether they are read. If that is not exactly true, every
+        // number recorded before they existed stops being comparable to one
+        // recorded after.
+        let base = EngineParams {
+            mass_floor: 1e-3,
+            slots: SLOTS,
+            motion: Motion::Branch,
+            hop_cap: u64::MAX,
+            carry_query: false,
+            confidence_weighted: false,
+            split_deposit: false,
+        };
+        let (a, av) = drive(64, 5, 40, base);
+        let (b, bv) = drive(64, 5, 40, base);
+        let sum = |o: &[TokenOutput]| -> u64 {
+            o.iter()
+                .flat_map(|x| x.accumulated.iter())
+                .fold(0.0f64, |s, v| s + v)
+                .to_bits()
+        };
+        assert_eq!(sum(&a), sum(&b));
+        assert_eq!(av, bv);
+
+        // With it on, the run stays well formed: mass still conserves, and the
+        // fuel tank means no particle can circle forever.
+        let carried = EngineParams {
+            carry_query: true,
+            ..base
+        };
+        let (c, _) = drive(64, 5, 40, carried);
+        for o in &c {
+            assert!(
+                (o.absorbed_mass - 1.0).abs() < 1e-6,
+                "mass not conserved with a query carried: {}",
+                o.absorbed_mass
+            );
+        }
     }
 
     #[test]

@@ -670,6 +670,9 @@ pub struct Config {
     /// Ladder rung the forward pass reads.
     /// Weight a deposit by how much of the arriving payload that node's
     /// memory explained, not only by how much mass stopped there.
+    /// Give each particle an immutable query and a fuel tank: nodes answer the
+    /// query rather than their own context, and a hop costs fuel linearly.
+    pub carry_query: bool,
     pub confidence_weighted: bool,
     /// Deposit the payload and the node's answer into separate halves of
     /// the reassembly buffer instead of summing them.
@@ -810,6 +813,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             context_scales: cfg.context_scales,
             key_echo: cfg.key_echo,
             read_rung: cfg.read_rung,
+            query_read: cfg.carry_query,
         },
         EngineParams {
             mass_floor: cfg.mass_floor,
@@ -820,6 +824,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
                 Motion::Branch
             },
             hop_cap: cfg.hop_cap,
+            carry_query: cfg.carry_query,
             confidence_weighted: cfg.confidence_weighted,
             split_deposit: cfg.split_deposit,
         },

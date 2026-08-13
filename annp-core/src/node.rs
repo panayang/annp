@@ -92,6 +92,15 @@ pub struct NodeParams {
     /// Which ladder rung the forward pass reads. Zero is the fastest and is
     /// what the design has always used; see `AssocMemory::read_at`.
     pub read_rung: usize,
+    /// Read the memory with the particle's immutable query rather than with the
+    /// node's own context key.
+    ///
+    /// With the node's key, every node on a route answers a different question —
+    /// "what follows what *I* just saw" — and averaging those blurs rather than
+    /// ensembles. With the query, they all answer the same one, which is the
+    /// arrangement a mixture of experts relies on. The write still uses the
+    /// node's key, so what a node learns is still its own local transition.
+    pub query_read: bool,
     /// Past keys each node remembers, for the key-echo diagnostic. Zero is off.
     ///
     /// A node's memory is addressed by its context key, so retrieval only pays
@@ -247,7 +256,13 @@ impl Node {
     /// predicted this one and write that correction, then emit from the
     /// updated matrix. `expects` is the tick's frozen snapshot and is never
     /// written here, so a tick's routing cannot depend on processing order.
-    pub fn step(&mut self, ctx: &Context<'_>, q: &[f64], scratch: &mut Scratch) -> Outcome {
+    pub fn step(
+        &mut self,
+        ctx: &Context<'_>,
+        q: &[f64],
+        query: &[f64],
+        scratch: &mut Scratch,
+    ) -> Outcome {
         let params = ctx.params;
         let degree = ctx.out_edges.len();
         let d = params.d_head;
@@ -300,9 +315,13 @@ impl Node {
 
         // Predict, from the context including what just arrived. This is also
         // what neighbours route against once published.
+        // The write above used the node's own key: what followed what, here.
+        // The read may use the particle's query instead, so that every node a
+        // particle passes is answering the same question.
+        let read_key: &[f64] = if params.query_read { query } else { &self.key };
         self.memory
             .read_at(params.read_rung)
-            .mul_vec(&self.key, &mut scratch.pred);
+            .mul_vec(read_key, &mut scratch.pred);
 
         // Emit. Residual, so an untrained node is transparent rather than
         // annihilating. Renormalised because unit-norm payloads are the
@@ -583,7 +602,7 @@ impl NodeBank {
             expects: &self.expects,
             self_expect: &self_expect,
         };
-        let out = self.nodes[node as usize].step(&ctx, q, &mut scratch);
+        let out = self.nodes[node as usize].step(&ctx, q, q, &mut scratch);
         self.scratch = scratch;
         out
     }
@@ -681,6 +700,7 @@ mod tests {
             context_scales: 1,
             key_echo: 0,
             read_rung: 0,
+            query_read: false,
         };
         let bank = NodeBank::new(&t, p);
         (t, bank)
@@ -727,6 +747,7 @@ mod tests {
                 context_scales: 1,
                 key_echo: 0,
                 read_rung: 0,
+                query_read: false,
             },
         );
         // The very first arrival at a node has no predecessor, so surprise is
@@ -803,6 +824,7 @@ mod tests {
                 context_scales: 1,
                 key_echo: 0,
                 read_rung: 0,
+                query_read: false,
             };
             (NodeBank::new(&t, p), t)
         };
@@ -841,6 +863,7 @@ mod tests {
                 context_scales: scales,
                 key_echo: 0,
                 read_rung: 0,
+                query_read: false,
             };
             (NodeBank::new(&t, p), t)
         };
@@ -888,6 +911,7 @@ mod tests {
             context_scales: 6,
             key_echo: 0,
             read_rung: 0,
+            query_read: false,
         };
         let mut bank = NodeBank::new(&t, p);
         let mut rng = Rng::new(63);
