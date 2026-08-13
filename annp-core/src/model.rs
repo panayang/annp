@@ -49,7 +49,7 @@
 //! good fixed code — and the head is an unconstrained linear map, so any logit
 //! matrix is reachable. `ModelParams::tied` selects between them.
 
-use crate::graph::Grid;
+use crate::graph::Ring;
 use crate::ladder::{AssocMemory, Schedule};
 use crate::linalg::Mat;
 use crate::linalg::norm;
@@ -150,20 +150,24 @@ pub enum IngressMode {
     Readout,
 }
 
-/// Maps an embedding to the grid position its particles enter at.
+/// Maps an embedding to the ring position its particles enter at.
 #[derive(Clone, Debug)]
 pub struct Ingress {
-    side: usize,
-    /// Two orthonormal pairs; each pair defines a plane whose phase gives one
-    /// torus coordinate. Fixed at construction, never trained.
-    planes: [Vec<f64>; 4],
-    /// Per-slot grid offset, drawn once inside a disc of radius `sqrt(P/pi)` so
-    /// that on average one slot lands per node. The radius is not a knob; it
-    /// follows from wanting the slots of one token to tile a local patch rather
-    /// than pile onto a single node or scatter across the whole grid.
-    offsets: Vec<(u32, u32)>,
+    len: usize,
+    /// One orthonormal pair defining a plane whose phase gives the ring
+    /// coordinate. Fixed at construction, never trained.
+    planes: [Vec<f64>; 2],
+    /// Per-slot ring offset: a random permutation of `P` consecutive cells.
+    ///
+    /// The 2-D version drew inside a disc of radius `sqrt(P/pi)`, chosen so the
+    /// disc holds `P` nodes and one slot lands per node on average. On a ring
+    /// the same requirement has an exact answer instead of an approximate one —
+    /// `P` consecutive cells hold exactly `P` nodes — so the radius constant and
+    /// the rejection sampling both disappear. Only the assignment of slots to
+    /// cells stays random.
+    offsets: Vec<u32>,
     /// Where each token's mass last came to rest, once it has been observed.
-    remembered: Vec<Option<(usize, usize)>>,
+    remembered: Vec<Option<usize>>,
     mode: IngressMode,
     /// How far anchors have travelled in total, and over how many moves. Rising
     /// distinct-anchor counts with bounded drift is a map forming; drift that
@@ -173,12 +177,16 @@ pub struct Ingress {
 }
 
 impl Ingress {
-    pub fn new(side: usize, d_model: usize, slots: usize, vocab: usize, rng: &mut Rng) -> Self {
-        let mut planes: [Vec<f64>; 4] = std::array::from_fn(|_| vec![0.0; d_model]);
-        for i in 0..4 {
+    pub fn new(len: usize, d_model: usize, slots: usize, vocab: usize, rng: &mut Rng) -> Self {
+        assert!(
+            slots <= len,
+            "cannot give {slots} slots a cell each on a ring of {len}"
+        );
+        let mut planes: [Vec<f64>; 2] = std::array::from_fn(|_| vec![0.0; d_model]);
+        for i in 0..2 {
             rng.fill_unit_vector(&mut planes[i]);
-            // Gram-Schmidt against the previous ones, so the two planes are
-            // genuinely independent and the two coordinates are not correlated.
+            // Gram-Schmidt against the previous one, so the plane is genuinely
+            // two-dimensional and the phase is well defined.
             for j in 0..i {
                 let proj = crate::linalg::dot(&planes[i], &planes[j]);
                 let (done, rest) = planes.split_at_mut(i);
@@ -186,43 +194,27 @@ impl Ingress {
                     *x -= proj * b;
                 }
             }
-            let len = norm(&planes[i]);
+            let len_i = norm(&planes[i]);
             assert!(
-                len > 1e-9,
-                "degenerate ingress plane; is d_model at least 4?"
+                len_i > 1e-9,
+                "degenerate ingress plane; is d_model at least 2?"
             );
             for x in planes[i].iter_mut() {
-                *x /= len;
+                *x /= len_i;
             }
         }
 
-        let radius = ((slots as f64 / std::f64::consts::PI).sqrt().ceil() as i64).max(1);
-        let mut offsets: Vec<(u32, u32)> = Vec::with_capacity(slots);
-        for _ in 0..slots {
-            // Rejection-sample the disc, then reject collisions so distinct
-            // slots start on distinct nodes where the disc has room for them.
-            let mut tries = 0;
-            loop {
-                let dx = rng.next_below((2 * radius + 1) as u64) as i64 - radius;
-                let dy = rng.next_below((2 * radius + 1) as u64) as i64 - radius;
-                tries += 1;
-                let inside = dx * dx + dy * dy <= radius * radius;
-                let wrapped = (
-                    dx.rem_euclid(side as i64) as u32,
-                    dy.rem_euclid(side as i64) as u32,
-                );
-                if inside && (!offsets.contains(&wrapped) || tries > 200) {
-                    offsets.push(wrapped);
-                    break;
-                }
-                assert!(
-                    tries < 10_000,
-                    "cannot place {slots} slots on a side-{side} grid"
-                );
-            }
+        // Centre the interval on the anchor so a token's fragments straddle it
+        // rather than trailing off to one side, which would bias every entry.
+        let half = (slots / 2) as i64;
+        let mut offsets: Vec<u32> = (0..slots as i64)
+            .map(|k| (k - half).rem_euclid(len as i64) as u32)
+            .collect();
+        for k in (1..offsets.len()).rev() {
+            offsets.swap(k, rng.next_below(k as u64 + 1) as usize);
         }
         Self {
-            side,
+            len,
             planes,
             offsets,
             remembered: vec![None; vocab],
@@ -237,17 +229,14 @@ impl Ingress {
     }
 
     /// Records where a token's mass came to rest. Returns how far its anchor
-    /// moved on the torus.
-    pub fn observe(&mut self, token: u32, resting: (usize, usize), embedding: &[f64]) -> usize {
+    /// moved around the ring.
+    pub fn observe(&mut self, token: u32, resting: usize, embedding: &[f64]) -> usize {
         if self.mode != IngressMode::Readout {
             return 0;
         }
         let previous = self.anchor(token, 0, embedding);
-        let gap = |a: usize, b: usize| {
-            let d = (a + self.side - b) % self.side;
-            d.min(self.side - d)
-        };
-        let moved = gap(resting.0, previous.0) + gap(resting.1, previous.1);
+        let d = (resting + self.len - previous) % self.len;
+        let moved = d.min(self.len - d);
         self.remembered[token as usize] = Some(resting);
         self.moves += 1;
         self.travelled += moved as u64;
@@ -256,8 +245,8 @@ impl Ingress {
 
     /// `(tokens with a remembered anchor, distinct cells occupied, mean move)`.
     pub fn drift(&self) -> (usize, usize, f64) {
-        let known: Vec<(usize, usize)> = self.remembered.iter().flatten().copied().collect();
-        let distinct: std::collections::HashSet<(usize, usize)> = known.iter().copied().collect();
+        let known: Vec<usize> = self.remembered.iter().flatten().copied().collect();
+        let distinct: std::collections::HashSet<usize> = known.iter().copied().collect();
         let mean = if self.moves > 0 {
             self.travelled as f64 / self.moves as f64
         } else {
@@ -267,19 +256,16 @@ impl Ingress {
     }
 
     /// Where this token enters.
-    pub fn anchor(&self, token: u32, position: u64, embedding: &[f64]) -> (usize, usize) {
+    pub fn anchor(&self, token: u32, position: u64, embedding: &[f64]) -> usize {
         match self.mode {
             IngressMode::Content => self.phase_anchor(embedding),
-            IngressMode::Constant => (self.side / 2, self.side / 2),
-            // One node per token along a serpentine raster: consecutive tokens
-            // land within two nodes of each other, so their footprints overlap
-            // heavily, and the grid is covered every side^2 tokens so the load
-            // spreads. Neither number is tuned — the step follows from wanting
-            // overlap at a path length of ~3, the period from the grid.
-            IngressMode::Cursor => {
-                let p = position as usize;
-                (p % self.side, (p / self.side) % self.side)
-            }
+            IngressMode::Constant => self.len / 2,
+            // One cell per token straight along the ring, so ring distance is
+            // stream lag with no remainder. That identity is the reason the
+            // lattice is one-dimensional at all: on a torus the same map splits
+            // lag across two axes and aliases every scale but two onto them.
+            // Nothing here is tuned; the step is one because lag is one.
+            IngressMode::Cursor => position as usize % self.len,
             IngressMode::Readout => match self.remembered[token as usize] {
                 Some(a) => a,
                 None => self.phase_anchor(embedding),
@@ -287,32 +273,26 @@ impl Ingress {
         }
     }
 
-    /// Torus coordinate of an embedding, as the phase in each fixed plane.
-    fn phase_anchor(&self, embedding: &[f64]) -> (usize, usize) {
-        let phase = |a: &[f64], b: &[f64]| {
-            let angle = crate::linalg::dot(embedding, a).atan2(crate::linalg::dot(embedding, b));
-            // atan2 is in (-pi, pi]; shift to [0, 1) then onto the ring.
-            let unit = (angle + std::f64::consts::PI) / std::f64::consts::TAU;
-            ((unit * self.side as f64) as usize).min(self.side - 1)
-        };
-        (
-            phase(&self.planes[0], &self.planes[1]),
-            phase(&self.planes[2], &self.planes[3]),
-        )
+    /// Ring coordinate of an embedding, as the phase in the fixed plane.
+    fn phase_anchor(&self, embedding: &[f64]) -> usize {
+        let angle = crate::linalg::dot(embedding, &self.planes[0])
+            .atan2(crate::linalg::dot(embedding, &self.planes[1]));
+        // atan2 is in (-pi, pi]; shift to [0, 1) then onto the ring.
+        let unit = (angle + std::f64::consts::PI) / std::f64::consts::TAU;
+        ((unit * self.len as f64) as usize).min(self.len - 1)
     }
 
     /// Entry node for one slot of a token with this embedding.
     pub fn node_for(
         &self,
-        grid: &Grid,
+        ring: &Ring,
         token: u32,
         position: u64,
         embedding: &[f64],
         slot: usize,
     ) -> u32 {
-        let (x, y) = self.anchor(token, position, embedding);
-        let (dx, dy) = self.offsets[slot];
-        grid.index((x + dx as usize) % self.side, (y + dy as usize) % self.side)
+        let anchor = self.anchor(token, position, embedding);
+        ring.shift(anchor as u32, self.offsets[slot] as usize)
     }
 }
 
@@ -343,7 +323,10 @@ pub struct ModelParams {
     /// width knob — and because nodes never see a slot index, it can change
     /// after training without touching a single node weight.
     pub slots: usize,
-    pub grid_side: usize,
+    /// Ring length: how many nodes there are. Reach is bounded by this, since
+    /// stream positions `t` and `t + nodes` enter at the same cell and nothing
+    /// downstream can separate them.
+    pub nodes: usize,
     pub schedule: Schedule,
     /// Rungs behind the tied table. One means a plain matrix, which is the
     /// reference point for what consolidation costs the output head.
@@ -440,7 +423,7 @@ impl Model {
         // change must not be able to perturb structure it has nothing to do
         // with.
         let rotation = Rotation::new(d_model, rng);
-        let ingress = Ingress::new(params.grid_side, d_model, params.slots, params.vocab, rng);
+        let ingress = Ingress::new(params.nodes, d_model, params.slots, params.vocab, rng);
         // Drawn unconditionally so the shared stream advances the same way
         // whichever head is in use; a conditional draw would work today and
         // break the moment anything else is constructed after this.
@@ -502,8 +485,8 @@ impl Model {
     }
 
     /// Remembers where a token's mass came to rest, for its next entry.
-    /// Returns how far that moved its anchor on the torus.
-    pub fn observe_resting_place(&mut self, token: u32, resting: (usize, usize)) -> usize {
+    /// Returns how far that moved its anchor around the ring.
+    pub fn observe_resting_place(&mut self, token: u32, resting: usize) -> usize {
         let d = self.params.d_model();
         let lo = token as usize * d;
         let embedding = self.embedding.read().as_slice()[lo..lo + d].to_vec();
@@ -519,7 +502,7 @@ impl Model {
 
     /// Turns a token into particles: rotate, slice, split each chunk into a
     /// unit direction and a share of the mass, and place it by content.
-    pub fn shatter(&mut self, grid: &Grid, token: u32, position: u64) -> Shattered {
+    pub fn shatter(&mut self, ring: &Ring, token: u32, position: u64) -> Shattered {
         let (d_head, slots) = (self.params.d_head, self.params.slots);
         let d_model = self.params.d_model();
         let lo = token as usize * d_model;
@@ -549,7 +532,7 @@ impl Model {
                 };
                 let node = self
                     .ingress
-                    .node_for(grid, token, position, &anchor_source, s);
+                    .node_for(ring, token, position, &anchor_source, s);
                 (node, s as u16, mag / scale, payload)
             })
             .collect();
@@ -854,7 +837,7 @@ mod tests {
             vocab: 64,
             d_head: 8,
             slots: 8,
-            grid_side: 16,
+            nodes: 16,
             schedule: Schedule::Geometric { r: 4.0, g1: 0.5 },
             embed_rungs: 4,
             learning_rate: 0.05,
@@ -902,7 +885,7 @@ mod tests {
     #[test]
     fn shattering_produces_a_probability_measure_over_unit_payloads() {
         let mut rng = Rng::new(3);
-        let grid = Grid::new(16);
+        let grid = Ring::new(16);
         let mut model = Model::new(params(), &mut rng);
         for token in 0..64 {
             let s = model.shatter(&grid, token, 0);
@@ -922,7 +905,7 @@ mod tests {
         // This is the whole ingress/egress path with the network removed, so it
         // isolates the split-and-rejoin arithmetic from everything else.
         let mut rng = Rng::new(4);
-        let grid = Grid::new(16);
+        let grid = Ring::new(16);
         let mut model = Model::new(params(), &mut rng);
         let d_head = model.params().d_head;
 
@@ -949,9 +932,9 @@ mod tests {
         // embedding is perturbed slightly enters nearby. Without both, no
         // topographic map can form and related memories end up unrelated.
         let mut rng = Rng::new(5);
-        let grid = Grid::new(32);
+        let grid = Ring::new(32);
         let mut p = params();
-        p.grid_side = 32;
+        p.nodes = 32;
         let mut model = Model::new(p, &mut rng);
 
         let a = model.shatter(&grid, 11, 0).seeds[0].0;
@@ -985,9 +968,9 @@ mod tests {
         // Not one node, not the whole grid. Related fragments must start close
         // enough that their memories are co-located.
         let mut rng = Rng::new(6);
-        let grid = Grid::new(32);
+        let grid = Ring::new(32);
         let mut p = params();
-        p.grid_side = 32;
+        p.nodes = 32;
         let mut model = Model::new(p, &mut rng);
         let s = model.shatter(&grid, 3, 0);
         let nodes: Vec<u32> = s.seeds.iter().map(|(n, _, _, _)| *n).collect();
@@ -1147,7 +1130,7 @@ mod tests {
             let mut q = params();
             q.head_kind = kind;
             q.tied = false;
-            let grid = Grid::new(q.grid_side);
+            let grid = Ring::new(q.nodes);
             let model = Model::new(q, &mut Rng::new(4242));
             let mut probe = vec![0.0; model.params().d_model()];
             probe[0] = 1.0;
@@ -1292,7 +1275,7 @@ mod tests {
         // d_head fixes the architecture; slots is a runtime width. Two models
         // differing only in slot count still emit unit payloads of the same
         // width, which is what makes nodes slot-agnostic.
-        let grid = Grid::new(16);
+        let grid = Ring::new(16);
         for slots in [4usize, 8, 16] {
             let mut rng = Rng::new(9);
             let mut p = params();

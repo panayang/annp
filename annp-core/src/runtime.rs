@@ -151,9 +151,9 @@ impl Runtime {
         rng: &mut crate::rng::Rng,
     ) -> Self {
         assert_eq!(
-            model_params.grid_side,
-            topology.grid().side(),
-            "the model's grid side must match the topology it routes over"
+            model_params.nodes,
+            topology.ring().len(),
+            "the model's node count must match the topology it routes over"
         );
         assert_eq!(
             model_params.d_head, node_params.d_head,
@@ -318,7 +318,7 @@ impl Runtime {
             let position = self.position;
             let shattered = self
                 .model
-                .shatter(self.topology.grid(), token, position as u64);
+                .shatter(self.topology.ring(), token, position as u64);
             self.engine.inject(position, &shattered.seeds);
             self.pending.insert(position, (token, shattered.scale));
             self.stream.insert(position, token);
@@ -400,8 +400,8 @@ impl Runtime {
 
             // The anchor is a readout of the dynamics, not a second learner:
             // this token next enters wherever its own mass just came to rest.
-            let side = self.topology.grid().side();
-            let anchor_move = match output.resting_place(side) {
+            let nodes = self.topology.ring().len();
+            let anchor_move = match output.resting_place(nodes) {
                 Some(resting) => self.model.observe_resting_place(token, resting),
                 None => 0,
             };
@@ -442,7 +442,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Grid, SmallWorld};
+    use crate::graph::{Ring, SmallWorld};
     use crate::ladder::Schedule;
     use crate::node::AbsorbRule;
     use crate::rng::Rng;
@@ -450,7 +450,7 @@ mod tests {
     fn build(vocab: usize, seed: u64) -> Runtime {
         let side = 16;
         let mut rng = Rng::new(seed);
-        let topology = Topology::small_world(Grid::new(side), SmallWorld::default(), &mut rng);
+        let topology = Topology::small_world(Ring::new(side), SmallWorld::default(), &mut rng);
         let schedule = Schedule::Geometric { r: 4.0, g1: 0.5 };
         Runtime::new(
             topology,
@@ -460,7 +460,7 @@ mod tests {
                 vocab,
                 d_head: 8,
                 slots: 8,
-                grid_side: side,
+                nodes: side,
                 schedule,
                 embed_rungs: 3,
                 learning_rate: 0.05,
@@ -550,7 +550,7 @@ mod tests {
         // partitioned the graph, which is the failure this project has hit
         // before.
         let mut rt = build(32, 41);
-        let before: Vec<usize> = (0..rt.topology().grid().len() as u32)
+        let before: Vec<usize> = (0..rt.topology().ring().len() as u32)
             .map(|n| rt.topology().degree(n))
             .collect();
         let stream: Vec<u32> = (0..1_500).map(|i| (i * 7 % 32) as u32).collect();
@@ -558,15 +558,18 @@ mod tests {
         assert!(rt.rewirings() > 0, "no rewiring happened at all");
 
         let t = rt.topology();
-        for node in 0..t.grid().len() as u32 {
+        for node in 0..t.ring().len() as u32 {
             assert_eq!(
                 t.degree(node),
                 before[node as usize],
                 "degree changed at {node}"
             );
-            let lattice = t.grid().axis_neighbours(node);
+            // Ask the topology how many slots are permanent rather than
+            // writing the number down; the implementation derives it from the
+            // lattice and a copy here would go stale the moment that changes.
+            let lattice = t.ring().neighbours(node);
             assert_eq!(
-                &t.out_edges(node)[..4],
+                &t.out_edges(node)[..t.lattice_degree()],
                 &lattice,
                 "lattice edge rewired at {node}"
             );
@@ -578,7 +581,7 @@ mod tests {
         }
         assert_eq!(
             t.reachable_count(0),
-            t.grid().len(),
+            t.ring().len(),
             "turnover partitioned the graph"
         );
     }
@@ -587,12 +590,12 @@ mod tests {
     fn turnover_can_be_switched_off() {
         let mut rt = build(32, 41);
         rt.set_turnover(false);
-        let before: Vec<u32> = (0..rt.topology().grid().len() as u32)
+        let before: Vec<u32> = (0..rt.topology().ring().len() as u32)
             .flat_map(|n| rt.topology().out_edges(n).to_vec())
             .collect();
         let stream: Vec<u32> = (0..1_000).map(|i| (i * 7 % 32) as u32).collect();
         feed(&mut rt, &stream);
-        let after: Vec<u32> = (0..rt.topology().grid().len() as u32)
+        let after: Vec<u32> = (0..rt.topology().ring().len() as u32)
             .flat_map(|n| rt.topology().out_edges(n).to_vec())
             .collect();
         assert_eq!(before, after);

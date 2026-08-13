@@ -136,8 +136,8 @@ pub struct TokenOutput {
     /// put the mean of `{0, side-1}` in the middle of the grid instead of at
     /// the seam where it belongs — the classic wraparound bug, and the reason
     /// `resting_place` exists rather than a plain division.
-    anchor_cos: [f64; 2],
-    anchor_sin: [f64; 2],
+    anchor_cos: f64,
+    anchor_sin: f64,
     injected_tick: u64,
 }
 
@@ -157,19 +157,16 @@ impl TokenOutput {
     /// `None` when the mass is spread evenly enough around either ring that the
     /// resultant vanishes and no direction is meaningful — a genuine
     /// degeneracy, not a tuned threshold.
-    pub fn resting_place(&self, side: usize) -> Option<(usize, usize)> {
-        let axis = |cos: f64, sin: f64| -> Option<usize> {
-            if (cos * cos + sin * sin).sqrt() < 1e-12 {
-                return None;
-            }
-            let theta = sin.atan2(cos);
-            let unit = (theta.rem_euclid(std::f64::consts::TAU)) / std::f64::consts::TAU;
-            Some(((unit * side as f64).round() as usize) % side)
-        };
-        Some((
-            axis(self.anchor_cos[0], self.anchor_sin[0])?,
-            axis(self.anchor_cos[1], self.anchor_sin[1])?,
-        ))
+    pub fn resting_place(&self, nodes: usize) -> Option<usize> {
+        // Circular mean, because the ring wraps: averaging cell indices would
+        // put mass split across the seam in the middle of the ring instead of
+        // at the seam.
+        if (self.anchor_cos * self.anchor_cos + self.anchor_sin * self.anchor_sin).sqrt() < 1e-12 {
+            return None;
+        }
+        let theta = self.anchor_sin.atan2(self.anchor_cos);
+        let unit = theta.rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU;
+        Some(((unit * nodes as f64).round() as usize) % nodes)
     }
 }
 
@@ -295,8 +292,8 @@ impl Engine {
                 hop_mass: 0.0,
                 visits: 0,
                 touched: Vec::new(),
-                anchor_cos: [0.0; 2],
-                anchor_sin: [0.0; 2],
+                anchor_cos: 0.0,
+                anchor_sin: 0.0,
                 injected_tick: self.tick,
             },
         );
@@ -433,7 +430,7 @@ impl Engine {
             ..Default::default()
         };
         let mut surprise_sum = 0.0;
-        let side = topology.grid().side();
+        let nodes = topology.ring().len();
         let d_head = self.d_head;
         for g in &groups {
             self.visits[g.node as usize] += g.visits;
@@ -455,9 +452,8 @@ impl Engine {
                 stats.forwarded_mass += mass;
                 stats.spawned += 1;
             }
-            let (gx, gy) = topology.grid().coords(g.node);
             for (token, slot, mass, payload) in &g.absorbed {
-                self.deposit(*token, *slot, *mass, payload, (gx, gy), side);
+                self.deposit(*token, *slot, *mass, payload, g.node as usize, nodes);
                 stats.absorbed_mass += mass;
             }
         }
@@ -484,8 +480,8 @@ impl Engine {
         slot: u16,
         mass: f64,
         payload: &[f64],
-        at: (usize, usize),
-        side: usize,
+        at: usize,
+        nodes: usize,
     ) {
         let d = self.d_head;
         let tick = self.tick;
@@ -500,12 +496,9 @@ impl Engine {
         out.absorbed_mass += mass;
         out.hop_mass += mass * (tick - out.injected_tick + 1) as f64;
 
-        let step = std::f64::consts::TAU / side as f64;
-        for (axis, coord) in [at.0, at.1].into_iter().enumerate() {
-            let theta = coord as f64 * step;
-            out.anchor_cos[axis] += mass * theta.cos();
-            out.anchor_sin[axis] += mass * theta.sin();
-        }
+        let theta = at as f64 * std::f64::consts::TAU / nodes as f64;
+        out.anchor_cos += mass * theta.cos();
+        out.anchor_sin += mass * theta.sin();
     }
 
     /// Runs ticks until nothing is left in flight.
@@ -531,7 +524,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Grid, SmallWorld, Topology};
+    use crate::graph::{Ring, SmallWorld, Topology};
     use crate::ladder::Schedule;
     use crate::node::{AbsorbRule, NodeParams};
     use crate::rng::Rng;
@@ -541,7 +534,7 @@ mod tests {
 
     fn fixture(side: usize, seed: u64) -> (Topology, NodeBank) {
         let mut rng = Rng::new(seed);
-        let t = Topology::small_world(Grid::new(side), SmallWorld::default(), &mut rng);
+        let t = Topology::small_world(Ring::new(side), SmallWorld::default(), &mut rng);
         let bank = NodeBank::new(
             &t,
             NodeParams {
@@ -599,11 +592,10 @@ mod tests {
     }
 
     #[test]
-    fn the_resting_place_averages_across_the_seam() {
-        // The wraparound bug this exists to prevent: mass split between x = 0
-        // and x = side-1 is concentrated *at the seam*, and a plain arithmetic
-        // mean would report the opposite side of the grid instead.
-        let side = 8usize;
+    fn a_resting_place_split_across_the_seam_lands_on_the_seam() {
+        // Mass at cells 0 and N-1 is adjacent on a ring; an arithmetic mean of
+        // the indices would report the opposite side instead.
+        let nodes = 8usize;
         let mut out = TokenOutput {
             accumulated: vec![0.0; D * SLOTS],
             after_one_hop: vec![0.0; D * SLOTS],
@@ -611,35 +603,30 @@ mod tests {
             hop_mass: 0.0,
             visits: 0,
             touched: Vec::new(),
-            anchor_cos: [0.0; 2],
-            anchor_sin: [0.0; 2],
+            anchor_cos: 0.0,
+            anchor_sin: 0.0,
             injected_tick: 0,
         };
-        let step = std::f64::consts::TAU / side as f64;
-        for (x, mass) in [(0usize, 0.5), (side - 1, 0.5)] {
-            let theta = x as f64 * step;
-            out.anchor_cos[0] += mass * theta.cos();
-            out.anchor_sin[0] += mass * theta.sin();
-            // y concentrated at 3, to check the axes are handled independently.
-            let phi = 3.0 * step;
-            out.anchor_cos[1] += mass * phi.cos();
-            out.anchor_sin[1] += mass * phi.sin();
+        let step = std::f64::consts::TAU / nodes as f64;
+        for (cell, mass) in [(0usize, 0.5), (nodes - 1, 0.5)] {
+            let theta = cell as f64 * step;
+            out.anchor_cos += mass * theta.cos();
+            out.anchor_sin += mass * theta.sin();
         }
-        let (x, y) = out
-            .resting_place(side)
+        let at = out
+            .resting_place(nodes)
             .expect("resultant is not degenerate");
-        let ring_gap = |a: usize, b: usize| (a + side - b) % side;
-        let to_seam = ring_gap(x, 0).min(ring_gap(0, x));
+        let gap = |a: usize, b: usize| (a + nodes - b) % nodes;
+        let to_seam = gap(at, 0).min(gap(0, at));
         assert!(
             to_seam <= 1,
-            "mean landed at {x}, which is {to_seam} from the seam"
+            "mean landed at {at}, which is {to_seam} from the seam"
         );
-        assert_eq!(y, 3, "the other axis must be unaffected");
     }
 
     #[test]
     fn a_resting_place_spread_evenly_round_the_ring_is_undefined() {
-        let side = 8usize;
+        let nodes = 8usize;
         let mut out = TokenOutput {
             accumulated: vec![0.0; D * SLOTS],
             after_one_hop: vec![0.0; D * SLOTS],
@@ -647,20 +634,18 @@ mod tests {
             hop_mass: 0.0,
             visits: 0,
             touched: Vec::new(),
-            anchor_cos: [0.0; 2],
-            anchor_sin: [0.0; 2],
+            anchor_cos: 0.0,
+            anchor_sin: 0.0,
             injected_tick: 0,
         };
-        let step = std::f64::consts::TAU / side as f64;
-        for x in 0..side {
-            let theta = x as f64 * step;
-            for axis in 0..2 {
-                out.anchor_cos[axis] += theta.cos() / side as f64;
-                out.anchor_sin[axis] += theta.sin() / side as f64;
-            }
+        let step = std::f64::consts::TAU / nodes as f64;
+        for cell in 0..nodes {
+            let theta = cell as f64 * step;
+            out.anchor_cos += theta.cos() / nodes as f64;
+            out.anchor_sin += theta.sin() / nodes as f64;
         }
         assert!(
-            out.resting_place(side).is_none(),
+            out.resting_place(nodes).is_none(),
             "a vanishing resultant has no direction"
         );
     }

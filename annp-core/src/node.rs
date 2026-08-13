@@ -479,7 +479,7 @@ impl NodeBank {
             params.context_scales >= 1,
             "a node needs at least one timescale"
         );
-        let n = topology.grid().len();
+        let n = topology.ring().len();
         let d = params.d_head;
         let nodes = (0..n)
             .map(|i| Node {
@@ -643,12 +643,15 @@ impl NodeBank {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Grid, SmallWorld};
+    use crate::graph::{Ring, SmallWorld};
     use crate::rng::Rng;
 
-    fn fixture(side: usize) -> (Topology, NodeBank) {
+    /// `nodes` is a ring length, not a torus side: a ring of `n` has `n`
+    /// nodes where the old grid had `n^2`, so a fixture that used to be roomy
+    /// at 5 has to say so explicitly now.
+    fn fixture(nodes: usize) -> (Topology, NodeBank) {
         let mut rng = Rng::new(1);
-        let t = Topology::small_world(Grid::new(side), SmallWorld::default(), &mut rng);
+        let t = Topology::small_world(Ring::new(nodes), SmallWorld::default(), &mut rng);
         let p = NodeParams {
             absorb: AbsorbRule::Relative,
             d_head: 16,
@@ -671,9 +674,9 @@ mod tests {
 
     #[test]
     fn routing_weights_are_a_probability_distribution() {
-        let (t, mut bank) = fixture(8);
+        let (t, mut bank) = fixture(64);
         let mut rng = Rng::new(2);
-        for node in 0..t.grid().len() as u32 {
+        for node in 0..t.ring().len() as u32 {
             let q = unit(&mut rng, 16);
             let out = bank.process(&t, node, &q);
             assert_eq!(out.weights.len(), t.degree(node) + 1);
@@ -692,7 +695,7 @@ mod tests {
         // the annealing back to a short path is driven by learning rather than
         // by a schedule.
         let mut rng = Rng::new(31);
-        let t = Topology::small_world(Grid::new(6), SmallWorld::default(), &mut rng);
+        let t = Topology::small_world(Ring::new(32), SmallWorld::default(), &mut rng);
         let mut bank = NodeBank::new(
             &t,
             NodeParams {
@@ -725,9 +728,9 @@ mod tests {
         // neighbour can beat where the particle already is. The network begins
         // fully transparent and grows its paths only as nodes learn — depth is
         // earned rather than spent at initialisation.
-        let (t, mut bank) = fixture(8);
+        let (t, mut bank) = fixture(64);
         let mut rng = Rng::new(21);
-        for node in 0..t.grid().len() as u32 {
+        for node in 0..t.ring().len() as u32 {
             let q = unit(&mut rng, 16);
             let out = bank.process(&t, node, &q);
             assert_eq!(
@@ -740,7 +743,7 @@ mod tests {
 
     #[test]
     fn a_particle_moves_on_once_a_neighbour_expects_it_better() {
-        let (t, mut bank) = fixture(6);
+        let (t, mut bank) = fixture(36);
         let mut rng = Rng::new(22);
         let (a, b) = (unit(&mut rng, 16), unit(&mut rng, 16));
         let student = t.out_edges(0)[2];
@@ -770,7 +773,7 @@ mod tests {
         let mut rng = Rng::new(61);
         let d = 16;
         let mut bank = {
-            let t = Topology::small_world(Grid::new(5), SmallWorld::default(), &mut Rng::new(1));
+            let t = Topology::small_world(Ring::new(32), SmallWorld::default(), &mut Rng::new(1));
             let p = NodeParams {
                 absorb: AbsorbRule::RelativeSurprise,
                 d_head: d,
@@ -808,7 +811,7 @@ mod tests {
         // differs from the key after seeing (c, b), so W can distinguish
         // histories that end the same way.
         let build = |scales: usize| {
-            let t = Topology::small_world(Grid::new(5), SmallWorld::default(), &mut Rng::new(1));
+            let t = Topology::small_world(Ring::new(32), SmallWorld::default(), &mut Rng::new(1));
             let p = NodeParams {
                 absorb: AbsorbRule::RelativeSurprise,
                 d_head: 16,
@@ -855,7 +858,7 @@ mod tests {
         // combination of unit vectors, so nothing accumulates; a conserving
         // ladder fed a unit payload every visit would grow without bound and
         // its key would converge to the historical mean.
-        let t = Topology::small_world(Grid::new(5), SmallWorld::default(), &mut Rng::new(1));
+        let t = Topology::small_world(Ring::new(32), SmallWorld::default(), &mut Rng::new(1));
         let p = NodeParams {
             absorb: AbsorbRule::RelativeSurprise,
             d_head: 16,
@@ -886,7 +889,7 @@ mod tests {
         // W starts at zero, so the residual must carry the payload through
         // unchanged. Without it the network annihilates its own input and can
         // never bootstrap.
-        let (t, mut bank) = fixture(5);
+        let (t, mut bank) = fixture(25);
         let mut rng = Rng::new(3);
         let q = unit(&mut rng, 16);
         let out = bank.process(&t, 0, &q);
@@ -901,10 +904,10 @@ mod tests {
 
     #[test]
     fn emitted_payloads_are_always_unit_norm() {
-        let (t, mut bank) = fixture(6);
+        let (t, mut bank) = fixture(36);
         let mut rng = Rng::new(4);
         for _ in 0..500 {
-            let node = rng.next_below(t.grid().len() as u64) as u32;
+            let node = rng.next_below(t.ring().len() as u64) as u32;
             let q = unit(&mut rng, 16);
             let out = bank.process(&t, node, &q);
             assert!((norm(&out.emitted) - 1.0).abs() < 1e-9, "norm drifted");
@@ -915,7 +918,7 @@ mod tests {
     fn a_node_learns_to_predict_a_repeated_transition() {
         // Feed a -> b over and over. Surprise must fall, and the published
         // expectation after seeing `a` must point at `b`.
-        let (t, mut bank) = fixture(5);
+        let (t, mut bank) = fixture(25);
         let mut rng = Rng::new(5);
         let (a, b) = (unit(&mut rng, 16), unit(&mut rng, 16));
 
@@ -942,7 +945,7 @@ mod tests {
     fn particles_route_towards_whoever_expects_them() {
         // Teach one neighbour to expect a payload, and routing mass must
         // concentrate on it without any edge parameter having been trained.
-        let (t, mut bank) = fixture(6);
+        let (t, mut bank) = fixture(36);
         let mut rng = Rng::new(6);
         let (a, b) = (unit(&mut rng, 16), unit(&mut rng, 16));
 
@@ -973,7 +976,7 @@ mod tests {
 
     #[test]
     fn unfired_nodes_publish_nothing_and_stay_neutral() {
-        let (_, bank) = fixture(5);
+        let (_, bank) = fixture(25);
         for node in 0..bank.len() as u32 {
             assert!(!bank.has_fired(node));
             assert!(bank.expectation(node).iter().all(|x| *x == 0.0));

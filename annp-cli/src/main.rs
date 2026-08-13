@@ -224,7 +224,7 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         slots: usize,
         #[arg(long, default_value_t = 24)]
-        grid_side: usize,
+        nodes: usize,
         #[arg(long, default_value_t = 4)]
         long_range: usize,
         /// Long-range contact exponent; 0 makes them distance-independent, so
@@ -298,9 +298,13 @@ enum Command {
     /// Topology bench — does the long-range exponent follow the lattice
     /// dimension, as DESIGN.md §1.9 claims, or was 2 just asserted?
     Topology {
-        /// Grid sides to sweep; the scaling fit needs at least three.
-        #[arg(long, value_delimiter = ',', default_value = "32,48,64,96,128")]
-        sides: Vec<usize>,
+        /// Ring lengths to sweep; the scaling fit needs at least three.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "1024,2048,4096,8192,16384"
+        )]
+        sizes: Vec<usize>,
         /// Long-range exponents to compare against Kleinberg's formulas.
         #[arg(long, value_delimiter = ',', default_value = "0,1,1.5,2,2.5,3,4")]
         exponents: Vec<f64>,
@@ -376,7 +380,7 @@ fn main() -> std::io::Result<()> {
             fanout,
             d_head,
             slots,
-            grid_side,
+            nodes,
             long_range,
             exponent,
             rungs,
@@ -419,7 +423,7 @@ fn main() -> std::io::Result<()> {
                 fanout,
                 d_head,
                 slots,
-                grid_side,
+                nodes,
                 long_range,
                 exponent,
                 rungs,
@@ -448,7 +452,7 @@ fn main() -> std::io::Result<()> {
             run::run(&cfg, &out)
         }
         Command::Topology {
-            sides,
+            sizes,
             exponents,
             contacts,
             pairs,
@@ -456,11 +460,11 @@ fn main() -> std::io::Result<()> {
             out,
         } => {
             assert!(
-                sides.len() >= 3,
-                "the hops ~ N^beta fit needs at least three grid sizes"
+                sizes.len() >= 3,
+                "the hops ~ N^beta fit needs at least three ring sizes"
             );
             let cfg = topology::Config {
-                sides,
+                sizes,
                 exponents,
                 contacts,
                 pairs,

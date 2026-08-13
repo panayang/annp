@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use annp_core::engine::EngineParams;
-use annp_core::graph::{Grid, SmallWorld, Topology};
+use annp_core::graph::{Ring, SmallWorld, Topology};
 use annp_core::ladder::Schedule;
 use annp_core::model::{HeadKind, IngressMode, ModelParams};
 use annp_core::node::{AbsorbRule, NodeParams};
@@ -675,7 +675,7 @@ pub struct Config {
     ///
     /// The cursor maps a one-dimensional stream onto a two-dimensional torus,
     /// so stream lag becomes spatial distance along only two scales — one step
-    /// in x is lag 1, one step in y is lag `grid_side`. Every other lag aliases
+    /// in x is lag 1, one step in y is lag `nodes`. Every other lag aliases
     /// onto those. On an order-2 chain that costs nothing, because lag 1 is the
     /// only lag carrying anything. Real text needs a continuum, and a lag that
     /// has been aliased cannot be recovered downstream by any parameter. This
@@ -689,7 +689,7 @@ pub struct Config {
     pub fanout: usize,
     pub d_head: usize,
     pub slots: usize,
-    pub grid_side: usize,
+    pub nodes: usize,
     pub long_range: usize,
     /// Long-range contact exponent. §9 measured this standalone with greedy
     /// lattice-distance routing and never end to end.
@@ -768,7 +768,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     };
 
     let topology = Topology::small_world(
-        Grid::new(cfg.grid_side),
+        Ring::new(cfg.nodes),
         SmallWorld {
             long_range: cfg.long_range,
             exponent: cfg.exponent,
@@ -783,7 +783,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             vocab: cfg.vocab,
             d_head: cfg.d_head,
             slots: cfg.slots,
-            grid_side: cfg.grid_side,
+            nodes: cfg.nodes,
             schedule,
             embed_rungs: cfg.embed_rungs,
             learning_rate: cfg.learning_rate,
@@ -892,9 +892,18 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let mut probe_previous: std::collections::BTreeMap<u32, u32> = Default::default();
     // Lags chosen to straddle the two scales the cursor can express: 1, the
     // grid side, and a spread either way.
+    // Powers of two out to half the ring, which is the furthest lag a ring can
+    // hold: past that, `t` and `t + nodes` share a cell and no readout can tell
+    // them apart. The old list was built around the torus side because that was
+    // the only long scale the cursor could express; on a ring every scale is
+    // present, so the probe has to look at all of them.
     let lags: Vec<usize> = if cfg.lag_probe {
-        let g = cfg.grid_side;
-        let mut v = vec![1usize, 2, 3, 4, 6, 8, 12, 16, g, g + 1, 2 * g, 4 * g];
+        let mut v = vec![1usize, 2, 3, 4, 6];
+        let mut k = 8;
+        while k <= cfg.nodes / 2 {
+            v.push(k);
+            k *= 2;
+        }
         v.sort_unstable();
         v.dedup();
         v
@@ -1124,7 +1133,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         for mut s in runtime.advance(Some(token)) {
             {
                 let nodes = std::mem::take(&mut s.touched);
-                cover_sum += nodes.len() as f64 / (cfg.grid_side * cfg.grid_side) as f64;
+                cover_sum += nodes.len() as f64 / (cfg.nodes * cfg.nodes) as f64;
                 cover_n += 1;
                 if let Some(prev) = trails.iter().rev().find(|t| t.token == s.token) {
                     let gap = s.position - prev.position;
@@ -1290,8 +1299,8 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         cfg.vocab,
         cfg.d_head,
         cfg.slots,
-        cfg.grid_side,
-        cfg.grid_side,
+        cfg.nodes,
+        cfg.nodes,
         4 + cfg.long_range,
         cfg.mass_floor
     );
@@ -1671,9 +1680,9 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     if !lags.is_empty() {
         println!("how far back the assembled vector still names a token");
         println!(
-            "  chance is {:.4} bits; the cursor can express lag 1 and lag {} and aliases the rest",
+            "  chance is {:.4} bits; a ring of {} holds every lag below it and aliases past it",
             (cfg.vocab as f64).ln() * nats_to_bits,
-            cfg.grid_side
+            cfg.nodes
         );
         println!("  {:>5} {:>10}", "lag", "bits");
         for (probe, lag) in lag_probes.iter().zip(&lags) {
