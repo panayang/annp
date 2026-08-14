@@ -103,7 +103,26 @@ impl RotaryContext {
         }
         self.ctx.observe(target);
         self.last = Some(target);
+        self.head.relax();
         best
+    }
+
+    /// Replace the head with one whose weights sit on a consolidation ladder.
+    /// Done after construction so the two arms draw identical initial weights.
+    pub fn consolidate(&mut self, rungs: Option<usize>, g1: f64, rng: &mut Rng) {
+        if let Some(m) = rungs {
+            self.head = Head::with_consolidation(
+                self.head.in_dim(),
+                self.head.hidden(),
+                self.vocab,
+                Some((m, g1)),
+                rng,
+            );
+        }
+    }
+
+    pub fn head_rungs(&self) -> usize {
+        self.head.rungs()
     }
 
     pub fn best(&self) -> (f64, f64) {
@@ -135,6 +154,16 @@ pub struct Config {
     pub seed: u64,
     pub corpus: Option<std::path::PathBuf>,
     pub tokenizer: Option<std::path::PathBuf>,
+    /// Above 1, the stream cycles through this many independent Markov chains
+    /// in blocks of `domain_span`, and the run reports retention per revisit
+    /// instead of a single loss.
+    pub domains: usize,
+    pub domain_span: usize,
+    /// Rungs on the readout head's weight tensors. `None` is plain SGD.
+    pub consolidate: Option<usize>,
+    /// Rung 1's conductance. Its inverse is the leak time, which must be long
+    /// enough to hold what one visit teaches. Defaults to `1 / domain_span`.
+    pub consolidate_g1: Option<f64>,
 }
 
 impl Config {
@@ -150,6 +179,9 @@ impl Config {
 pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     crate::write_manifest(out_dir, "next", cfg);
     std::fs::create_dir_all(out_dir)?;
+    if cfg.domains > 1 {
+        return retention(cfg);
+    }
     let mut rng = Rng::new(cfg.seed);
 
     let stream: Vec<u32> = match (&cfg.corpus, &cfg.tokenizer) {
@@ -230,6 +262,92 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Retention across revisits, which is the claim the ladder was built for.
+///
+/// The stream cycles through `domains` independent chains in blocks of
+/// `domain_span`, so every domain is abandoned and later resumed. What is
+/// reported is the cost of the **first tokens after coming back**: a learner
+/// that forgot pays full price again, a learner that retained does not. No task
+/// label is given, no boundary is announced, nothing is replayed, and the state
+/// is bounded — `m` rungs, whatever the stream's length.
+///
+/// The overall loss is reported next to it and is expected to be *worse* than a
+/// plain learner's on a stationary stream. That is not a defeat to be hidden.
+/// An architecture that keeps capacity free for distributions it has not met
+/// yet cannot also spend all of it on the one in front of it, so the gap is the
+/// price of the property, and the point of printing both is to quote the price
+/// rather than to pretend there is none.
+fn retention(cfg: &Config) -> std::io::Result<()> {
+    let mut rng = Rng::new(cfg.seed);
+    let (d, span) = (cfg.domains, cfg.domain_span.max(1));
+    let mut sources: Vec<crate::run::MarkovSource> = (0..d)
+        .map(|_| crate::run::MarkovSource::new(cfg.vocab, cfg.order, cfg.fanout, &mut rng))
+        .collect();
+    let mut draw = Rng::new(cfg.seed ^ 0x5EED);
+    let stream: Vec<u32> = (0..cfg.tokens)
+        .map(|i| sources[(i / span) % d].next(&mut draw))
+        .collect();
+
+    let mut model = RotaryContext::new(cfg, &mut rng);
+    // Derived, not tuned: rung 1 holds a visit's worth of learning.
+    let g1 = cfg.consolidate_g1.unwrap_or(1.0 / span as f64);
+    model.consolidate(cfg.consolidate, g1, &mut Rng::new(cfg.seed ^ 0xC0FFEE));
+
+    // The re-entry probe is the first tenth of a visit. Long enough to average,
+    // short enough that relearning from scratch has not yet happened.
+    let probe = (span / 10).max(1);
+    let visits = cfg.tokens / (span * d) + 1;
+    let mut reentry = vec![vec![0.0f64; d]; visits];
+    let mut counts = vec![vec![0.0f64; d]; visits];
+    let started = std::time::Instant::now();
+    for (i, &tok) in stream.iter().enumerate() {
+        let nats = model.observe(tok, i * 10 >= stream.len() * 9);
+        let dom = (i / span) % d;
+        let visit = i / (span * d);
+        if i % span < probe && visit < visits {
+            reentry[visit][dom] += nats;
+            counts[visit][dom] += 1.0;
+        }
+    }
+    let elapsed = started.elapsed();
+    let bits = std::f64::consts::LOG2_E;
+    let (total, rate) = model.best();
+
+    println!();
+    println!(
+        "=== retention over {d} domains, span {span}, {} rungs on the head (g1={g1:.2e}) ===",
+        model.head_rungs()
+    );
+    println!(
+        "  vocab={} order={} tokens={} memory={}",
+        cfg.vocab, cfg.order, cfg.tokens, cfg.memory
+    );
+    println!(
+        "  {:.2} s, {:.0} tokens/s",
+        elapsed.as_secs_f64(),
+        stream.len() as f64 / elapsed.as_secs_f64()
+    );
+    println!();
+    println!("re-entry cost, bits per token over the first {probe} tokens of each visit");
+    println!("  visit   mean over domains");
+    for v in 0..visits {
+        let n: f64 = counts[v].iter().sum();
+        if n < 1.0 {
+            continue;
+        }
+        let s: f64 = reentry[v].iter().sum();
+        println!("  {:>5}   {:>8.4}", v + 1, s / n * bits);
+    }
+    println!();
+    println!(
+        "  prequential total: {:.1} bits over {} tokens (best rate {rate})",
+        total * bits,
+        stream.len()
+    );
+    println!("  <- expected to be worse than a plain learner. That is the price, not a defeat.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +370,10 @@ mod tests {
                 ladder: true,
                 addressing,
                 memory: true,
+                domains: 1,
+                domain_span: 4000,
+                consolidate: None,
+                consolidate_g1: None,
                 linear_spacing: false,
                 order: 2,
                 fanout: 3,

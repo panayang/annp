@@ -223,6 +223,20 @@ enum Command {
         /// This is the order-1 control, run through the same head.
         #[arg(long)]
         no_memory: bool,
+        /// Above 1, cycle the stream through this many independent chains and
+        /// report retention per revisit instead of a single loss.
+        #[arg(long, default_value_t = 1)]
+        domains: usize,
+        #[arg(long, default_value_t = 4000)]
+        domain_span: usize,
+        /// Rungs on the readout head's weights. Absent is plain SGD; this is
+        /// the arm that tests Benna-Fusi where Benna-Fusi belongs.
+        #[arg(long)]
+        consolidate: Option<usize>,
+        /// Rung 1's conductance; its inverse is the leak time. Defaults to
+        /// 1/domain_span so the fast rung holds one visit's learning.
+        #[arg(long)]
+        consolidate_g1: Option<f64>,
         #[arg(long, default_value_t = 2)]
         order: usize,
         #[arg(long, default_value_t = 3)]
@@ -499,6 +513,10 @@ fn main() -> std::io::Result<()> {
             no_addressing,
             linear_spacing,
             no_memory,
+            domains,
+            domain_span,
+            consolidate,
+            consolidate_g1,
             order,
             fanout,
             seed,
@@ -515,6 +533,10 @@ fn main() -> std::io::Result<()> {
                 ladder: !no_ladder,
                 addressing: !no_addressing,
                 memory: !no_memory,
+                domains,
+                domain_span,
+                consolidate,
+                consolidate_g1,
                 linear_spacing,
                 order,
                 fanout,

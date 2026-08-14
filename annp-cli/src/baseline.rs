@@ -239,14 +239,9 @@ mod tests {
         let mut rng = Rng::new(7);
         let (vocab, window, d, hid) = (11usize, 3usize, 5usize, 4usize);
         let mut m = WindowMlp::new(vocab, window, d, hid, &mut rng);
-        m.head.rates = vec![0.0]; // freeze: measure the gradient, do not take a step
-        m.head.b1 = vec![vec![0.0; hid]];
-        m.head.b2 = vec![vec![0.0; vocab]];
+        // Freeze: measure the gradient, do not take a step.
+        m.head.keep_one_rate(0.0);
         m.embed.truncate(1);
-        m.head.w1.truncate(1);
-        m.head.w2.truncate(1);
-        m.head.nats = vec![0.0];
-        m.head.tail = vec![0.0];
         for t in [2u32, 5, 9] {
             m.history.push_back(t);
         }
@@ -260,14 +255,14 @@ mod tests {
         for (which, idx) in probes {
             let loss_at = |m: &mut WindowMlp, delta: f64| -> f64 {
                 match which {
-                    "w2" => m.head.w2[0][idx] += delta,
-                    "w1" => m.head.w1[0][idx] += delta,
+                    "w2" => m.head.w2_mut(0)[idx] += delta,
+                    "w1" => m.head.w1_mut(0)[idx] += delta,
                     _ => m.embed[0][idx] += delta,
                 }
                 let l = m.step(0, target);
                 match which {
-                    "w2" => m.head.w2[0][idx] -= delta,
-                    "w1" => m.head.w1[0][idx] -= delta,
+                    "w2" => m.head.w2_mut(0)[idx] -= delta,
+                    "w1" => m.head.w1_mut(0)[idx] -= delta,
                     _ => m.embed[0][idx] -= delta,
                 }
                 l
@@ -277,24 +272,24 @@ mod tests {
             let numeric = (up - down) / (2.0 * eps);
 
             // The analytic gradient, read off by taking a step of known size.
-            m.head.rates = vec![1.0];
+            m.head.set_rate(1.0);
             let before = match which {
-                "w2" => m.head.w2[0][idx],
-                "w1" => m.head.w1[0][idx],
+                "w2" => m.head.w2_mut(0)[idx],
+                "w1" => m.head.w1_mut(0)[idx],
                 _ => m.embed[0][idx],
             };
             m.step(0, target);
             let after = match which {
-                "w2" => m.head.w2[0][idx],
-                "w1" => m.head.w1[0][idx],
+                "w2" => m.head.w2_mut(0)[idx],
+                "w1" => m.head.w1_mut(0)[idx],
                 _ => m.embed[0][idx],
             };
             let analytic = before - after;
-            m.head.rates = vec![0.0];
+            m.head.set_rate(0.0);
             // Undo the step so the next probe starts from the same weights.
             match which {
-                "w2" => m.head.w2[0][idx] = before,
-                "w1" => m.head.w1[0][idx] = before,
+                "w2" => m.head.w2_mut(0)[idx] = before,
+                "w1" => m.head.w1_mut(0)[idx] = before,
                 _ => m.embed[0][idx] = before,
             }
             assert!(
