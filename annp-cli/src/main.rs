@@ -4,6 +4,7 @@
 //! recording the git revision and every parameter that went into the numbers,
 //! so any result in the paper can be regenerated from one line.
 
+mod baseline;
 mod corpus;
 mod e0;
 
@@ -155,6 +156,35 @@ enum Command {
         #[arg(long, default_value_t = 20_260_806)]
         seed: u64,
         #[arg(long, default_value = "results/e0")]
+        out: PathBuf,
+    },
+    /// A learned baseline on the same stream and the same protocol, so the
+    /// architecture has something to be compared against that is not an
+    /// ablation of itself.
+    Baseline {
+        #[arg(long, default_value_t = 200_000)]
+        tokens: usize,
+        #[arg(long, default_value_t = 4096)]
+        vocab: usize,
+        /// How many previous tokens the model sees. Three is the architecture's
+        /// own measured window (§40.6), so it is the matched comparison.
+        #[arg(long, default_value_t = 3)]
+        window: usize,
+        #[arg(long, default_value_t = 128)]
+        d_model: usize,
+        #[arg(long, default_value_t = 256)]
+        hidden: usize,
+        #[arg(long, default_value_t = 2)]
+        order: usize,
+        #[arg(long, default_value_t = 3)]
+        fanout: usize,
+        #[arg(long, default_value_t = 20_260_807)]
+        seed: u64,
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+        #[arg(long, default_value = "results/baseline")]
         out: PathBuf,
     },
     /// End-to-end run on a synthetic Markov source with a known entropy rate.
@@ -383,6 +413,33 @@ fn main() -> std::io::Result<()> {
             };
             e0::run(&cfg, &out)
         }
+        Command::Baseline {
+            tokens,
+            vocab,
+            window,
+            d_model,
+            hidden,
+            order,
+            fanout,
+            seed,
+            corpus,
+            tokenizer,
+            out,
+        } => baseline::run(
+            &baseline::Config {
+                tokens,
+                vocab,
+                window,
+                d_model,
+                hidden,
+                order,
+                fanout,
+                seed,
+                corpus,
+                tokenizer,
+            },
+            &out,
+        ),
         Command::Run {
             tokens,
             vocab,
