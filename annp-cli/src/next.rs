@@ -32,6 +32,21 @@ pub struct RotaryContext {
     ctx: Context,
     head: Head,
     vocab: usize,
+    memory: bool,
+    /// `[context state | code of the most recent token]`, width `2d`.
+    ///
+    /// The second half is a lossless path to the token just seen. Without it
+    /// the head had to decode even lag 0 out of a superposition of the whole
+    /// history, and the first real-text run came out *worse than the
+    /// context-free ceiling* — a head fed a constant learns the marginal and
+    /// scores 7.6475, while the same head fed our state scored 8.03. At that
+    /// signal-to-noise ratio the state was acting as noise injection, and
+    /// every arm was being judged on a handicap that has nothing to do with
+    /// what candidate A claims. The baseline reads three tokens losslessly;
+    /// this gives one, and everything beyond lag 0 still has to come out of
+    /// the addressed memory.
+    x: Vec<f64>,
+    last: Option<u32>,
 }
 
 impl RotaryContext {
@@ -42,11 +57,14 @@ impl RotaryContext {
         } else {
             Context::without_addressing(v, d, h, cfg.ladder, rng)
         };
-        let head = Head::new(d, cfg.hidden, v, rng);
+        let head = Head::new(2 * d, cfg.hidden, v, rng);
         Self {
             ctx,
             head,
             vocab: v,
+            memory: cfg.memory,
+            x: vec![0.0; 2 * d],
+            last: None,
         }
     }
 
@@ -67,13 +85,24 @@ impl RotaryContext {
     /// Predict, pay, then write. The write happens after every rate has been
     /// charged, so no rate ever sees the token it is being scored on.
     pub fn observe(&mut self, target: u32, in_tail: bool) -> f64 {
+        let d = self.ctx.width();
+        if self.memory {
+            self.x[..d].copy_from_slice(self.ctx.read());
+        }
+        match self.last {
+            Some(t) => self.x[d..].copy_from_slice(self.ctx.code(t)),
+            // Nothing seen yet, which is what a model at the start of a stream
+            // legitimately knows.
+            None => self.x[d..].fill(0.0),
+        }
         let mut best = f64::INFINITY;
         for r in 0..self.head.num_rates() {
-            let nats = self.head.step(r, self.ctx.read(), target);
+            let nats = self.head.step(r, &self.x, target);
             self.head.charge(r, nats, in_tail);
             best = best.min(nats);
         }
         self.ctx.observe(target);
+        self.last = Some(target);
         best
     }
 
@@ -95,6 +124,11 @@ pub struct Config {
     pub horizon: f64,
     pub ladder: bool,
     pub addressing: bool,
+    /// Zero the context half of the input, leaving only the lossless current
+    /// token. This is the order-1 control realised through our own head, so
+    /// the 2x2 measures what the memory adds on top of it rather than what it
+    /// adds on top of nothing.
+    pub memory: bool,
     pub linear_spacing: bool,
     pub order: usize,
     pub fanout: usize,
@@ -149,11 +183,15 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let (total, rate) = model.best();
     let tail_count = (stream.len() / 10).max(1) as f64;
 
-    let arm = match (cfg.addressing, cfg.ladder) {
-        (true, true) => "rotation + ladder      (candidate A)",
-        (true, false) => "rotation + decay       (ladder removed)",
-        (false, true) => "identity + ladder      (what DESIGN.md died as)",
-        (false, false) => "identity + decay       (decaying bag of codes)",
+    let arm = if !cfg.memory {
+        "current token only     (order-1 through our own head)"
+    } else {
+        match (cfg.addressing, cfg.ladder) {
+            (true, true) => "rotation + ladder      (candidate A)",
+            (true, false) => "rotation + decay       (ladder removed)",
+            (false, true) => "identity + ladder      (what DESIGN.md died as)",
+            (false, false) => "identity + decay       (decaying bag of codes)",
+        }
     };
 
     println!();
@@ -213,6 +251,7 @@ mod tests {
                 horizon: 128.0,
                 ladder: true,
                 addressing,
+                memory: true,
                 linear_spacing: false,
                 order: 2,
                 fanout: 3,

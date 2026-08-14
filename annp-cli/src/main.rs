@@ -199,9 +199,10 @@ enum Command {
         /// Accumulator width. Must be even: it is d/2 rotation planes.
         #[arg(long, default_value_t = 256)]
         d_model: usize,
-        /// 384 matches the window MLP's trained parameter count at vocab 4096
-        /// and d 256 to within 128 parameters.
-        #[arg(long, default_value_t = 384)]
+        /// 363 matches the window MLP's trained parameter count at vocab 4096
+        /// and d 256 to within 1,643 of 1,675,520. The input is 2d wide: the
+        /// context state plus a lossless copy of the current token.
+        #[arg(long, default_value_t = 363)]
         hidden: usize,
         /// Sizes both halves at once: the slowest rotation period and, through
         /// `rungs_for_horizon`, the number of ladder rungs.
@@ -218,6 +219,10 @@ enum Command {
         /// Frequencies uniform on (0, pi] instead of geometric in period.
         #[arg(long)]
         linear_spacing: bool,
+        /// Drop the memory entirely and predict from the current token alone.
+        /// This is the order-1 control, run through the same head.
+        #[arg(long)]
+        no_memory: bool,
         #[arg(long, default_value_t = 2)]
         order: usize,
         #[arg(long, default_value_t = 3)]
@@ -493,6 +498,7 @@ fn main() -> std::io::Result<()> {
             no_ladder,
             no_addressing,
             linear_spacing,
+            no_memory,
             order,
             fanout,
             seed,
@@ -508,6 +514,7 @@ fn main() -> std::io::Result<()> {
                 horizon,
                 ladder: !no_ladder,
                 addressing: !no_addressing,
+                memory: !no_memory,
                 linear_spacing,
                 order,
                 fanout,
