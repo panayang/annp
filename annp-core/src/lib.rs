@@ -4,6 +4,7 @@
 //! `DESIGN.md` at the repository root for the design snapshot these pieces
 //! implement, including which parts are settled and which are still on trial.
 
+pub mod context;
 pub mod engine;
 pub mod graph;
 pub mod ladder;

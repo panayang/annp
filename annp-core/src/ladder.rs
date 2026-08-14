@@ -143,6 +143,17 @@ impl Ladder {
         &self.rungs[k]
     }
 
+    /// Every rung, mutably. The caller may apply any transform that acts
+    /// identically on all of them: the diffusion couples rungs coordinate by
+    /// coordinate with the same conductances everywhere, so a map that mixes
+    /// coordinates but treats rungs alike commutes with `relax`. That is what
+    /// lets `context.rs` rotate the whole chain without disturbing the
+    /// consolidation dynamics.
+    #[inline]
+    pub fn rungs_mut(&mut self) -> &mut [Mat] {
+        &mut self.rungs
+    }
+
     #[inline]
     pub fn capacity(&self, k: usize) -> f64 {
         self.capacity[k]
