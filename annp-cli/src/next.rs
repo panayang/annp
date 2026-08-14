@@ -280,12 +280,25 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
 fn retention(cfg: &Config) -> std::io::Result<()> {
     let mut rng = Rng::new(cfg.seed);
     let (d, span) = (cfg.domains, cfg.domain_span.max(1));
+    // Each domain gets its own slice of the alphabet, and this is not a
+    // detail. With every domain drawing from the same symbols and the same
+    // marginal, the input never says which domain is active, so the model
+    // cannot specialise to one; it learns the mixture, the mixture is stable,
+    // and there is nothing domain-specific left to forget. Measured: at 3, 8
+    // and 16 shared-alphabet domains the plain arm's re-entry cost fell
+    // monotonically, which looks like retention but is only convergence to an
+    // average. Real non-stationarity announces itself in the content. Disjoint
+    // slices are the smallest change that restores that.
+    let width = (cfg.vocab / d).max(2);
     let mut sources: Vec<crate::run::MarkovSource> = (0..d)
-        .map(|_| crate::run::MarkovSource::new(cfg.vocab, cfg.order, cfg.fanout, &mut rng))
+        .map(|_| crate::run::MarkovSource::new(width, cfg.order, cfg.fanout.min(width - 1), &mut rng))
         .collect();
     let mut draw = Rng::new(cfg.seed ^ 0x5EED);
     let stream: Vec<u32> = (0..cfg.tokens)
-        .map(|i| sources[(i / span) % d].next(&mut draw))
+        .map(|i| {
+            let dom = (i / span) % d;
+            sources[dom].next(&mut draw) + (dom * width) as u32
+        })
         .collect();
 
     let mut model = RotaryContext::new(cfg, &mut rng);
@@ -293,20 +306,38 @@ fn retention(cfg: &Config) -> std::io::Result<()> {
     let g1 = cfg.consolidate_g1.unwrap_or(1.0 / span as f64);
     model.consolidate(cfg.consolidate, g1, &mut Rng::new(cfg.seed ^ 0xC0FFEE));
 
-    // The re-entry probe is the first tenth of a visit. Long enough to average,
-    // short enough that relearning from scratch has not yet happened.
-    let probe = (span / 10).max(1);
+    // Two probes per visit, and the *gap* between them is the measurement.
+    //
+    // Re-entry cost alone cannot be read. It fell monotonically in every
+    // shared-alphabet protocol tried, which looks like retention until you
+    // notice there is no reference: absolute bits also fall because the model
+    // is getting better at everything. What forgetting means is that coming
+    // back costs more than staying, so the settled cost at the end of a visit
+    // is the null this has to be read against -- the same mistake, and the same
+    // fix, as the two wrong null hypotheses in DIAGNOSIS.md section 5.
+    //
+    // The probe is short on purpose. If relearning takes fifty tokens, a probe
+    // spanning a tenth of a four-thousand-token visit measures the relearned
+    // state and reports no forgetting whatever happened.
+    let probe = (span / 50).clamp(1, 64);
     let visits = cfg.tokens / (span * d) + 1;
     let mut reentry = vec![vec![0.0f64; d]; visits];
     let mut counts = vec![vec![0.0f64; d]; visits];
+    let mut settled = vec![vec![0.0f64; d]; visits];
+    let mut settled_n = vec![vec![0.0f64; d]; visits];
     let started = std::time::Instant::now();
     for (i, &tok) in stream.iter().enumerate() {
         let nats = model.observe(tok, i * 10 >= stream.len() * 9);
         let dom = (i / span) % d;
         let visit = i / (span * d);
-        if i % span < probe && visit < visits {
-            reentry[visit][dom] += nats;
-            counts[visit][dom] += 1.0;
+        if visit < visits {
+            if i % span < probe {
+                reentry[visit][dom] += nats;
+                counts[visit][dom] += 1.0;
+            } else if i % span >= span - probe {
+                settled[visit][dom] += nats;
+                settled_n[visit][dom] += 1.0;
+            }
         }
     }
     let elapsed = started.elapsed();
@@ -328,15 +359,19 @@ fn retention(cfg: &Config) -> std::io::Result<()> {
         stream.len() as f64 / elapsed.as_secs_f64()
     );
     println!();
-    println!("re-entry cost, bits per token over the first {probe} tokens of each visit");
-    println!("  visit   mean over domains");
+    println!("bits per token over the first and last {probe} tokens of each visit");
+    println!("  visit   re-entry   settled       gap  <- the gap is the forgetting");
     for v in 0..visits {
-        let n: f64 = counts[v].iter().sum();
-        if n < 1.0 {
+        let (n, m) = (
+            counts[v].iter().sum::<f64>(),
+            settled_n[v].iter().sum::<f64>(),
+        );
+        if n < 1.0 || m < 1.0 {
             continue;
         }
-        let s: f64 = reentry[v].iter().sum();
-        println!("  {:>5}   {:>8.4}", v + 1, s / n * bits);
+        let r = reentry[v].iter().sum::<f64>() / n * bits;
+        let s = settled[v].iter().sum::<f64>() / m * bits;
+        println!("  {:>5}   {:>8.4}  {:>8.4}  {:>+8.4}", v + 1, r, s, r - s);
     }
     println!();
     println!(
