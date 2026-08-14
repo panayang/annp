@@ -123,6 +123,11 @@ pub struct Head {
     /// Accumulated code length per rate, in nats, and over the final tenth.
     pub(crate) nats: Vec<f64>,
     pub(crate) tail: Vec<f64>,
+    /// `[rate][decile]`, so a learning curve can be read per rate rather than
+    /// only a final number. A model still improving steeply at the end has not
+    /// lost, it has run out of stream.
+    deciles: Vec<Vec<f64>>,
+    decile_n: Vec<f64>,
     h: Vec<f64>,
     logits: Vec<f64>,
     gh: Vec<f64>,
@@ -179,6 +184,8 @@ impl Head {
             b2: vec![vec![0.0; vocab]; n],
             nats: vec![0.0; n],
             tail: vec![0.0; n],
+            deciles: vec![vec![0.0; 10]; n],
+            decile_n: vec![0.0; 10],
             h: vec![0.0; hidden],
             logits: vec![0.0; vocab],
             gh: vec![0.0; hidden],
@@ -338,11 +345,37 @@ impl Head {
         nats
     }
 
-    pub fn charge(&mut self, r: usize, nats: f64, in_tail: bool) {
+    pub fn charge(&mut self, r: usize, nats: f64, in_tail: bool, decile: usize) {
         self.nats[r] += nats;
         if in_tail {
             self.tail[r] += nats;
         }
+        let d = decile.min(9);
+        self.deciles[r][d] += nats;
+        if r == 0 {
+            self.decile_n[d] += 1.0;
+        }
+    }
+
+    /// Bits per token per decile for the rate with the lowest total.
+    pub fn best_curve(&self) -> Vec<f64> {
+        let mut best = (f64::INFINITY, 0usize);
+        for (r, &n) in self.nats.iter().enumerate() {
+            if n < best.0 {
+                best = (n, r);
+            }
+        }
+        self.deciles[best.1]
+            .iter()
+            .zip(&self.decile_n)
+            .map(|(s, n)| {
+                if *n > 0.0 {
+                    s / n * std::f64::consts::LOG2_E
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect()
     }
 
     /// Best accumulated code length across rates, and which rate won.

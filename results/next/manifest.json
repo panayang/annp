@@ -1,0 +1,6 @@
+{
+  "experiment": "next",
+  "git": "e7bb61ef35c6-dirty",
+  "argv": ["target/release/annp", "next", "--tokens", "60000", "--vocab", "1024", "--d-model", "256", "--hidden", "363", "--corpus", "/tmp/claude-1000/-home-pana-dev-annp-alg-annp/b4cc1a13-bea5-4c4a-8008-8337037bd85e/scratchpad/../../../../../home/pana/dev/annp-alg/annp/stage_1_1-32001.json"],
+  "resolved": "Config {\n    tokens: 60000,\n    vocab: 1024,\n    d_model: 256,\n    hidden: 363,\n    horizon: 1024.0,\n    ladder: true,\n    addressing: true,\n    memory: true,\n    linear_spacing: false,\n    order: 2,\n    fanout: 3,\n    seed: 20260807,\n    corpus: Some(\n        \"/tmp/claude-1000/-home-pana-dev-annp-alg-annp/b4cc1a13-bea5-4c4a-8008-8337037bd85e/scratchpad/../../../../../home/pana/dev/annp-alg/annp/stage_1_1-32001.json\",\n    ),\n    tokenizer: None,\n    domains: 1,\n    domain_span: 4000,\n    consolidate: None,\n    consolidate_g1: None,\n}"
+}

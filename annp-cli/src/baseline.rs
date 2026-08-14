@@ -83,10 +83,14 @@ impl WindowMlp {
     /// best rate's nats for this token, so the caller can report a stream that
     /// is comparable token by token.
     pub fn observe(&mut self, target: u32, in_tail: bool) -> f64 {
+        self.observe_at(target, in_tail, 0)
+    }
+
+    pub fn observe_at(&mut self, target: u32, in_tail: bool, decile: usize) -> f64 {
         let mut best = f64::INFINITY;
         for r in 0..self.head.num_rates() {
             let nats = self.step(r, target);
-            self.head.charge(r, nats, in_tail);
+            self.head.charge(r, nats, in_tail, decile);
             best = best.min(nats);
         }
         // The window advances after every rate has seen the same input.
@@ -176,7 +180,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     let started = std::time::Instant::now();
     let mut per_token = Vec::with_capacity(stream.len());
     for (i, &tok) in stream.iter().enumerate() {
-        per_token.push(model.observe(tok, i * 10 >= stream.len() * 9));
+        per_token.push(model.observe_at(tok, i * 10 >= stream.len() * 9, i * 10 / stream.len()));
     }
     let elapsed = started.elapsed();
     let nats_to_bits = std::f64::consts::LOG2_E;

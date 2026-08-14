@@ -47,6 +47,9 @@ pub struct RotaryContext {
     /// the addressed memory.
     x: Vec<f64>,
     last: Option<u32>,
+    norm_state: f64,
+    norm_code: f64,
+    norm_n: f64,
 }
 
 impl RotaryContext {
@@ -65,6 +68,9 @@ impl RotaryContext {
             memory: cfg.memory,
             x: vec![0.0; 2 * d],
             last: None,
+            norm_state: 0.0,
+            norm_code: 0.0,
+            norm_n: 0.0,
         }
     }
 
@@ -85,9 +91,27 @@ impl RotaryContext {
     /// Predict, pay, then write. The write happens after every rate has been
     /// charged, so no rate ever sees the token it is being scored on.
     pub fn observe(&mut self, target: u32, in_tail: bool) -> f64 {
+        self.observe_at(target, in_tail, 0)
+    }
+
+    pub fn observe_at(&mut self, target: u32, in_tail: bool, decile: usize) -> f64 {
         let d = self.ctx.width();
         if self.memory {
             self.x[..d].copy_from_slice(self.ctx.read());
+            // Normalise the state half to match the code half.
+            //
+            // Both halves go through one `w1` under one learning rate. Measured
+            // unnormalised: the state's mean norm is 10.797 against the code's
+            // 1.000, and the rate that survives the race drops from 0.1 to 0.01
+            // -- the same factor of ten. The clean order-1 pathway was being
+            // run an order of magnitude slower because it shared an optimiser
+            // with a block whose gradients were ten times larger, and the loss
+            // rose across deciles instead of falling. "Memory is worse than no
+            // memory" was measuring that, not measuring memory.
+            let n = self.x[..d].iter().map(|v| v * v).sum::<f64>().sqrt();
+            if n > f64::MIN_POSITIVE {
+                self.x[..d].iter_mut().for_each(|v| *v /= n);
+            }
         }
         match self.last {
             Some(t) => self.x[d..].copy_from_slice(self.ctx.code(t)),
@@ -95,10 +119,19 @@ impl RotaryContext {
             // legitimately knows.
             None => self.x[d..].fill(0.0),
         }
+        // The two halves are fed through one w1 with one learning rate. If the
+        // state half carries a much larger norm than the clean code half, its
+        // gradients dominate and the rate that survives is set by the noisy
+        // half -- which would slow the clean half down by the same factor and
+        // look exactly like "memory hurts".
+        let (a, b) = self.x.split_at(d);
+        self.norm_state += a.iter().map(|v| v * v).sum::<f64>().sqrt();
+        self.norm_code += b.iter().map(|v| v * v).sum::<f64>().sqrt();
+        self.norm_n += 1.0;
         let mut best = f64::INFINITY;
         for r in 0..self.head.num_rates() {
             let nats = self.head.step(r, &self.x, target);
-            self.head.charge(r, nats, in_tail);
+            self.head.charge(r, nats, in_tail, decile);
             best = best.min(nats);
         }
         self.ctx.observe(target);
@@ -131,6 +164,14 @@ impl RotaryContext {
 
     pub fn best_tail(&self) -> f64 {
         self.head.best_tail()
+    }
+
+    pub fn mean_norms(&self) -> (f64, f64) {
+        (self.norm_state / self.norm_n, self.norm_code / self.norm_n)
+    }
+
+    pub fn best_curve(&self) -> Vec<f64> {
+        self.head.best_curve()
     }
 }
 
@@ -208,7 +249,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
 
     let started = std::time::Instant::now();
     for (i, &tok) in stream.iter().enumerate() {
-        model.observe(tok, i * 10 >= stream.len() * 9);
+        model.observe_at(tok, i * 10 >= stream.len() * 9, i * 10 / stream.len());
     }
     let elapsed = started.elapsed();
     let nats_to_bits = std::f64::consts::LOG2_E;
@@ -254,6 +295,17 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         "last decile",
         model.best_tail() / tail_count * nats_to_bits
     );
+    let (ns, nc) = model.mean_norms();
+    println!("  mean input norm: state {ns:.3}, current-token code {nc:.3}");
+    println!(
+        "  learning curve, bits per token by decile:\n    {}",
+        model
+            .best_curve()
+            .iter()
+            .map(|b| format!("{b:.3}"))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
     println!(
         "  prequential total: {:.1} bits over {} tokens",
         total * nats_to_bits,
@@ -291,7 +343,9 @@ fn retention(cfg: &Config) -> std::io::Result<()> {
     // slices are the smallest change that restores that.
     let width = (cfg.vocab / d).max(2);
     let mut sources: Vec<crate::run::MarkovSource> = (0..d)
-        .map(|_| crate::run::MarkovSource::new(width, cfg.order, cfg.fanout.min(width - 1), &mut rng))
+        .map(|_| {
+            crate::run::MarkovSource::new(width, cfg.order, cfg.fanout.min(width - 1), &mut rng)
+        })
         .collect();
     let mut draw = Rng::new(cfg.seed ^ 0x5EED);
     let stream: Vec<u32> = (0..cfg.tokens)
