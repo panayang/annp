@@ -7,6 +7,8 @@
 mod baseline;
 mod corpus;
 mod e0;
+mod head;
+mod next;
 
 /// Git revision, or `unknown` outside a checkout.
 pub fn git_revision() -> String {
@@ -185,6 +187,48 @@ enum Command {
         #[arg(long)]
         tokenizer: Option<PathBuf>,
         #[arg(long, default_value = "results/baseline")]
+        out: PathBuf,
+    },
+    /// Candidate A: rotation-addressed context with ladder persistence, and
+    /// the 2x2 that separates addressing from persistence.
+    Next {
+        #[arg(long, default_value_t = 200_000)]
+        tokens: usize,
+        #[arg(long, default_value_t = 4096)]
+        vocab: usize,
+        /// Accumulator width. Must be even: it is d/2 rotation planes.
+        #[arg(long, default_value_t = 256)]
+        d_model: usize,
+        /// 384 matches the window MLP's trained parameter count at vocab 4096
+        /// and d 256 to within 128 parameters.
+        #[arg(long, default_value_t = 384)]
+        hidden: usize,
+        /// Sizes both halves at once: the slowest rotation period and, through
+        /// `rungs_for_horizon`, the number of ladder rungs.
+        #[arg(long, default_value_t = 1024.0)]
+        horizon: f64,
+        /// Replace the ladder with a single exponential decay of the same
+        /// nominal horizon. This is candidate C's arm.
+        #[arg(long)]
+        no_ladder: bool,
+        /// Remove the rotation. This is what DESIGN.md's architecture was:
+        /// persistence with no way to address it.
+        #[arg(long)]
+        no_addressing: bool,
+        /// Frequencies uniform on (0, pi] instead of geometric in period.
+        #[arg(long)]
+        linear_spacing: bool,
+        #[arg(long, default_value_t = 2)]
+        order: usize,
+        #[arg(long, default_value_t = 3)]
+        fanout: usize,
+        #[arg(long, default_value_t = 20_260_807)]
+        seed: u64,
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+        #[arg(long, default_value = "results/next")]
         out: PathBuf,
     },
     /// End-to-end run on a synthetic Markov source with a known entropy rate.
@@ -432,6 +476,39 @@ fn main() -> std::io::Result<()> {
                 window,
                 d_model,
                 hidden,
+                order,
+                fanout,
+                seed,
+                corpus,
+                tokenizer,
+            },
+            &out,
+        ),
+        Command::Next {
+            tokens,
+            vocab,
+            d_model,
+            hidden,
+            horizon,
+            no_ladder,
+            no_addressing,
+            linear_spacing,
+            order,
+            fanout,
+            seed,
+            corpus,
+            tokenizer,
+            out,
+        } => next::run(
+            &next::Config {
+                tokens,
+                vocab,
+                d_model,
+                hidden,
+                horizon,
+                ladder: !no_ladder,
+                addressing: !no_addressing,
+                linear_spacing,
                 order,
                 fanout,
                 seed,

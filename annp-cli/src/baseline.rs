@@ -30,6 +30,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
+use crate::head::Head;
 use annp_core::rng::Rng;
 
 /// A fixed-window model: embed the last `window` tokens, concatenate, one
@@ -41,74 +42,41 @@ pub struct WindowMlp {
     vocab: usize,
     window: usize,
     d_model: usize,
-    hidden: usize,
-    rates: Vec<f64>,
-    /// `[rate][token * d_model + j]`
+    /// `[rate][token * d_model + j]`. The embedding is the only learned thing
+    /// outside the shared head, and it is what makes this a learned baseline
+    /// rather than a fixed featuriser.
     embed: Vec<Vec<f64>>,
-    /// `[rate][h * (window * d_model) + j]`
-    w1: Vec<Vec<f64>>,
-    b1: Vec<Vec<f64>>,
-    /// `[rate][token * hidden + h]`
-    w2: Vec<Vec<f64>>,
-    b2: Vec<Vec<f64>>,
-    /// Accumulated code length per rate, in nats, and over the final tenth.
-    nats: Vec<f64>,
-    tail: Vec<f64>,
+    head: Head,
     /// Scratch, reused so a step allocates nothing.
     x: Vec<f64>,
-    h: Vec<f64>,
-    logits: Vec<f64>,
-    gh: Vec<f64>,
     history: std::collections::VecDeque<u32>,
 }
 
 impl WindowMlp {
     pub fn new(vocab: usize, window: usize, d_model: usize, hidden: usize, rng: &mut Rng) -> Self {
         assert!(window >= 1 && d_model >= 1 && hidden >= 1);
-        let rates = vec![0.003, 0.01, 0.03, 0.1];
-        let n = rates.len();
         let fan_in = window * d_model;
-        // He-style for the tanh layer and small for the rest; the exact scale
-        // matters little because the rates are raced anyway.
-        let draw = |count: usize, sigma: f64, rng: &mut Rng| -> Vec<f64> {
-            (0..count).map(|_| rng.next_normal() * sigma).collect()
-        };
-        let embed = (0..n)
-            .map(|_| draw(vocab * d_model, 1.0 / (d_model as f64).sqrt(), rng))
-            .collect();
-        let w1 = (0..n)
-            .map(|_| draw(hidden * fan_in, 1.0 / (fan_in as f64).sqrt(), rng))
-            .collect();
-        let w2 = (0..n)
-            .map(|_| draw(vocab * hidden, 1.0 / (hidden as f64).sqrt(), rng))
+        let head = Head::new(fan_in, hidden, vocab, rng);
+        let embed = (0..head.num_rates())
+            .map(|_| {
+                (0..vocab * d_model)
+                    .map(|_| rng.next_normal() / (d_model as f64).sqrt())
+                    .collect()
+            })
             .collect();
         Self {
             vocab,
             window,
             d_model,
-            hidden,
             embed,
-            w1,
-            b1: vec![vec![0.0; hidden]; n],
-            w2,
-            b2: vec![vec![0.0; vocab]; n],
-            nats: vec![0.0; n],
-            tail: vec![0.0; n],
+            head,
             x: vec![0.0; fan_in],
-            h: vec![0.0; hidden],
-            logits: vec![0.0; vocab],
-            gh: vec![0.0; hidden],
-            rates,
             history: std::collections::VecDeque::new(),
         }
     }
 
     pub fn parameters(&self) -> usize {
-        self.vocab * self.d_model
-            + self.hidden * self.window * self.d_model
-            + self.hidden
-            + self.vocab * self.hidden
-            + self.vocab
+        self.vocab * self.d_model + self.head.parameters()
     }
 
     /// Charges `target` against the current weights, then updates. Returns the
@@ -116,12 +84,9 @@ impl WindowMlp {
     /// is comparable token by token.
     pub fn observe(&mut self, target: u32, in_tail: bool) -> f64 {
         let mut best = f64::INFINITY;
-        for r in 0..self.rates.len() {
+        for r in 0..self.head.num_rates() {
             let nats = self.step(r, target);
-            self.nats[r] += nats;
-            if in_tail {
-                self.tail[r] += nats;
-            }
+            self.head.charge(r, nats, in_tail);
             best = best.min(nats);
         }
         // The window advances after every rate has seen the same input.
@@ -135,7 +100,7 @@ impl WindowMlp {
     /// Forward and backward for one rate. Split out so the gradient can be
     /// checked against finite differences without going through `observe`.
     fn step(&mut self, r: usize, target: u32) -> f64 {
-        let (w, d, hid, v) = (self.window, self.d_model, self.hidden, self.vocab);
+        let d = self.d_model;
         // Positions with no history yet read a zero block, which is what a
         // model at the start of a stream legitimately knows.
         self.x.iter_mut().for_each(|x| *x = 0.0);
@@ -144,83 +109,27 @@ impl WindowMlp {
             let e = &self.embed[r][tok as usize * d..(tok as usize + 1) * d];
             self.x[lo..lo + d].copy_from_slice(e);
         }
-        for j in 0..hid {
-            let row = &self.w1[r][j * (w * d)..(j + 1) * (w * d)];
-            let z: f64 = row.iter().zip(&self.x).map(|(a, b)| a * b).sum::<f64>() + self.b1[r][j];
-            self.h[j] = z.tanh();
-        }
-        for n in 0..v {
-            let row = &self.w2[r][n * hid..(n + 1) * hid];
-            self.logits[n] =
-                row.iter().zip(&self.h).map(|(a, b)| a * b).sum::<f64>() + self.b2[r][n];
-        }
-        let peak = self
-            .logits
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
-        let mut total = 0.0;
-        for l in self.logits.iter_mut() {
-            *l = (*l - peak).exp();
-            total += *l;
-        }
-        for l in self.logits.iter_mut() {
-            *l /= total;
-        }
-        let nats = -self.logits[target as usize].max(f64::MIN_POSITIVE).ln();
-
-        // Backward. `logits` becomes the output error in place.
-        let lr = self.rates[r];
-        self.logits[target as usize] -= 1.0;
-        self.gh.iter_mut().for_each(|g| *g = 0.0);
-        for n in 0..v {
-            let g = self.logits[n];
-            if g == 0.0 {
-                continue;
+        let nats = self.head.step(r, &self.x, target);
+        // The head returns `dL/dx` against pre-update `w1`, which is the
+        // gradient belonging to this forward pass. Route it into the
+        // embeddings the window actually read.
+        let lr = self.head.rate(r);
+        for k in 0..self.head.gx.len() {
+            let slot = k / d;
+            if let Some(&tok) = self.history.get(slot) {
+                self.embed[r][tok as usize * d + (k % d)] -= lr * self.head.gx[k];
             }
-            let row = &mut self.w2[r][n * hid..(n + 1) * hid];
-            for (j, (weight, &hv)) in row.iter_mut().zip(&self.h).enumerate() {
-                self.gh[j] += g * *weight;
-                *weight -= lr * g * hv;
-            }
-            self.b2[r][n] -= lr * g;
-        }
-        // Through the tanh, then into the first layer and the embeddings that
-        // fed it. The embedding gradient is what makes this a learned model
-        // rather than a fixed featuriser.
-        for j in 0..hid {
-            let gz = self.gh[j] * (1.0 - self.h[j] * self.h[j]);
-            if gz == 0.0 {
-                continue;
-            }
-            let row = &mut self.w1[r][j * (w * d)..(j + 1) * (w * d)];
-            for (k, (weight, &xv)) in row.iter_mut().zip(&self.x).enumerate() {
-                // Accumulate into the embedding before the weight moves, so the
-                // gradient is the one belonging to this forward pass.
-                let slot = k / d;
-                if let Some(&tok) = self.history.get(slot) {
-                    self.embed[r][tok as usize * d + (k % d)] -= lr * gz * *weight;
-                }
-                *weight -= lr * gz * xv;
-            }
-            self.b1[r][j] -= lr * gz;
         }
         nats
     }
 
     /// Best accumulated code length across rates, and which rate won.
     pub fn best(&self) -> (f64, f64) {
-        let mut best = (f64::INFINITY, self.rates[0]);
-        for (r, &n) in self.nats.iter().enumerate() {
-            if n < best.0 {
-                best = (n, self.rates[r]);
-            }
-        }
-        best
+        self.head.best()
     }
 
     pub fn best_tail(&self) -> f64 {
-        self.tail.iter().copied().fold(f64::INFINITY, f64::min)
+        self.head.best_tail()
     }
 }
 
@@ -330,14 +239,14 @@ mod tests {
         let mut rng = Rng::new(7);
         let (vocab, window, d, hid) = (11usize, 3usize, 5usize, 4usize);
         let mut m = WindowMlp::new(vocab, window, d, hid, &mut rng);
-        m.rates = vec![0.0]; // freeze: measure the gradient, do not take a step
-        m.b1 = vec![vec![0.0; hid]];
-        m.b2 = vec![vec![0.0; vocab]];
+        m.head.rates = vec![0.0]; // freeze: measure the gradient, do not take a step
+        m.head.b1 = vec![vec![0.0; hid]];
+        m.head.b2 = vec![vec![0.0; vocab]];
         m.embed.truncate(1);
-        m.w1.truncate(1);
-        m.w2.truncate(1);
-        m.nats = vec![0.0];
-        m.tail = vec![0.0];
+        m.head.w1.truncate(1);
+        m.head.w2.truncate(1);
+        m.head.nats = vec![0.0];
+        m.head.tail = vec![0.0];
         for t in [2u32, 5, 9] {
             m.history.push_back(t);
         }
@@ -351,14 +260,14 @@ mod tests {
         for (which, idx) in probes {
             let loss_at = |m: &mut WindowMlp, delta: f64| -> f64 {
                 match which {
-                    "w2" => m.w2[0][idx] += delta,
-                    "w1" => m.w1[0][idx] += delta,
+                    "w2" => m.head.w2[0][idx] += delta,
+                    "w1" => m.head.w1[0][idx] += delta,
                     _ => m.embed[0][idx] += delta,
                 }
                 let l = m.step(0, target);
                 match which {
-                    "w2" => m.w2[0][idx] -= delta,
-                    "w1" => m.w1[0][idx] -= delta,
+                    "w2" => m.head.w2[0][idx] -= delta,
+                    "w1" => m.head.w1[0][idx] -= delta,
                     _ => m.embed[0][idx] -= delta,
                 }
                 l
@@ -368,24 +277,24 @@ mod tests {
             let numeric = (up - down) / (2.0 * eps);
 
             // The analytic gradient, read off by taking a step of known size.
-            m.rates = vec![1.0];
+            m.head.rates = vec![1.0];
             let before = match which {
-                "w2" => m.w2[0][idx],
-                "w1" => m.w1[0][idx],
+                "w2" => m.head.w2[0][idx],
+                "w1" => m.head.w1[0][idx],
                 _ => m.embed[0][idx],
             };
             m.step(0, target);
             let after = match which {
-                "w2" => m.w2[0][idx],
-                "w1" => m.w1[0][idx],
+                "w2" => m.head.w2[0][idx],
+                "w1" => m.head.w1[0][idx],
                 _ => m.embed[0][idx],
             };
             let analytic = before - after;
-            m.rates = vec![0.0];
+            m.head.rates = vec![0.0];
             // Undo the step so the next probe starts from the same weights.
             match which {
-                "w2" => m.w2[0][idx] = before,
-                "w1" => m.w1[0][idx] = before,
+                "w2" => m.head.w2[0][idx] = before,
+                "w1" => m.head.w1[0][idx] = before,
                 _ => m.embed[0][idx] = before,
             }
             assert!(
