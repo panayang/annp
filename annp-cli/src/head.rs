@@ -485,6 +485,12 @@ impl Head {
             .collect()
     }
 
+    /// True when the winning rate is an endpoint of the swept set.
+    pub fn rate_at_boundary(&self) -> bool {
+        let (_, r) = self.best();
+        r == self.rates[0] || r == self.rates[self.rates.len() - 1]
+    }
+
     /// Best accumulated code length across rates, and which rate won.
     pub fn best(&self) -> (f64, f64) {
         let mut best = (f64::INFINITY, self.rates[0]);

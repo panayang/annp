@@ -181,6 +181,10 @@ impl RotaryContext {
         self.head.best_tail()
     }
 
+    pub fn rate_at_boundary(&self) -> bool {
+        self.head.rate_at_boundary()
+    }
+
     pub fn mean_norms(&self) -> (f64, f64) {
         (self.norm_state / self.norm_n, self.norm_code / self.norm_n)
     }
@@ -229,7 +233,12 @@ pub struct LadderNode {
 
 impl LadderNode {
     pub fn new(vocab: usize, in_dim: usize, rungs: usize, r: f64, g1: f64) -> Self {
-        let etas = vec![0.003, 0.01, 0.03, 0.1];
+        // Up to 1.0, because that is where the delta rule lives: with a
+        // unit-norm key, eta = 1 is exact one-shot storage, and E0 worked in
+        // that region. The old range topped out at 0.1 and every arm won there
+        // -- all four sitting on the boundary, all four under-stepped, and the
+        // comparison between them meaningless.
+        let etas = vec![0.01, 0.1, 0.3, 1.0];
         let schedule = annp_core::ladder::Schedule::Geometric { r, g1 };
         Self {
             mem: (0..etas.len())
@@ -330,6 +339,14 @@ impl LadderNode {
             }
         }
         b
+    }
+
+    /// True when the winning rate is an endpoint of the swept set, meaning the
+    /// optimum is probably outside it and the number should not be compared
+    /// against anything.
+    pub fn rate_at_boundary(&self) -> bool {
+        let (_, r) = self.best();
+        r == self.etas[0] || r == self.etas[self.etas.len() - 1]
     }
 
     pub fn best_tail(&self) -> f64 {
@@ -460,6 +477,13 @@ impl Arm {
         match self {
             Arm::Node(n, _, _) => n.best_tail(),
             Arm::Ffn(m) => m.best_tail(),
+        }
+    }
+
+    fn rate_at_boundary(&self) -> bool {
+        match self {
+            Arm::Node(n, _, _) => n.rate_at_boundary(),
+            Arm::Ffn(m) => m.rate_at_boundary(),
         }
     }
 
@@ -641,6 +665,12 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         total * nats_to_bits,
         stream.len()
     );
+    if model.rate_at_boundary() {
+        println!(
+            "  !! the winning rate is an endpoint of the swept set -- the optimum \
+             is probably outside it and this number should not be compared"
+        );
+    }
     Ok(())
 }
 
