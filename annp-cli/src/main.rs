@@ -245,6 +245,18 @@ enum Command {
         /// varies slowly and carries the domain.
         #[arg(long)]
         gate_on_state: bool,
+        /// Width of each domain's alphabet window in strides. 1 is disjoint,
+        /// `domains` is fully shared, between the two they overlap.
+        #[arg(long, default_value_t = 2.0)]
+        domain_width: f64,
+        /// Run the single ladder node: one matrix, a nonlinear local write, no
+        /// hidden layer, no backpropagation.
+        #[arg(long)]
+        node: bool,
+        /// Deliberately more rungs than the horizon needs -- redundancy against
+        /// timescales we have not thought of. Costs memory, not forward compute.
+        #[arg(long, default_value_t = 8)]
+        node_rungs: usize,
         #[arg(long, default_value_t = 2)]
         order: usize,
         #[arg(long, default_value_t = 3)]
@@ -527,6 +539,9 @@ fn main() -> std::io::Result<()> {
             consolidate_g1,
             experts,
             gate_on_state,
+            domain_width,
+            node,
+            node_rungs,
             order,
             fanout,
             seed,
@@ -549,6 +564,9 @@ fn main() -> std::io::Result<()> {
                 consolidate_g1,
                 experts,
                 gate_on_state,
+                domain_width,
+                node,
+                node_rungs,
                 linear_spacing,
                 order,
                 fanout,

@@ -80,20 +80,8 @@ impl RotaryContext {
         self.head.parameters()
     }
 
-    pub fn fixed_state(&self) -> usize {
-        self.vocab * self.ctx.width() + self.ctx.rungs() * self.ctx.width()
-    }
-
-    pub fn rungs(&self) -> usize {
-        self.ctx.rungs()
-    }
-
     /// Predict, pay, then write. The write happens after every rate has been
     /// charged, so no rate ever sees the token it is being scored on.
-    pub fn observe(&mut self, target: u32, in_tail: bool) -> f64 {
-        self.observe_at(target, in_tail, 0)
-    }
-
     pub fn observe_at(&mut self, target: u32, in_tail: bool, decile: usize) -> f64 {
         let d = self.ctx.width();
         if self.memory {
@@ -198,6 +186,262 @@ impl RotaryContext {
     }
 }
 
+/// A single associative node: one ladder-backed matrix, and the ladder is the
+/// learner.
+///
+/// Stripped to the bone on purpose. `DESIGN-NEXT.md` §9–§11 put five mechanisms
+/// into one design — rotation, ladder persistence, concatenated input, routing,
+/// gating — and every one of them generated its own confound. Nothing here but
+/// a write rule and a ladder.
+///
+/// The write is the delta rule with its prediction passed through the softmax:
+///
+/// ```text
+///     W += eta * (onehot(y) - softmax(W k)) k^T
+/// ```
+///
+/// which is simultaneously a nonlinear local write and the exact cross-entropy
+/// gradient of a linear softmax layer. So "nonlinear write" and "no
+/// backpropagation" are the same statement here rather than two assumptions.
+///
+/// Rungs are deliberately more than the horizon asks for. The chain is closed
+/// and cheap in the forward pass — only rung 1 is read — so extra depth is
+/// redundancy held against timescales we have not thought of, and the cost is
+/// memory rather than compute.
+pub struct LadderNode {
+    /// One independent memory per learning rate, raced like the head's.
+    mem: Vec<annp_core::ladder::AssocMemory>,
+    etas: Vec<f64>,
+    nats: Vec<f64>,
+    tail: Vec<f64>,
+    deciles: Vec<Vec<f64>>,
+    decile_n: Vec<f64>,
+    logits: Vec<f64>,
+    resid: Vec<f64>,
+    vocab: usize,
+    in_dim: usize,
+    rungs: usize,
+}
+
+impl LadderNode {
+    pub fn new(vocab: usize, in_dim: usize, rungs: usize, g1: f64) -> Self {
+        let etas = vec![0.003, 0.01, 0.03, 0.1];
+        let schedule = annp_core::ladder::Schedule::Geometric { r: 2.0, g1 };
+        Self {
+            mem: (0..etas.len())
+                .map(|_| {
+                    annp_core::ladder::AssocMemory::ladder_rect(vocab, in_dim, schedule, rungs)
+                })
+                .collect(),
+            nats: vec![0.0; etas.len()],
+            tail: vec![0.0; etas.len()],
+            deciles: vec![vec![0.0; 10]; etas.len()],
+            decile_n: vec![0.0; 10],
+            logits: vec![0.0; vocab],
+            resid: vec![0.0; vocab],
+            etas,
+            vocab,
+            in_dim,
+            rungs,
+        }
+    }
+
+    pub fn parameters(&self) -> usize {
+        self.vocab * self.in_dim
+    }
+
+    pub fn rungs(&self) -> usize {
+        self.rungs
+    }
+
+    pub fn observe_at(&mut self, key: &[f64], target: u32, in_tail: bool, decile: usize) -> f64 {
+        let mut best = f64::INFINITY;
+        for e in 0..self.etas.len() {
+            self.mem[e].read().mul_vec(key, &mut self.logits);
+            let peak = self
+                .logits
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let mut total = 0.0;
+            for l in self.logits.iter_mut() {
+                *l = (*l - peak).exp();
+                total += *l;
+            }
+            for l in self.logits.iter_mut() {
+                *l /= total;
+            }
+            let nats = -self.logits[target as usize].max(f64::MIN_POSITIVE).ln();
+            // residual = onehot(target) - softmax
+            for (r, p) in self.resid.iter_mut().zip(&self.logits) {
+                *r = -p;
+            }
+            self.resid[target as usize] += 1.0;
+            self.mem[e].inject(&self.resid, key, self.etas[e]);
+            self.mem[e].relax();
+
+            self.nats[e] += nats;
+            if in_tail {
+                self.tail[e] += nats;
+            }
+            let d = decile.min(9);
+            self.deciles[e][d] += nats;
+            if e == 0 {
+                self.decile_n[d] += 1.0;
+            }
+            best = best.min(nats);
+        }
+        best
+    }
+
+    pub fn best(&self) -> (f64, f64) {
+        let mut b = (f64::INFINITY, self.etas[0]);
+        for (e, &n) in self.nats.iter().enumerate() {
+            if n < b.0 {
+                b = (n, self.etas[e]);
+            }
+        }
+        b
+    }
+
+    pub fn best_tail(&self) -> f64 {
+        self.tail.iter().copied().fold(f64::INFINITY, f64::min)
+    }
+
+    pub fn best_curve(&self) -> Vec<f64> {
+        let mut b = (f64::INFINITY, 0usize);
+        for (e, &n) in self.nats.iter().enumerate() {
+            if n < b.0 {
+                b = (n, e);
+            }
+        }
+        self.deciles[b.1]
+            .iter()
+            .zip(&self.decile_n)
+            .map(|(s, n)| {
+                if *n > 0.0 {
+                    s / n * std::f64::consts::LOG2_E
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect()
+    }
+}
+
+/// Either arm, behind one interface, so the protocol and the metrics cannot
+/// differ between them by accident.
+enum Arm {
+    Node(Box<LadderNode>, Vec<f64>, usize),
+    Ffn(Box<RotaryContext>),
+}
+
+impl Arm {
+    fn build(cfg: &Config, rng: &mut Rng) -> Self {
+        if cfg.node {
+            let d = cfg.d_model;
+            let mut codes = vec![0.0; cfg.vocab * d];
+            for tok in 0..cfg.vocab {
+                rng.fill_unit_vector(&mut codes[tok * d..(tok + 1) * d]);
+            }
+            let g1 = 1.0 / cfg.domain_span.max(1) as f64;
+            Arm::Node(
+                Box::new(LadderNode::new(cfg.vocab, d, cfg.node_rungs, g1)),
+                codes,
+                d,
+            )
+        } else {
+            let mut m = RotaryContext::new(cfg, rng);
+            let g1 = cfg
+                .consolidate_g1
+                .unwrap_or(1.0 / cfg.domain_span.max(1) as f64);
+            m.rebuild_head(
+                cfg.consolidate,
+                g1,
+                cfg.experts,
+                cfg.gate_on_state,
+                &mut Rng::new(cfg.seed ^ 0xC0FFEE),
+            );
+            Arm::Ffn(Box::new(m))
+        }
+    }
+
+    fn observe_at(&mut self, tok: u32, in_tail: bool, decile: usize, prev: Option<u32>) -> f64 {
+        match self {
+            Arm::Node(n, codes, d) => {
+                let key: Vec<f64> = match prev {
+                    Some(p) => codes[p as usize * *d..(p as usize + 1) * *d].to_vec(),
+                    None => vec![0.0; *d],
+                };
+                n.observe_at(&key, tok, in_tail, decile)
+            }
+            Arm::Ffn(m) => m.observe_at(tok, in_tail, decile),
+        }
+    }
+
+    fn label(&self, cfg: &Config) -> String {
+        match self {
+            Arm::Node(n, _, _) => format!(
+                "single ladder node, {} rungs, {} parameters",
+                n.rungs(),
+                n.parameters()
+            ),
+            Arm::Ffn(m) => format!(
+                "ffn head, {} rungs on the weights, {} experts, {} parameters",
+                m.head_rungs(),
+                cfg.experts,
+                m.parameters()
+            ),
+        }
+    }
+
+    fn best(&self) -> (f64, f64) {
+        match self {
+            Arm::Node(n, _, _) => n.best(),
+            Arm::Ffn(m) => m.best(),
+        }
+    }
+
+    fn best_curve(&self) -> Vec<f64> {
+        match self {
+            Arm::Node(n, _, _) => n.best_curve(),
+            Arm::Ffn(m) => m.best_curve(),
+        }
+    }
+
+    fn best_tail(&self) -> f64 {
+        match self {
+            Arm::Node(n, _, _) => n.best_tail(),
+            Arm::Ffn(m) => m.best_tail(),
+        }
+    }
+
+    /// Which expert the last token used; the node arm has exactly one.
+    fn last_expert(&self) -> usize {
+        match self {
+            Arm::Node(..) => 0,
+            Arm::Ffn(m) => m.last_expert(),
+        }
+    }
+
+    /// Mean norms of the two input halves. Printed on every run so an
+    /// imbalance like the one that invalidated §10.1 is visible at the time
+    /// rather than discovered a day later.
+    fn mean_norms(&self) -> (f64, f64) {
+        match self {
+            Arm::Node(..) => (0.0, 1.0),
+            Arm::Ffn(m) => m.mean_norms(),
+        }
+    }
+
+    fn expert_shares(&self) -> Vec<f64> {
+        match self {
+            Arm::Node(..) => vec![1.0],
+            Arm::Ffn(m) => m.expert_shares(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub tokens: usize,
@@ -232,6 +476,15 @@ pub struct Config {
     pub experts: usize,
     /// Route on the state half only, not on the current token's code.
     pub gate_on_state: bool,
+    /// How many strides wide each domain's alphabet window is. 1.0 is disjoint
+    /// windows, `domains` is a fully shared alphabet, between the two they
+    /// overlap.
+    pub domain_width: f64,
+    /// Run the single ladder node instead of the FFN head. The three arms of
+    /// the stripped-down comparison are `--node`, `--consolidate m`, and
+    /// neither.
+    pub node: bool,
+    pub node_rungs: usize,
 }
 
 impl Config {
@@ -272,18 +525,23 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         _ => panic!("--corpus and --tokenizer go together"),
     };
 
-    let mut model = RotaryContext::new(cfg, &mut rng);
+    let mut model = Arm::build(cfg, &mut rng);
 
     let started = std::time::Instant::now();
+    let mut prev: Option<u32> = None;
     for (i, &tok) in stream.iter().enumerate() {
-        model.observe_at(tok, i * 10 >= stream.len() * 9, i * 10 / stream.len());
+        model.observe_at(tok, i * 10 >= stream.len() * 9, i * 10 / stream.len(), prev);
+        prev = Some(tok);
     }
     let elapsed = started.elapsed();
     let nats_to_bits = std::f64::consts::LOG2_E;
     let (total, rate) = model.best();
     let tail_count = (stream.len() / 10).max(1) as f64;
 
-    let arm = if !cfg.memory {
+    let arm_name = model.label(cfg);
+    let arm = if cfg.node {
+        "single ladder node    (nonlinear local write, no backprop)"
+    } else if !cfg.memory {
         "current token only     (order-1 through our own head)"
     } else {
         match (cfg.addressing, cfg.ladder) {
@@ -296,25 +554,18 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
 
     println!();
     println!("=== {arm} ===");
+    println!("  {arm_name}");
     println!(
-        "  vocab={} d={} hidden={} horizon={} rungs={} spacing={:?}",
-        cfg.vocab,
-        cfg.d_model,
-        cfg.hidden,
-        cfg.horizon,
-        model.rungs(),
-        cfg.spacing()
-    );
-    println!(
-        "  trained parameters={}  fixed state={}",
-        model.parameters(),
-        model.fixed_state()
+        "  vocab={} d={} hidden={} horizon={}",
+        cfg.vocab, cfg.d_model, cfg.hidden, cfg.horizon
     );
     println!(
         "  {:.2} s, {:.0} tokens/s",
         elapsed.as_secs_f64(),
         stream.len() as f64 / elapsed.as_secs_f64()
     );
+    let (ns, nc) = model.mean_norms();
+    println!("  mean input norm: state {ns:.3}, current-token code {nc:.3}");
     println!();
     println!("loss, bits per token");
     println!(
@@ -322,8 +573,6 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         "last decile",
         model.best_tail() / tail_count * nats_to_bits
     );
-    let (ns, nc) = model.mean_norms();
-    println!("  mean input norm: state {ns:.3}, current-token code {nc:.3}");
     println!(
         "  learning curve, bits per token by decile:\n    {}",
         model
@@ -368,7 +617,18 @@ fn retention(cfg: &Config) -> std::io::Result<()> {
     // monotonically, which looks like retention but is only convergence to an
     // average. Real non-stationarity announces itself in the content. Disjoint
     // slices are the smallest change that restores that.
-    let width = (cfg.vocab / d).max(2);
+    // Overlapping alphabet windows, and the overlap is the whole point.
+    //
+    // The hypothesis needs two things at once and the first three protocols
+    // each supplied exactly one. A shared alphabet gives interference, so
+    // forgetting happens, but every domain looks identical from its content and
+    // routing separates nothing -- measured expert-domain purity 0.157 against
+    // a chance of 0.125. Disjoint alphabets give a perfect content signature
+    // and no interference, so eight domains coexist and there is nothing to
+    // forget. Sliding windows that overlap give both: the overlap is where
+    // domains collide, the rest is what tells them apart.
+    let stride = (cfg.vocab / d).max(1);
+    let width = ((stride as f64 * cfg.domain_width).round() as usize).clamp(2, cfg.vocab);
     let mut sources: Vec<crate::run::MarkovSource> = (0..d)
         .map(|_| {
             crate::run::MarkovSource::new(width, cfg.order, cfg.fanout.min(width - 1), &mut rng)
@@ -378,20 +638,11 @@ fn retention(cfg: &Config) -> std::io::Result<()> {
     let stream: Vec<u32> = (0..cfg.tokens)
         .map(|i| {
             let dom = (i / span) % d;
-            sources[dom].next(&mut draw) + (dom * width) as u32
+            ((sources[dom].next(&mut draw) as usize + dom * stride) % cfg.vocab) as u32
         })
         .collect();
 
-    let mut model = RotaryContext::new(cfg, &mut rng);
-    // Derived, not tuned: rung 1 holds a visit's worth of learning.
-    let g1 = cfg.consolidate_g1.unwrap_or(1.0 / span as f64);
-    model.rebuild_head(
-        cfg.consolidate,
-        g1,
-        cfg.experts,
-        cfg.gate_on_state,
-        &mut Rng::new(cfg.seed ^ 0xC0FFEE),
-    );
+    let mut model = Arm::build(cfg, &mut rng);
 
     // Two probes per visit, and the *gap* between them is the measurement.
     //
@@ -418,8 +669,10 @@ fn retention(cfg: &Config) -> std::io::Result<()> {
     // never having tested the claim.
     let mut joint = vec![vec![0.0f64; d]; cfg.experts];
     let started = std::time::Instant::now();
+    let mut prev: Option<u32> = None;
     for (i, &tok) in stream.iter().enumerate() {
-        let nats = model.observe(tok, i * 10 >= stream.len() * 9);
+        let nats = model.observe_at(tok, i * 10 >= stream.len() * 9, i * 10 / stream.len(), prev);
+        prev = Some(tok);
         let dom = (i / span) % d;
         joint[model.last_expert()][dom] += 1.0;
         let visit = i / (span * d);
@@ -439,8 +692,8 @@ fn retention(cfg: &Config) -> std::io::Result<()> {
 
     println!();
     println!(
-        "=== retention over {d} domains, span {span}, {} rungs on the head (g1={g1:.2e}) ===",
-        model.head_rungs()
+        "=== retention over {d} domains, span {span} ===\n  {}",
+        model.label(cfg)
     );
     println!(
         "  vocab={} order={} tokens={} memory={}",
@@ -490,8 +743,13 @@ fn retention(cfg: &Config) -> std::io::Result<()> {
         }
     }
     println!();
+    println!(
+        "  alphabet: {width} symbols per domain, stride {stride}, {} shared with the neighbour",
+        width.saturating_sub(stride)
+    );
+    println!();
     println!("bits per token over the first and last {probe} tokens of each visit");
-    println!("  visit   re-entry   settled       gap  <- the gap is the forgetting");
+    println!("  visit   re-entry   settled       gap  <- read the trajectory, not the last row");
     for v in 0..visits {
         let (n, m) = (
             counts[v].iter().sum::<f64>(),
@@ -542,6 +800,9 @@ mod tests {
                 consolidate_g1: None,
                 experts: 1,
                 gate_on_state: false,
+                domain_width: 1.0,
+                node: false,
+                node_rungs: 8,
                 linear_spacing: false,
                 order: 2,
                 fanout: 3,
@@ -564,7 +825,7 @@ mod tests {
                     s.next_below(vocab as u64) as u32
                 };
                 past.push(tok);
-                let nats = m.observe(tok, i * 10 >= n * 9);
+                let nats = m.observe_at(tok, i * 10 >= n * 9, 0);
                 if i * 10 >= n * 9 {
                     tail += nats;
                 }
