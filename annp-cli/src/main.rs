@@ -257,6 +257,11 @@ enum Command {
         /// timescales we have not thought of. Costs memory, not forward compute.
         #[arg(long, default_value_t = 8)]
         node_rungs: usize,
+        /// Geometric ratio of the node's ladder. E0-b found r=8 with three
+        /// rungs matched r=2 with eight, on three times the memory rather than
+        /// eight, and recalled more overall.
+        #[arg(long, default_value_t = 2.0)]
+        node_r: f64,
         #[arg(long, default_value_t = 2)]
         order: usize,
         #[arg(long, default_value_t = 3)]
@@ -542,6 +547,7 @@ fn main() -> std::io::Result<()> {
             domain_width,
             node,
             node_rungs,
+            node_r,
             order,
             fanout,
             seed,
@@ -567,6 +573,7 @@ fn main() -> std::io::Result<()> {
                 domain_width,
                 node,
                 node_rungs,
+                node_r,
                 linear_spacing,
                 order,
                 fanout,

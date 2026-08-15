@@ -228,13 +228,22 @@ pub struct LadderNode {
 }
 
 impl LadderNode {
-    pub fn new(vocab: usize, in_dim: usize, rungs: usize, g1: f64) -> Self {
+    pub fn new(vocab: usize, in_dim: usize, rungs: usize, r: f64, g1: f64) -> Self {
         let etas = vec![0.003, 0.01, 0.03, 0.1];
-        let schedule = annp_core::ladder::Schedule::Geometric { r: 2.0, g1 };
+        let schedule = annp_core::ladder::Schedule::Geometric { r, g1 };
         Self {
             mem: (0..etas.len())
                 .map(|_| {
-                    annp_core::ladder::AssocMemory::ladder_rect(vocab, in_dim, schedule, rungs)
+                    // `rungs == 1` is the honest no-consolidation control: a
+                    // single matrix with no diffusion at all. `rungs == 2` is
+                    // not that -- rung 1 still leaks into rung 2 -- so using it
+                    // as the control would compare a short ladder against a
+                    // long one and call the difference "the ladder".
+                    if rungs <= 1 {
+                        annp_core::ladder::AssocMemory::single_rect(vocab, in_dim, 1.0)
+                    } else {
+                        annp_core::ladder::AssocMemory::ladder_rect(vocab, in_dim, schedule, rungs)
+                    }
                 })
                 .collect(),
             nats: vec![0.0; etas.len()],
@@ -259,13 +268,14 @@ impl LadderNode {
     /// expressiveness -- only rung 1 is read -- so they are not parameters in
     /// the usual sense, but they are not free either.
     pub fn state(&self) -> usize {
-        self.vocab * self.in_dim * self.rungs
+        self.vocab * self.in_dim * self.rungs.max(1)
     }
 
     /// Multiply-accumulates per token: read, write and one diffusion step per
     /// rung, for every raced rate.
     pub fn cost(&self) -> usize {
-        self.etas.len() * (2 + self.rungs) * self.vocab * self.in_dim
+        let diffusion = if self.rungs <= 1 { 0 } else { self.rungs };
+        self.etas.len() * (2 + diffusion) * self.vocab * self.in_dim
     }
 
     pub fn rungs(&self) -> usize {
@@ -364,7 +374,13 @@ impl Arm {
             }
             let g1 = 1.0 / cfg.domain_span.max(1) as f64;
             Arm::Node(
-                Box::new(LadderNode::new(cfg.vocab, d, cfg.node_rungs, g1)),
+                Box::new(LadderNode::new(
+                    cfg.vocab,
+                    d,
+                    cfg.node_rungs,
+                    cfg.node_r,
+                    g1,
+                )),
                 codes,
                 d,
             )
@@ -415,7 +431,9 @@ impl Arm {
 
     fn label(&self, cfg: &Config) -> String {
         match self {
-            Arm::Node(n, _, _) => format!("single ladder node, {} rungs", n.rungs()),
+            Arm::Node(n, _, _) => {
+                format!("single ladder node, {} rungs, r={}", n.rungs(), cfg.node_r)
+            }
             Arm::Ffn(m) => format!(
                 "ffn head, {} rungs on the weights, {} experts",
                 m.head_rungs(),
@@ -514,6 +532,11 @@ pub struct Config {
     /// neither.
     pub node: bool,
     pub node_rungs: usize,
+    /// Geometric ratio of the node's ladder. Not 2 by default any more: E0-b
+    /// measured `r=8, m=3` reaching the same usable rank as `r=2, m=8` on three
+    /// rungs instead of eight, with the best total recall of anything tried.
+    /// The 2 that was hardcoded here came from other code, not from that result.
+    pub node_r: f64,
 }
 
 impl Config {
@@ -836,6 +859,7 @@ mod tests {
                 domain_width: 1.0,
                 node: false,
                 node_rungs: 8,
+                node_r: 2.0,
                 linear_spacing: false,
                 order: 2,
                 fanout: 3,
