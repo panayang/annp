@@ -238,7 +238,10 @@ impl LadderNode {
         // that region. The old range topped out at 0.1 and every arm won there
         // -- all four sitting on the boundary, all four under-stepped, and the
         // comparison between them meaningless.
-        let etas = vec![0.01, 0.1, 0.3, 1.0];
+        // The delta rule's natural point is eta = 1 with a unit-norm key, but
+        // the first sweep that reached 1.0 still won there, so the range has to
+        // extend past it for the winner to be interior.
+        let etas = vec![0.01, 0.1, 0.3, 1.0, 3.0, 10.0];
         let schedule = annp_core::ladder::Schedule::Geometric { r, g1 };
         Self {
             mem: (0..etas.len())
@@ -349,8 +352,15 @@ impl LadderNode {
         r == self.etas[0] || r == self.etas[self.etas.len() - 1]
     }
 
+    /// Tail of the rate that won on total, matching the reported curve.
     pub fn best_tail(&self) -> f64 {
-        self.tail.iter().copied().fold(f64::INFINITY, f64::min)
+        let mut b = (f64::INFINITY, 0usize);
+        for (e, &n) in self.nats.iter().enumerate() {
+            if n < b.0 {
+                b = (n, e);
+            }
+        }
+        self.tail[b.1]
     }
 
     pub fn best_curve(&self) -> Vec<f64> {
@@ -867,15 +877,20 @@ mod tests {
     /// lag from any other and should not.
     #[test]
     fn a_fixed_lag_dependency_is_learned_only_with_addressing() {
+        // Vocabulary large enough that a bag of recent codes cannot give the
+        // answer away. At six symbols the identity arm nearly matched the
+        // addressed one once the learning rates were wide enough -- co-occurrence
+        // alone was almost sufficient, so the task never required knowing
+        // *which* lag, which is the only thing rotation supplies.
         let lag = 4usize;
-        let vocab = 6usize;
+        let vocab = 64usize;
         let build = |addressing: bool| {
             let mut rng = Rng::new(9);
             let cfg = Config {
                 tokens: 0,
                 vocab,
-                d_model: 64,
-                hidden: 32,
+                d_model: 128,
+                hidden: 64,
                 horizon: 128.0,
                 ladder: true,
                 addressing,

@@ -191,7 +191,10 @@ impl Head {
             experts >= 1 && hidden.is_multiple_of(experts),
             "hidden must divide by experts"
         );
-        let rates = vec![0.003, 0.01, 0.03, 0.1];
+        // Wide enough that the winner can be interior. A race whose optimum
+        // sits on an endpoint is not a race, and every arm of the first real
+        // text sweep won at the top of a set that stopped at 0.1.
+        let rates = vec![0.003, 0.01, 0.03, 0.1, 0.3, 1.0];
         let n = rates.len();
         let draw = |count: usize, sigma: f64, rng: &mut Rng| -> Vec<f64> {
             (0..count).map(|_| rng.next_normal() * sigma).collect()
@@ -502,7 +505,18 @@ impl Head {
         best
     }
 
+    /// Tail of the rate that won on *total* code length, not the smallest tail
+    /// across rates. Taking the minimum let the reported number come from a
+    /// different model than the reported curve, and picking whichever rate
+    /// happened to do best over the last tenth is fitting the headline to the
+    /// measurement.
     pub fn best_tail(&self) -> f64 {
-        self.tail.iter().copied().fold(f64::INFINITY, f64::min)
+        let mut b = (f64::INFINITY, 0usize);
+        for (r, &n) in self.nats.iter().enumerate() {
+            if n < b.0 {
+                b = (n, r);
+            }
+        }
+        self.tail[b.1]
     }
 }
