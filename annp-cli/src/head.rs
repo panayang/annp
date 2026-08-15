@@ -188,7 +188,7 @@ impl Head {
     ) -> Self {
         assert!(in_dim >= 1 && hidden >= 1 && vocab >= 1);
         assert!(
-            experts >= 1 && hidden % experts == 0,
+            experts >= 1 && hidden.is_multiple_of(experts),
             "hidden must divide by experts"
         );
         let rates = vec![0.003, 0.01, 0.03, 0.1];

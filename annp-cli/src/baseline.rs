@@ -82,10 +82,6 @@ impl WindowMlp {
     /// Charges `target` against the current weights, then updates. Returns the
     /// best rate's nats for this token, so the caller can report a stream that
     /// is comparable token by token.
-    pub fn observe(&mut self, target: u32, in_tail: bool) -> f64 {
-        self.observe_at(target, in_tail, 0)
-    }
-
     pub fn observe_at(&mut self, target: u32, in_tail: bool, decile: usize) -> f64 {
         let mut best = f64::INFINITY;
         for r in 0..self.head.num_rates() {
