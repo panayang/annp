@@ -74,12 +74,6 @@ impl RotaryContext {
         }
     }
 
-    /// Trained parameters only. The write codes are fixed, so they are state,
-    /// not parameters, and are reported separately rather than folded in.
-    pub fn parameters(&self) -> usize {
-        self.head.parameters()
-    }
-
     /// Predict, pay, then write. The write happens after every rate has been
     /// charged, so no rate ever sees the token it is being scored on.
     pub fn observe_at(&mut self, target: u32, in_tail: bool, decile: usize) -> f64 {
@@ -169,6 +163,16 @@ impl RotaryContext {
         self.head.rungs()
     }
 
+    /// Live parameters, total held state, multiply-accumulates per token.
+    /// Forward plus backward is about three passes over the weights, and a
+    /// consolidated head adds one diffusion step per rung.
+    pub fn resources(&self) -> (usize, usize, usize) {
+        let p = self.head.parameters();
+        let r = self.head.rungs();
+        let rates = self.head.num_rates();
+        (p, p * r, rates * (3 + r.saturating_sub(1)) * p)
+    }
+
     pub fn best(&self) -> (f64, f64) {
         self.head.best()
     }
@@ -246,8 +250,22 @@ impl LadderNode {
         }
     }
 
+    /// Live parameters: rung 1 alone, which is all the forward pass reads.
     pub fn parameters(&self) -> usize {
         self.vocab * self.in_dim
+    }
+
+    /// Everything held, rungs included. The deeper rungs add no forward
+    /// expressiveness -- only rung 1 is read -- so they are not parameters in
+    /// the usual sense, but they are not free either.
+    pub fn state(&self) -> usize {
+        self.vocab * self.in_dim * self.rungs
+    }
+
+    /// Multiply-accumulates per token: read, write and one diffusion step per
+    /// rung, for every raced rate.
+    pub fn cost(&self) -> usize {
+        self.etas.len() * (2 + self.rungs) * self.vocab * self.in_dim
     }
 
     pub fn rungs(&self) -> usize {
@@ -379,18 +397,29 @@ impl Arm {
         }
     }
 
+    /// Live parameters, everything held, and multiply-accumulates per token.
+    ///
+    /// One number cannot control this comparison. Matching on live parameters
+    /// makes the node and the ffn look equal at about 16.4k; the node then
+    /// holds eight times the state and costs five times the compute. Matching
+    /// on either of those instead would size the arms completely differently.
+    /// Quoting only the flattering one is how "matched parameters" became a
+    /// claim it could not support, so all three are printed and none is called
+    /// the control.
+    fn resources(&self) -> (usize, usize, usize) {
+        match self {
+            Arm::Node(n, _, _) => (n.parameters(), n.state(), n.cost()),
+            Arm::Ffn(m) => m.resources(),
+        }
+    }
+
     fn label(&self, cfg: &Config) -> String {
         match self {
-            Arm::Node(n, _, _) => format!(
-                "single ladder node, {} rungs, {} parameters",
-                n.rungs(),
-                n.parameters()
-            ),
+            Arm::Node(n, _, _) => format!("single ladder node, {} rungs", n.rungs()),
             Arm::Ffn(m) => format!(
-                "ffn head, {} rungs on the weights, {} experts, {} parameters",
+                "ffn head, {} rungs on the weights, {} experts",
                 m.head_rungs(),
-                cfg.experts,
-                m.parameters()
+                cfg.experts
             ),
         }
     }
@@ -555,6 +584,8 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     println!();
     println!("=== {arm} ===");
     println!("  {arm_name}");
+    let (live, held, cost) = model.resources();
+    println!("  live parameters {live}   state held {held}   MACs/token {cost}");
     println!(
         "  vocab={} d={} hidden={} horizon={}",
         cfg.vocab, cfg.d_model, cfg.hidden, cfg.horizon
@@ -695,6 +726,8 @@ fn retention(cfg: &Config) -> std::io::Result<()> {
         "=== retention over {d} domains, span {span} ===\n  {}",
         model.label(cfg)
     );
+    let (live, held, cost) = model.resources();
+    println!("  live parameters {live}   state held {held}   MACs/token {cost}");
     println!(
         "  vocab={} order={} tokens={} memory={}",
         cfg.vocab, cfg.order, cfg.tokens, cfg.memory
