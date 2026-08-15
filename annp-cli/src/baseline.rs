@@ -312,7 +312,7 @@ mod tests {
         let mut late = 0.0;
         for i in 0..6000 {
             let next = (last * 3 + 1) % vocab as u32;
-            let nats = m.observe(next, false);
+            let nats = m.observe_at(next, false, 0);
             if i < 500 {
                 early += nats;
             }
