@@ -237,6 +237,14 @@ enum Command {
         /// 1/domain_span so the fast rung holds one visit's learning.
         #[arg(long)]
         consolidate_g1: Option<f64>,
+        /// Split the hidden layer into this many content-routed groups, one
+        /// active per token. This is candidate B.
+        #[arg(long, default_value_t = 1)]
+        experts: usize,
+        /// Route on the context state only, so the gate reads something that
+        /// varies slowly and carries the domain.
+        #[arg(long)]
+        gate_on_state: bool,
         #[arg(long, default_value_t = 2)]
         order: usize,
         #[arg(long, default_value_t = 3)]
@@ -517,6 +525,8 @@ fn main() -> std::io::Result<()> {
             domain_span,
             consolidate,
             consolidate_g1,
+            experts,
+            gate_on_state,
             order,
             fanout,
             seed,
@@ -537,6 +547,8 @@ fn main() -> std::io::Result<()> {
                 domain_span,
                 consolidate,
                 consolidate_g1,
+                experts,
+                gate_on_state,
                 linear_spacing,
                 order,
                 fanout,

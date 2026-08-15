@@ -134,6 +134,29 @@ pub struct Head {
     /// `dL/dx` for the last `step`, taken against the pre-update `w1`. A front
     /// end with learned inputs applies this; one with fixed codes ignores it.
     pub(crate) gx: Vec<f64>,
+    /// Hidden units are split into this many contiguous groups and one group is
+    /// active per token. `1` is the dense head.
+    ///
+    /// This is the whole of candidate B, and it is small because the ladder is
+    /// already elementwise: separation does not need a ladder per expert, it
+    /// needs different domains to touch different weights. Routing is what
+    /// supplies that. `DESIGN-NEXT.md` §10.3 measured consolidation making
+    /// forgetting three times worse in a dense layer and explained it as
+    /// consolidation preserving whatever repeats -- which across interleaved
+    /// domains is the mixture. If that explanation is right, the ladder should
+    /// pay here and only here, and the prediction is an interaction, not a main
+    /// effect.
+    experts: usize,
+    /// `[expert][in_dim]`, fixed unit vectors. Routing is content-addressed and
+    /// unlearned: no gradient enters the gate, so the memory pathway keeps the
+    /// property that only the readout learns.
+    gate: Vec<f64>,
+    /// How often each expert won, so a collapsed gate is visible before any
+    /// loss is read. A gate that always picks one expert makes the routed arm a
+    /// dense arm with fewer units, and the comparison would mean nothing.
+    expert_use: Vec<f64>,
+    last_expert: usize,
+    gate_width: usize,
 }
 
 impl Head {
@@ -152,7 +175,22 @@ impl Head {
         consolidation: Option<(usize, f64)>,
         rng: &mut Rng,
     ) -> Self {
+        Self::routed(in_dim, hidden, vocab, consolidation, 1, rng)
+    }
+
+    pub fn routed(
+        in_dim: usize,
+        hidden: usize,
+        vocab: usize,
+        consolidation: Option<(usize, f64)>,
+        experts: usize,
+        rng: &mut Rng,
+    ) -> Self {
         assert!(in_dim >= 1 && hidden >= 1 && vocab >= 1);
+        assert!(
+            experts >= 1 && hidden % experts == 0,
+            "hidden must divide by experts"
+        );
         let rates = vec![0.003, 0.01, 0.03, 0.1];
         let n = rates.len();
         let draw = |count: usize, sigma: f64, rng: &mut Rng| -> Vec<f64> {
@@ -191,7 +229,64 @@ impl Head {
             gh: vec![0.0; hidden],
             gx: vec![0.0; in_dim],
             rates,
+            experts,
+            gate: {
+                let mut g = vec![0.0; experts * in_dim];
+                for e in 0..experts {
+                    let row = &mut g[e * in_dim..(e + 1) * in_dim];
+                    rng.fill_unit_vector(row);
+                }
+                g
+            },
+            expert_use: vec![0.0; experts],
+            last_expert: 0,
+            gate_width: in_dim,
         }
+    }
+
+    /// Share of tokens each expert won, most-used first.
+    pub fn expert_shares(&self) -> Vec<f64> {
+        let total: f64 = self.expert_use.iter().sum::<f64>().max(1.0);
+        let mut s: Vec<f64> = self.expert_use.iter().map(|u| u / total).collect();
+        s.sort_by(|a, b| b.total_cmp(a));
+        s
+    }
+
+    /// Which expert the last `step` routed to.
+    pub fn last_expert(&self) -> usize {
+        self.last_expert
+    }
+
+    /// Restrict the gate to the leading `w` inputs.
+    pub fn set_gate_width(&mut self, w: usize) {
+        assert!(w >= 1 && w <= self.in_dim);
+        self.gate_width = w;
+    }
+
+    /// Which expert this input routes to. Deterministic, unlearned, content
+    /// addressed: the nearest of `experts` fixed directions.
+    fn route(&self, x: &[f64]) -> usize {
+        if self.experts == 1 {
+            return 0;
+        }
+        let n = self.in_dim;
+        // `gate_width` lets the gate read only the leading part of the input.
+        // With the state first and the current token's code second, reading the
+        // state alone routes on something that varies slowly and carries the
+        // domain, instead of on a code that changes every token and scatters a
+        // single domain across every expert. Measured on the full input:
+        // expert-domain purity 0.253 against a chance of 0.125, so the
+        // separation the claim needs was barely there.
+        let w = self.gate_width.min(n);
+        (0..self.experts)
+            .map(|e| {
+                let row = &self.gate[e * n..e * n + w];
+                row.iter().zip(&x[..w]).map(|(a, b)| a * b).sum::<f64>()
+            })
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(e, _)| e)
+            .unwrap()
     }
 
     pub fn num_rates(&self) -> usize {
@@ -264,9 +359,17 @@ impl Head {
     pub fn step(&mut self, r: usize, x: &[f64], target: u32) -> f64 {
         assert_eq!(x.len(), self.in_dim, "head: input width mismatch");
         let (hid, v, n_in) = (self.hidden, self.vocab, self.in_dim);
+        let expert = self.route(x);
+        let group = hid / self.experts;
+        let (lo, hi) = (expert * group, expert * group + group);
+        if r == 0 {
+            self.expert_use[expert] += 1.0;
+        }
+        self.last_expert = expert;
+        self.h.iter_mut().for_each(|v| *v = 0.0);
         {
             let w1 = self.w1.live(r);
-            for j in 0..hid {
+            for j in lo..hi {
                 let row = &w1[j * n_in..(j + 1) * n_in];
                 let z: f64 = row.iter().zip(x).map(|(a, b)| a * b).sum::<f64>() + self.b1[r][j];
                 self.h[j] = z.tanh();
@@ -275,9 +378,13 @@ impl Head {
         {
             let w2 = self.w2.live(r);
             for n in 0..v {
-                let row = &w2[n * hid..(n + 1) * hid];
-                self.logits[n] =
-                    row.iter().zip(&self.h).map(|(a, b)| a * b).sum::<f64>() + self.b2[r][n];
+                let row = &w2[n * hid + lo..n * hid + hi];
+                self.logits[n] = row
+                    .iter()
+                    .zip(&self.h[lo..hi])
+                    .map(|(a, b)| a * b)
+                    .sum::<f64>()
+                    + self.b2[r][n];
             }
         }
         let peak = self
@@ -306,9 +413,9 @@ impl Head {
                 if g == 0.0 {
                     continue;
                 }
-                let row = &mut w2[n * hid..(n + 1) * hid];
-                for (j, (weight, &hv)) in row.iter_mut().zip(h).enumerate() {
-                    gh[j] += g * *weight;
+                let row = &mut w2[n * hid + lo..n * hid + hi];
+                for (j, (weight, &hv)) in row.iter_mut().zip(&h[lo..hi]).enumerate() {
+                    gh[lo + j] += g * *weight;
                     *weight -= lr * g * hv;
                 }
             }
@@ -322,7 +429,7 @@ impl Head {
         self.gx.iter_mut().for_each(|g| *g = 0.0);
         {
             let (w1, h, gh, gx) = (self.w1.live(r), &self.h, &self.gh, &mut self.gx);
-            for j in 0..hid {
+            for j in lo..hi {
                 let gz = gh[j] * (1.0 - h[j] * h[j]);
                 if gz == 0.0 {
                     continue;
@@ -336,7 +443,7 @@ impl Head {
                 }
             }
         }
-        for j in 0..hid {
+        for j in lo..hi {
             let gz = self.gh[j] * (1.0 - self.h[j] * self.h[j]);
             if gz != 0.0 {
                 self.b1[r][j] -= lr * gz;

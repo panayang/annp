@@ -142,16 +142,39 @@ impl RotaryContext {
 
     /// Replace the head with one whose weights sit on a consolidation ladder.
     /// Done after construction so the two arms draw identical initial weights.
-    pub fn consolidate(&mut self, rungs: Option<usize>, g1: f64, rng: &mut Rng) {
-        if let Some(m) = rungs {
-            self.head = Head::with_consolidation(
-                self.head.in_dim(),
-                self.head.hidden(),
-                self.vocab,
-                Some((m, g1)),
-                rng,
-            );
+    /// Rebuild the head with consolidation and/or routing. Done after
+    /// construction so every arm of the 2x2 draws the same initial weights from
+    /// the same point in the stream.
+    pub fn rebuild_head(
+        &mut self,
+        rungs: Option<usize>,
+        g1: f64,
+        experts: usize,
+        gate_on_state: bool,
+        rng: &mut Rng,
+    ) {
+        if rungs.is_none() && experts == 1 {
+            return;
         }
+        self.head = Head::routed(
+            self.head.in_dim(),
+            self.head.hidden(),
+            self.vocab,
+            rungs.map(|m| (m, g1)),
+            experts,
+            rng,
+        );
+        if gate_on_state {
+            self.head.set_gate_width(self.ctx.width());
+        }
+    }
+
+    pub fn expert_shares(&self) -> Vec<f64> {
+        self.head.expert_shares()
+    }
+
+    pub fn last_expert(&self) -> usize {
+        self.head.last_expert()
     }
 
     pub fn head_rungs(&self) -> usize {
@@ -205,6 +228,10 @@ pub struct Config {
     /// Rung 1's conductance. Its inverse is the leak time, which must be long
     /// enough to hold what one visit teaches. Defaults to `1 / domain_span`.
     pub consolidate_g1: Option<f64>,
+    /// Hidden units split into this many content-routed groups. 1 is dense.
+    pub experts: usize,
+    /// Route on the state half only, not on the current token's code.
+    pub gate_on_state: bool,
 }
 
 impl Config {
@@ -358,7 +385,13 @@ fn retention(cfg: &Config) -> std::io::Result<()> {
     let mut model = RotaryContext::new(cfg, &mut rng);
     // Derived, not tuned: rung 1 holds a visit's worth of learning.
     let g1 = cfg.consolidate_g1.unwrap_or(1.0 / span as f64);
-    model.consolidate(cfg.consolidate, g1, &mut Rng::new(cfg.seed ^ 0xC0FFEE));
+    model.rebuild_head(
+        cfg.consolidate,
+        g1,
+        cfg.experts,
+        cfg.gate_on_state,
+        &mut Rng::new(cfg.seed ^ 0xC0FFEE),
+    );
 
     // Two probes per visit, and the *gap* between them is the measurement.
     //
@@ -379,10 +412,16 @@ fn retention(cfg: &Config) -> std::io::Result<()> {
     let mut counts = vec![vec![0.0f64; d]; visits];
     let mut settled = vec![vec![0.0f64; d]; visits];
     let mut settled_n = vec![vec![0.0f64; d]; visits];
+    // Expert x domain. A spread gate is not the same as a gate that separates
+    // *domains*, and only the second is what the hypothesis needs. Checking the
+    // first and not the second is how a run can look like a refutation while
+    // never having tested the claim.
+    let mut joint = vec![vec![0.0f64; d]; cfg.experts];
     let started = std::time::Instant::now();
     for (i, &tok) in stream.iter().enumerate() {
         let nats = model.observe(tok, i * 10 >= stream.len() * 9);
         let dom = (i / span) % d;
+        joint[model.last_expert()][dom] += 1.0;
         let visit = i / (span * d);
         if visit < visits {
             if i % span < probe {
@@ -412,6 +451,44 @@ fn retention(cfg: &Config) -> std::io::Result<()> {
         elapsed.as_secs_f64(),
         stream.len() as f64 / elapsed.as_secs_f64()
     );
+    println!();
+    // Self-check before any loss is read. A gate that always picks the same
+    // expert turns the routed arm into a narrower dense arm, and the whole
+    // comparison would be meaningless without this being visible.
+    let shares = model.expert_shares();
+    println!(
+        "  expert usage, most-used first: {}",
+        shares
+            .iter()
+            .take(8)
+            .map(|s| format!("{:.3}", s))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    if cfg.experts > 1 && shares[0] > 0.9 {
+        println!("  !! gate collapsed onto one expert -- routed arm is not routed");
+    }
+    if cfg.experts > 1 {
+        // Mean over experts of the largest domain share inside that expert.
+        // 1/domains means the expert sees every domain equally and separates
+        // nothing; 1.0 means each expert belongs to one domain.
+        let purity: f64 = joint
+            .iter()
+            .filter(|row| row.iter().sum::<f64>() > 0.0)
+            .map(|row| {
+                let tot: f64 = row.iter().sum();
+                row.iter().fold(0.0f64, |m, v| m.max(*v)) / tot
+            })
+            .sum::<f64>()
+            / joint.iter().filter(|r| r.iter().sum::<f64>() > 0.0).count() as f64;
+        println!(
+            "  expert-domain purity: {purity:.3}  (chance {:.3}, 1.000 = one domain per expert)",
+            1.0 / d as f64
+        );
+        if purity < 2.0 / d as f64 {
+            println!("  !! routing is not separating domains -- this run cannot test the claim");
+        }
+    }
     println!();
     println!("bits per token over the first and last {probe} tokens of each visit");
     println!("  visit   re-entry   settled       gap  <- the gap is the forgetting");
@@ -463,6 +540,8 @@ mod tests {
                 domain_span: 4000,
                 consolidate: None,
                 consolidate_g1: None,
+                experts: 1,
+                gate_on_state: false,
                 linear_spacing: false,
                 order: 2,
                 fanout: 3,
