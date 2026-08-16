@@ -202,6 +202,9 @@ enum Command {
         /// Run the online EWC control instead of the tree.
         #[arg(long)]
         ewc: bool,
+        /// Print the source diagnostic and stop.
+        #[arg(long)]
+        source_only: bool,
         #[arg(long, default_value_t = 20_260_816)]
         seed: u64,
         #[arg(long, default_value = "results/grow")]
@@ -563,6 +566,7 @@ fn main() -> std::io::Result<()> {
             ladder_r,
             eta,
             ewc,
+            source_only,
             seed,
             out,
         } => grow::run(
@@ -581,6 +585,7 @@ fn main() -> std::io::Result<()> {
                 ladder_r,
                 eta,
                 ewc,
+                source_only,
                 seed,
             },
             &out,

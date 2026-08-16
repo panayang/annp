@@ -217,6 +217,9 @@ pub struct Config {
     pub ladder_r: f64,
     pub eta: f64,
     pub ewc: bool,
+    /// Print the source diagnostic and stop. The tilt trade-off is a property
+    /// of the source alone, so measuring it should not cost a model run.
+    pub source_only: bool,
     pub seed: u64,
 }
 
@@ -271,6 +274,55 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     );
     if (s_head - s_tail).abs() > 0.35 {
         println!("  !! head and tail exponents disagree -- this is not a clean power law");
+    }
+
+    // The other half of the tilt trade-off. A tilt small enough to leave the
+    // marginal a clean power law also leaves the conditional uninformative, and
+    // then the current symbol says nothing about the next one -- a source with
+    // a beautiful exponent and no task in it. Both numbers have to be read
+    // together, so both are printed together.
+    {
+        let v = cfg.vocab;
+        let mut uni = vec![0.0f64; v];
+        let mut joint = vec![0.0f64; v * v];
+        for w in stream.windows(2) {
+            uni[w[0] as usize] += 1.0;
+            joint[w[0] as usize * v + w[1] as usize] += 1.0;
+        }
+        let n: f64 = uni.iter().sum();
+        let mut marg = vec![0.0f64; v];
+        for &tok in &stream[1..] {
+            marg[tok as usize] += 1.0;
+        }
+        let h1: f64 = marg
+            .iter()
+            .filter(|c| **c > 0.0)
+            .map(|c| {
+                let p = c / n;
+                -p * p.log2()
+            })
+            .sum();
+        let mut h2 = 0.0;
+        for a in 0..v {
+            if uni[a] <= 0.0 {
+                continue;
+            }
+            let pa = uni[a] / n;
+            let row = &joint[a * v..(a + 1) * v];
+            let mut inner = 0.0;
+            for c in row.iter().filter(|c| **c > 0.0) {
+                let p = c / uni[a];
+                inner -= p * p.log2();
+            }
+            h2 += pa * inner;
+        }
+        println!(
+            "  entropy: marginal {h1:.3} bits, conditional {h2:.3} bits, mutual information {:.3}",
+            h1 - h2
+        );
+    }
+    if cfg.source_only {
+        return Ok(());
     }
 
     let mut codes = vec![0.0; cfg.vocab * cfg.d_model];
