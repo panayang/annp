@@ -13,3 +13,4 @@ pub mod model;
 pub mod node;
 pub mod rng;
 pub mod runtime;
+pub mod tree;

@@ -7,6 +7,7 @@
 mod baseline;
 mod corpus;
 mod e0;
+mod grow;
 mod head;
 mod next;
 
@@ -158,6 +159,52 @@ enum Command {
         #[arg(long, default_value_t = 20_260_806)]
         seed: u64,
         #[arg(long, default_value = "results/e0")]
+        out: PathBuf,
+    },
+    /// The growing tree of nodes on a synthetic Zipf source, with an online
+    /// EWC control. See DESIGN-TREE.md.
+    Grow {
+        #[arg(long, default_value_t = 200_000)]
+        tokens: usize,
+        #[arg(long, default_value_t = 256)]
+        vocab: usize,
+        /// Kept small on purpose: slicing was dropped in favour of lowering the
+        /// source dimension, so one path carries the whole input.
+        #[arg(long, default_value_t = 32)]
+        d_model: usize,
+        #[arg(long, default_value_t = 8)]
+        domains: usize,
+        #[arg(long, default_value_t = 3000)]
+        domain_span: usize,
+        /// Window width in strides. 1 is disjoint, `domains` is fully shared;
+        /// between the two the domains overlap, which is what gives both
+        /// interference and a content signature.
+        #[arg(long, default_value_t = 2.0)]
+        domain_width: f64,
+        #[arg(long, default_value_t = 1.0)]
+        zipf_s: f64,
+        /// State-dependent tilt on the Zipf marginal; zero makes the current
+        /// symbol uninformative.
+        #[arg(long, default_value_t = 1.0)]
+        tilt: f64,
+        #[arg(long, default_value_t = 2)]
+        fanout: usize,
+        /// Depth bounds compute per token and, with fanout, the node count.
+        #[arg(long, default_value_t = 6)]
+        depth: usize,
+        /// Ladder rungs per node. Swept on the whole tree, not on one node.
+        #[arg(long, default_value_t = 4)]
+        rungs: usize,
+        #[arg(long, default_value_t = 2.0)]
+        ladder_r: f64,
+        #[arg(long, default_value_t = 0.3)]
+        eta: f64,
+        /// Run the online EWC control instead of the tree.
+        #[arg(long)]
+        ewc: bool,
+        #[arg(long, default_value_t = 20_260_816)]
+        seed: u64,
+        #[arg(long, default_value = "results/grow")]
         out: PathBuf,
     },
     /// A learned baseline on the same stream and the same protocol, so the
@@ -501,6 +548,43 @@ fn main() -> std::io::Result<()> {
             };
             e0::run(&cfg, &out)
         }
+        Command::Grow {
+            tokens,
+            vocab,
+            d_model,
+            domains,
+            domain_span,
+            domain_width,
+            zipf_s,
+            tilt,
+            fanout,
+            depth,
+            rungs,
+            ladder_r,
+            eta,
+            ewc,
+            seed,
+            out,
+        } => grow::run(
+            &grow::Config {
+                tokens,
+                vocab,
+                d_model,
+                domains,
+                domain_span,
+                domain_width,
+                zipf_s,
+                tilt,
+                fanout,
+                depth,
+                rungs,
+                ladder_r,
+                eta,
+                ewc,
+                seed,
+            },
+            &out,
+        ),
         Command::Baseline {
             tokens,
             vocab,
