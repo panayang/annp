@@ -243,11 +243,11 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         .collect();
 
     // Verify the shape instead of assuming it.
-    let mut counts = vec![0.0f64; cfg.vocab];
+    let mut counts_by_id = vec![0.0f64; cfg.vocab];
     for &t in &stream {
-        counts[t as usize] += 1.0;
+        counts_by_id[t as usize] += 1.0;
     }
-    let mut ranked: Vec<f64> = counts.into_iter().filter(|c| *c > 0.0).collect();
+    let mut ranked: Vec<f64> = counts_by_id.iter().copied().filter(|c| *c > 0.0).collect();
     ranked.sort_by(|a, b| b.total_cmp(a));
     let total: f64 = ranked.iter().sum();
     let upper = ranked.len().min(1000);
@@ -353,6 +353,37 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
     // Re-entry cost against the settled cost of the same visit. Absolute
     // re-entry alone cannot be read: it falls as the model improves at
     // everything, which looks like retention and is not.
+    // Loss stratified by the target's global rank.
+    //
+    // A Zipf marginal puts most of the mass in the head, so an aggregate bits
+    // per token is very nearly a measurement of the head alone. The ladder's
+    // mechanism is protecting rare items from being overwritten by frequent
+    // ones, which is a tail effect by construction, and E0-b's win was reported
+    // as a tail metric -- usable rank 205 against 96, recall over ranks 22-45 of
+    // 99% against 61%. Judging it on an average was judging it where it does
+    // not act. Bands are log spaced because the distribution is.
+    let mut rank_of = vec![0usize; cfg.vocab];
+    {
+        let mut order: Vec<(usize, f64)> = counts_by_id.iter().copied().enumerate().collect();
+        order.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (r, (id, _)) in order.into_iter().enumerate() {
+            rank_of[id] = r + 1;
+        }
+    }
+    let band_of = |id: u32| -> usize {
+        match rank_of[id as usize] {
+            0..=4 => 0,
+            5..=16 => 1,
+            17..=64 => 2,
+            _ => 3,
+        }
+    };
+    const BANDS: usize = 4;
+    const BAND_NAME: [&str; BANDS] = ["rank 1-4", "rank 5-16", "rank 17-64", "rank 65+"];
+    let (mut band_s, mut band_n) = ([0.0f64; BANDS], [0.0f64; BANDS]);
+    let (mut band_re, mut band_re_n) = ([0.0f64; BANDS], [0.0f64; BANDS]);
+    let (mut band_se, mut band_se_n) = ([0.0f64; BANDS], [0.0f64; BANDS]);
+
     let probe = (span / 50).clamp(1, 64);
     let visits = cfg.tokens / (span * d_count) + 1;
     let (mut reentry, mut re_n) = (vec![0.0f64; visits], vec![0.0f64; visits]);
@@ -369,14 +400,21 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             Arm::Ewc(e) => e.observe(key, tok),
         };
         prev = Some(tok);
+        let b = band_of(tok);
+        band_s[b] += nats;
+        band_n[b] += 1.0;
         let visit = i / (span * d_count);
         if visit < visits {
             if i % span < probe {
                 reentry[visit] += nats;
                 re_n[visit] += 1.0;
+                band_re[b] += nats;
+                band_re_n[b] += 1.0;
             } else if i % span >= span - probe {
                 settled[visit] += nats;
                 se_n[visit] += 1.0;
+                band_se[b] += nats;
+                band_se_n[b] += 1.0;
             }
         }
     }
@@ -436,6 +474,36 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         elapsed.as_secs_f64(),
         stream.len() as f64 / elapsed.as_secs_f64()
     );
+    println!();
+    println!("  band          share   overall   re-entry   settled       gap");
+    for b in 0..BANDS {
+        if band_n[b] < 1.0 {
+            continue;
+        }
+        let share = 100.0 * band_n[b] / stream.len() as f64;
+        let overall = band_s[b] / band_n[b] * bits;
+        let (r, s) = (
+            if band_re_n[b] > 0.0 {
+                band_re[b] / band_re_n[b] * bits
+            } else {
+                f64::NAN
+            },
+            if band_se_n[b] > 0.0 {
+                band_se[b] / band_se_n[b] * bits
+            } else {
+                f64::NAN
+            },
+        );
+        println!(
+            "  {:<12} {:>5.1}%  {:>8.4}   {:>8.4}  {:>8.4}  {:>+8.4}",
+            BAND_NAME[b],
+            share,
+            overall,
+            r,
+            s,
+            r - s
+        );
+    }
     println!();
     println!("  visit   re-entry   settled       gap  <- read the trajectory");
     for v in 0..visits {
