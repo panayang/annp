@@ -202,6 +202,10 @@ enum Command {
         /// Run the online EWC control instead of the tree.
         #[arg(long)]
         ewc: bool,
+        /// Anchor follow rate; its inverse is EWC's memory timescale. Defaults
+        /// to one full domain cycle.
+        #[arg(long)]
+        ewc_trail: Option<f64>,
         /// Print the source diagnostic and stop.
         #[arg(long)]
         source_only: bool,
@@ -566,6 +570,7 @@ fn main() -> std::io::Result<()> {
             ladder_r,
             eta,
             ewc,
+            ewc_trail,
             source_only,
             seed,
             out,
@@ -585,6 +590,7 @@ fn main() -> std::io::Result<()> {
                 ladder_r,
                 eta,
                 ewc,
+                ewc_trail,
                 source_only,
                 seed,
             },

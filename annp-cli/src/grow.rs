@@ -92,6 +92,11 @@ pub struct OnlineEwc {
     fisher: Vec<Vec<f64>>,
     lambdas: Vec<f64>,
     nats: Vec<f64>,
+    /// Running |penalty| and |gradient|, so "the penalty is inert" is visible
+    /// rather than inferred.
+    pull_mag: Vec<f64>,
+    grad_mag: Vec<f64>,
+    fisher_mean: Vec<f64>,
     vocab: usize,
     d: usize,
     eta: f64,
@@ -102,13 +107,29 @@ pub struct OnlineEwc {
 
 impl OnlineEwc {
     pub fn new(vocab: usize, d: usize, eta: f64, trail: f64) -> Self {
-        let lambdas = vec![0.0, 1.0, 10.0, 100.0];
+        // The grid has to span the Fisher's scale, not look reasonable.
+        //
+        // The gradient is `(onehot - p) x`, so only the target row carries an
+        // O(1) factor and the other `vocab - 1` rows carry `-p ~ 1/vocab`. The
+        // Fisher, a running mean of `g^2`, is therefore around 1e-6 for almost
+        // every weight, and a penalty of `lambda * F * (W - W*)` at lambda 100
+        // is four orders of magnitude below the gradient it is meant to oppose.
+        // Every lambda in {0, 1, 10, 100} was effectively zero, so the four arms
+        // were the same model and "lambda 0 won" was a tie broken by noise --
+        // not a finding that consolidation earns nothing.
+        // With the penalty applied proximally and the Fisher normalised by its
+        // own mean, lambda spans "no anchoring" to "pinned to the anchor" and
+        // means the same thing at any vocabulary or width.
+        let lambdas = vec![0.0, 0.1, 1.0, 10.0, 100.0];
         let n = lambdas.len();
         Self {
             w: vec![vec![0.0; vocab * d]; n],
             anchor: vec![vec![0.0; vocab * d]; n],
             fisher: vec![vec![0.0; vocab * d]; n],
             nats: vec![0.0; n],
+            pull_mag: vec![0.0; n],
+            grad_mag: vec![0.0; n],
+            fisher_mean: vec![0.0; n],
             lambdas,
             vocab,
             d,
@@ -144,6 +165,8 @@ impl OnlineEwc {
             best = best.min(nats);
 
             let lam = self.lambdas[l];
+            // One pass behind is close enough for a scale, and it costs nothing.
+            self.fisher_mean[l] = self.fisher[l].iter().sum::<f64>() / self.fisher[l].len() as f64;
             for n in 0..v {
                 let g_out = if n == target as usize {
                     1.0 - self.logits[n]
@@ -151,11 +174,23 @@ impl OnlineEwc {
                     -self.logits[n]
                 };
                 let base = n * d;
+                let fbar = self.fisher_mean[l].max(f64::MIN_POSITIVE);
                 for (j, &k) in key.iter().enumerate() {
                     let idx = base + j;
                     let g = g_out * k;
-                    let pull = lam * self.fisher[l][idx] * (self.w[l][idx] - self.anchor[l][idx]);
-                    self.w[l][idx] += self.eta * (g - pull);
+                    // Proximal, not explicit. The Fisher spans orders of
+                    // magnitude across weights -- around 0.1 on the target row
+                    // and 1e-6 elsewhere -- so no single lambda can be both
+                    // effective on the small ones and stable on the large ones
+                    // in an explicit step. Measured: inert at 100, NaN at 1e8.
+                    // The proximal form is unconditionally stable and reaches
+                    // the anchor as lambda grows.
+                    let stiff = self.eta * lam * self.fisher[l][idx] / fbar;
+                    let before = self.w[l][idx];
+                    let w = (before + self.eta * g + stiff * self.anchor[l][idx]) / (1.0 + stiff);
+                    self.pull_mag[l] += (w - (before + self.eta * g)).abs();
+                    self.grad_mag[l] += (self.eta * g).abs();
+                    self.w[l][idx] = w;
                     self.fisher[l][idx] += self.trail * (g * g - self.fisher[l][idx]);
                     self.anchor[l][idx] += self.trail * (self.w[l][idx] - self.anchor[l][idx]);
                 }
@@ -173,6 +208,23 @@ impl OnlineEwc {
             }
         }
         b
+    }
+
+    /// Per-lambda total bits and the penalty-to-gradient ratio. If the totals
+    /// are all but identical the grid never engaged the mechanism.
+    pub fn report(&self) -> Vec<(f64, f64, f64)> {
+        self.lambdas
+            .iter()
+            .enumerate()
+            .map(|(l, &lam)| {
+                let ratio = if self.grad_mag[l] > 0.0 {
+                    self.pull_mag[l] / self.grad_mag[l]
+                } else {
+                    0.0
+                };
+                (lam, self.nats[l] * std::f64::consts::LOG2_E, ratio)
+            })
+            .collect()
     }
 
     pub fn lambda_at_boundary(&self) -> bool {
@@ -217,6 +269,11 @@ pub struct Config {
     pub ladder_r: f64,
     pub eta: f64,
     pub ewc: bool,
+    /// Anchor and Fisher follow the weights at this rate. Its inverse is the
+    /// timescale over which EWC remembers, and it has to span what the stream
+    /// asks it to hold: an anchor that tracks within a single visit cannot
+    /// carry anything across domains, it just slows adaptation.
+    pub ewc_trail: Option<f64>,
     /// Print the source diagnostic and stop. The tilt trade-off is a property
     /// of the source alone, so measuring it should not cost a model run.
     pub source_only: bool,
@@ -335,7 +392,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             cfg.vocab,
             cfg.d_model,
             cfg.eta,
-            1.0 / span as f64,
+            cfg.ewc_trail.unwrap_or(1.0 / (span * d_count) as f64),
         )))
     } else {
         Arm::Tree(Box::new(Tree::new(annp_core::tree::Spec {
@@ -370,16 +427,28 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
             rank_of[id] = r + 1;
         }
     }
-    let band_of = |id: u32| -> usize {
-        match rank_of[id as usize] {
-            0..=4 => 0,
-            5..=16 => 1,
-            17..=64 => 2,
-            _ => 3,
-        }
-    };
+    // Bands scale with the vocabulary, in quarters of log-rank, so the same
+    // four names mean the same four decades of rarity whatever the alphabet.
     const BANDS: usize = 4;
-    const BAND_NAME: [&str; BANDS] = ["rank 1-4", "rank 5-16", "rank 17-64", "rank 65+"];
+    let edges: Vec<usize> = {
+        let lg = (cfg.vocab as f64).ln();
+        (1..BANDS)
+            .map(|k| (lg * k as f64 / BANDS as f64).exp().round() as usize)
+            .collect()
+    };
+    let band_of = |id: u32| -> usize {
+        let r = rank_of[id as usize];
+        edges.iter().take_while(|e| r > **e).count()
+    };
+    let band_name: Vec<String> = (0..BANDS)
+        .map(|b| {
+            let lo = if b == 0 { 1 } else { edges[b - 1] + 1 };
+            match edges.get(b) {
+                Some(hi) => format!("rank {lo}-{hi}"),
+                None => format!("rank {lo}+"),
+            }
+        })
+        .collect();
     let (mut band_s, mut band_n) = ([0.0f64; BANDS], [0.0f64; BANDS]);
     let (mut band_re, mut band_re_n) = ([0.0f64; BANDS], [0.0f64; BANDS]);
     let (mut band_se, mut band_se_n) = ([0.0f64; BANDS], [0.0f64; BANDS]);
@@ -457,15 +526,28 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         Arm::Ewc(e) => {
             let (_, lam) = e.best();
             println!("=== online EWC (continual-learning control) ===");
+            println!(
+                "  anchor trail {:.3e}  (one full domain cycle is {:.3e})",
+                cfg.ewc_trail.unwrap_or(1.0 / (span * d_count) as f64),
+                1.0 / (span * d_count) as f64
+            );
             println!("  best lambda {lam}");
+            println!("  lambda      total bits     |penalty|/|gradient|");
+            for (l, bits_total, ratio) in e.report() {
+                println!("  {l:>9}  {bits_total:>13.1}  {ratio:>20.2e}");
+            }
             println!(
                 "  live parameters {}   state held {}   MACs/token {}",
                 e.parameters(),
                 e.state_held(),
                 e.cost()
             );
-            if e.lambda_at_boundary() {
-                println!("  !! the winning lambda is an endpoint of the swept set");
+            // Zero is the floor of the parameter's meaning, not a truncated
+            // search: it is "no penalty at all". Winning there is a finding.
+            if e.lambda_at_boundary() && lam > 0.0 {
+                println!("  !! the winning lambda is the top of the swept set");
+            } else if lam == 0.0 {
+                println!("  (lambda 0 won: the consolidation penalty earns nothing here)");
             }
         }
     }
@@ -496,7 +578,7 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         );
         println!(
             "  {:<12} {:>5.1}%  {:>8.4}   {:>8.4}  {:>8.4}  {:>+8.4}",
-            BAND_NAME[b],
+            band_name[b],
             share,
             overall,
             r,
@@ -565,10 +647,14 @@ mod tests {
             e.observe(&codes[a as usize * d..(a as usize + 1) * d], b);
         }
         let free: f64 = e.w[0].iter().map(|x| x * x).sum();
-        let held: f64 = e.w[3].iter().map(|x| x * x).sum();
+        let held: f64 = e.w[e.w.len() - 1].iter().map(|x| x * x).sum();
+        // A magnitude, not just a direction. The first version asserted only
+        // `held < free`, which a 0.1% effect satisfies, and that is exactly what
+        // was happening: every lambda in the old grid sat four orders of
+        // magnitude below the gradient, so the arms were the same model.
         assert!(
-            held < free,
-            "lambda 100 did not restrain anything: {held} vs {free}"
+            held < 0.5 * free,
+            "the largest lambda barely restrained anything: {held} vs {free}"
         );
     }
 }
