@@ -611,6 +611,99 @@ pub fn run(cfg: &Config, out_dir: &Path) -> std::io::Result<()> {
         _ => panic!("--corpus and --tokenizer go together"),
     };
 
+    // Model-free difficulty per decile, so a curve's shape can be attributed
+    // before it is interpreted. `global` is the code length of each decile
+    // under the whole stream's unigram distribution; `local` is that decile's
+    // own unigram entropy. Neither involves any learning, so any structure they
+    // share with the model's curve belongs to the corpus.
+    {
+        let bits = std::f64::consts::LOG2_E;
+        let mut whole = vec![0.0f64; cfg.vocab];
+        for &tok in &stream {
+            whole[tok as usize] += 1.0;
+        }
+        let n_all: f64 = stream.len() as f64;
+        let chunk = (stream.len() / 10).max(1);
+        let (mut g, mut l) = (Vec::new(), Vec::new());
+        for k in 0..10 {
+            let lo = k * chunk;
+            let hi = ((k + 1) * chunk).min(stream.len());
+            if lo >= hi {
+                break;
+            }
+            let mut here = vec![0.0f64; cfg.vocab];
+            for &tok in &stream[lo..hi] {
+                here[tok as usize] += 1.0;
+            }
+            let n = (hi - lo) as f64;
+            let gl: f64 = stream[lo..hi]
+                .iter()
+                .map(|&t| -(whole[t as usize] / n_all).ln())
+                .sum::<f64>()
+                / n;
+            let ll: f64 = here
+                .iter()
+                .filter(|c| **c > 0.0)
+                .map(|c| {
+                    let p = c / n;
+                    -p * p.ln()
+                })
+                .sum();
+            g.push(gl * bits);
+            l.push(ll * bits);
+        }
+        let fmt = |v: &Vec<f64>| {
+            v.iter()
+                .map(|x| format!("{x:.3}"))
+                .collect::<Vec<_>>()
+                .join("  ")
+        };
+        // Rank-frequency shape. E0-b's positive result depends on a
+        // heavy-tailed distribution -- consolidation protects rare items from
+        // being overwritten by frequent ones, and with a flat distribution
+        // there is nothing to protect. Asserting the corpus is Zipf is not the
+        // same as measuring it.
+        {
+            let mut ranked: Vec<f64> = whole.iter().copied().filter(|c| *c > 0.0).collect();
+            ranked.sort_by(|a, b| b.total_cmp(a));
+            let n: f64 = ranked.iter().sum();
+            let top = |k: usize| -> f64 { ranked.iter().take(k).sum::<f64>() / n };
+            // Slope of log count against log rank, over the head where a Zipf
+            // law is supposed to hold.
+            let upper = ranked.len().min(1000);
+            let (xs, ys): (Vec<f64>, Vec<f64>) = (1..=upper)
+                .map(|r| ((r as f64).ln(), ranked[r - 1].ln()))
+                .unzip();
+            let (slope, _) = annp_core::linalg::linear_fit(&xs, &ys);
+            // Rank and count, so the shape can be looked at instead of
+            // summarised. A slope near -1 is not evidence of a Zipf law: a
+            // curve that bends can fit one just as well.
+            {
+                let mut csv = String::from("rank,count\n");
+                for (i, c) in ranked.iter().enumerate() {
+                    csv.push_str(&format!("{},{}\n", i + 1, *c as u64));
+                }
+                let _ = std::fs::create_dir_all(out_dir);
+                let _ = std::fs::write(out_dir.join("rank_freq.csv"), csv);
+            }
+            println!(
+                "  corpus, distinct {}  top-10 {:.1}%  top-100 {:.1}%  top-1000 {:.1}%  zipf slope {:.3}",
+                ranked.len(),
+                100.0 * top(10),
+                100.0 * top(100),
+                100.0 * top(1000),
+                slope
+            );
+        }
+        println!("  corpus, global unigram cost by decile:\n    {}", fmt(&g));
+        println!(
+            "  corpus, local unigram entropy by decile:\n    {}",
+            fmt(&l)
+        );
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+    }
+
     let mut model = Arm::build(cfg, &mut rng);
 
     let started = std::time::Instant::now();
