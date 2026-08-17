@@ -143,6 +143,11 @@ impl Ladder {
         &self.rungs[k]
     }
 
+    #[inline]
+    pub fn rungs(&self) -> &[Mat] {
+        &self.rungs
+    }
+
     /// Every rung, mutably. The caller may apply any transform that acts
     /// identically on all of them: the diffusion couples rungs coordinate by
     /// coordinate with the same conductances everywhere, so a map that mixes
@@ -240,6 +245,44 @@ impl Ladder {
             std::mem::swap(flux_prev, flux_cur);
             for x in flux_prev.iter_mut() {
                 *x = -*x;
+            }
+        }
+    }
+
+    /// Advances the diffusion by one event ONLY on the specified active columns (Activity-Gated Event Diffusion).
+    ///
+    /// Silent columns undergo ZERO diffusion (quiescent / time-frozen), eliminating quiescent dissipation
+    /// and reducing computation by D / k factor (e.g. 32x speedup).
+    pub fn relax_columns(&mut self, active_cols: &[usize]) {
+        let m = self.rungs.len();
+        if m <= 1 || active_cols.is_empty() {
+            return;
+        }
+
+        let rows = self.rungs[0].rows();
+        let cols = self.rungs[0].cols();
+
+        for &col in active_cols {
+            assert!(col < cols, "column index out of bounds");
+
+            for v in 0..rows {
+                let e = v * cols + col;
+                let mut flux_prev = 0.0;
+
+                for k in 0..m {
+                    let flux_cur = if k + 1 < m {
+                        let cur_val = self.rungs[k].as_slice()[e];
+                        let next_val = self.rungs[k + 1].as_slice()[e];
+                        self.conductance[k] * (next_val - cur_val)
+                    } else {
+                        0.0
+                    };
+
+                    let inv_c = self.inv_capacity[k];
+                    self.rungs[k].as_mut_slice()[e] += inv_c * (flux_prev + flux_cur);
+
+                    flux_prev = -flux_cur;
+                }
             }
         }
     }

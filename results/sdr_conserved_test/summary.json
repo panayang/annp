@@ -1,0 +1,58 @@
+{
+  "domains": 4,
+  "facts_per_domain": 50,
+  "span_tokens": 2000,
+  "rounds": 5,
+  "vocab": 512,
+  "d_input": 64,
+  "m_in": 4,
+  "d_sdr": 512,
+  "k_active": 16,
+  "arms": [
+    {
+      "name": "Ladder-8 (m=8)",
+      "best_eta": 0.0100,
+      "best_ewc_lambda": 0.00,
+      "final_acc": 0.9750,
+      "final_loss": 6.2382,
+      "eta_boundary_hit": true,
+      "ewc_zero_lambda_won": false
+    },
+    {
+      "name": "Ladder-4 (m=4)",
+      "best_eta": 3.0000,
+      "best_ewc_lambda": 0.00,
+      "final_acc": 0.9750,
+      "final_loss": 5.5544,
+      "eta_boundary_hit": true,
+      "ewc_zero_lambda_won": false
+    },
+    {
+      "name": "Ladder-2 (m=2)",
+      "best_eta": 3.0000,
+      "best_ewc_lambda": 0.00,
+      "final_acc": 0.9800,
+      "final_loss": 2.9692,
+      "eta_boundary_hit": true,
+      "ewc_zero_lambda_won": false
+    },
+    {
+      "name": "Plain (m=1)",
+      "best_eta": 3.0000,
+      "best_ewc_lambda": 0.00,
+      "final_acc": 1.0000,
+      "final_loss": 0.3772,
+      "eta_boundary_hit": true,
+      "ewc_zero_lambda_won": false
+    },
+    {
+      "name": "Proximal EWC (lam=0.0)",
+      "best_eta": 3.0000,
+      "best_ewc_lambda": 0.00,
+      "final_acc": 1.0000,
+      "final_loss": 0.3772,
+      "eta_boundary_hit": true,
+      "ewc_zero_lambda_won": true
+    }
+  ]
+}

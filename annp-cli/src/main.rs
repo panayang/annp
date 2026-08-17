@@ -10,6 +10,7 @@ mod e0;
 mod grow;
 mod head;
 mod next;
+mod sdr_exp;
 
 /// Git revision, or `unknown` outside a checkout.
 pub fn git_revision() -> String {
@@ -514,6 +515,56 @@ enum Command {
         #[arg(long, default_value = "results/topology")]
         out: PathBuf,
     },
+    /// Continuous SDR with multi-timescale consolidation ladders and relational facts benchmark.
+    /// See DESIGN-SDR.md.
+    Sdr {
+        /// Number of domains to cycle through.
+        #[arg(long, default_value_t = 4)]
+        domains: usize,
+        /// Number of relational facts per domain.
+        #[arg(long, default_value_t = 100)]
+        facts_per_domain: usize,
+        /// Number of stream tokens presented per domain visit (span).
+        #[arg(long, default_value_t = 2000)]
+        span_tokens: usize,
+        /// Number of domain cycling rounds.
+        #[arg(long, default_value_t = 5)]
+        rounds: usize,
+        /// Vocabulary size.
+        #[arg(long, default_value_t = 512)]
+        vocab: usize,
+        /// Input causal trace embedding dimension.
+        #[arg(long, default_value_t = 64)]
+        d_input: usize,
+        /// High-dimensional SDR feature dimension D.
+        #[arg(long, default_value_t = 128)]
+        d_sdr: usize,
+        /// Active sparsity k (k-WTA).
+        #[arg(long, default_value_t = 8)]
+        k_active: usize,
+        /// Input context ladder rung count (replaces arbitrary single gamma).
+        #[arg(long, default_value_t = 4)]
+        m_in: usize,
+        /// Geometric ladder ratio r.
+        #[arg(long, default_value_t = 2.0)]
+        ladder_r: f64,
+        /// Zipf power-law exponent s.
+        #[arg(long, default_value_t = 1.0)]
+        zipf_s: f64,
+        /// Fraction of entities that are global cross-domain hubs.
+        #[arg(long, default_value_t = 0.10)]
+        hub_ratio: f64,
+        /// Learning rate eta. If omitted, sweeps grid [0.01, 0.03, 0.1, 0.3, 1.0, 3.0].
+        #[arg(long)]
+        eta: Option<f64>,
+        /// Online EWC regularisation lambda. If omitted, sweeps [0.0, 0.1, 1.0, 10.0, 100.0].
+        #[arg(long)]
+        ewc_lambda: Option<f64>,
+        #[arg(long, default_value_t = 20260817)]
+        seed: u64,
+        #[arg(long, default_value = "results/sdr")]
+        out: PathBuf,
+    },
 }
 
 fn main() -> std::io::Result<()> {
@@ -799,6 +850,46 @@ fn main() -> std::io::Result<()> {
                 seed,
             };
             topology::run(&cfg, &out)
+        }
+        Command::Sdr {
+            domains,
+            facts_per_domain,
+            span_tokens,
+            rounds,
+            vocab,
+            d_input,
+            d_sdr,
+            k_active,
+            m_in,
+            ladder_r,
+            zipf_s,
+            hub_ratio,
+            eta,
+            ewc_lambda,
+            seed,
+            out,
+        } => {
+            let cfg = sdr_exp::SdrConfig {
+                domains,
+                facts_per_domain,
+                span_tokens,
+                rounds,
+                vocab,
+                d_input,
+                m_in,
+                d_sdr,
+                k_active,
+                ladder_r,
+                zipf_s,
+                hub_ratio,
+                eta,
+                ewc_lambda,
+                seed,
+                out: out.clone(),
+            };
+            write_manifest(&out, "sdr", &cfg);
+            let summaries = sdr_exp::run_sdr_experiment(&cfg);
+            sdr_exp::export_and_print_results(&cfg, &summaries, &out)
         }
     }
 }

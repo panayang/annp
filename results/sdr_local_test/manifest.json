@@ -1,0 +1,6 @@
+{
+  "experiment": "sdr",
+  "git": "3f50c2e32879-dirty",
+  "argv": ["target/release/annp", "sdr", "--domains", "2", "--facts-per-domain", "20", "--span-tokens", "100", "--rounds", "2", "--d-sdr", "64", "--k-active", "8", "--out", "results/sdr_local_test"],
+  "resolved": "SdrConfig {\n    domains: 2,\n    facts_per_domain: 20,\n    span_tokens: 100,\n    rounds: 2,\n    vocab: 512,\n    d_input: 64,\n    m_in: 4,\n    d_sdr: 64,\n    k_active: 8,\n    ladder_r: 2.0,\n    mode: Orthogonal,\n    eta: None,\n    ewc_lambda: None,\n    seed: 20260817,\n    out: \"results/sdr_local_test\",\n}"
+}

@@ -1,0 +1,54 @@
+{
+  "domains": 4,
+  "facts_per_domain": 50,
+  "span_tokens": 2000,
+  "rounds": 5,
+  "mode": "Orthogonal",
+  "arms": [
+    {
+      "arm": "Ladder-8 (m=8)",
+      "best_eta": 3.0000,
+      "best_ewc_lambda": 0.00,
+      "final_0shot_retention_acc": 1.0000,
+      "final_0shot_loss": 0.4522,
+      "eta_boundary_hit": true,
+      "ewc_zero_lambda_won": false
+    },
+    {
+      "arm": "Ladder-4 (m=4)",
+      "best_eta": 3.0000,
+      "best_ewc_lambda": 0.00,
+      "final_0shot_retention_acc": 1.0000,
+      "final_0shot_loss": 0.4522,
+      "eta_boundary_hit": true,
+      "ewc_zero_lambda_won": false
+    },
+    {
+      "arm": "Ladder-2 (m=2)",
+      "best_eta": 3.0000,
+      "best_ewc_lambda": 0.00,
+      "final_0shot_retention_acc": 1.0000,
+      "final_0shot_loss": 0.1451,
+      "eta_boundary_hit": true,
+      "ewc_zero_lambda_won": false
+    },
+    {
+      "arm": "Plain (m=1)",
+      "best_eta": 3.0000,
+      "best_ewc_lambda": 0.00,
+      "final_0shot_retention_acc": 1.0000,
+      "final_0shot_loss": 0.0100,
+      "eta_boundary_hit": true,
+      "ewc_zero_lambda_won": false
+    },
+    {
+      "arm": "Proximal EWC (lam=0.0)",
+      "best_eta": 3.0000,
+      "best_ewc_lambda": 0.00,
+      "final_0shot_retention_acc": 1.0000,
+      "final_0shot_loss": 0.0100,
+      "eta_boundary_hit": true,
+      "ewc_zero_lambda_won": true
+    }
+  ]
+}
