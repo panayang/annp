@@ -24,6 +24,29 @@ use annp_core::ladder::Schedule;
 use annp_core::rng::Rng;
 use annp_core::sdr::{InputContextLadder, RandomProjection, SdrMemory};
 
+/// Stream mode: Mode A (orthogonal disjoint domains) or Mode B (shared-entity semantic collision).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamMode {
+    ModeA,
+    ModeB,
+}
+
+impl StreamMode {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "b" | "mode_b" | "modeb" => StreamMode::ModeB,
+            _ => StreamMode::ModeA,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            StreamMode::ModeA => "Mode A (Orthogonal Domains)",
+            StreamMode::ModeB => "Mode B (Shared-Entity Semantic Collision)",
+        }
+    }
+}
+
 /// A relational triplet fact: `[entity, relation] -> target` with Zipf rank tier.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RelationalFact {
@@ -38,6 +61,7 @@ pub struct RelationalFact {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct RelationalFactStream {
+    pub mode: StreamMode,
     pub domains: usize,
     pub facts_per_domain: usize,
     pub span_tokens: usize,
@@ -47,11 +71,13 @@ pub struct RelationalFactStream {
     pub vocab: usize,
     pub facts: Vec<Vec<RelationalFact>>, // [domain][probe_facts]
     pub walks: Vec<Vec<RelationalFact>>, // [domain][walk_steps]
+    pub prefixes: Vec<Vec<usize>>,        // [domain][prefix_tokens]
 }
 
 impl RelationalFactStream {
-    /// Constructs a hierarchical scale-free Zipf knowledge graph with lifelong shared Hub backbone and domain-specific leaves.
+    /// Constructs a stream generator under either Mode A (orthogonal) or Mode B (semantic collision).
     pub fn new(
+        mode: StreamMode,
         domains: usize,
         facts_per_domain: usize,
         span_tokens: usize,
@@ -65,6 +91,36 @@ impl RelationalFactStream {
         assert!(span_tokens >= 3, "span_tokens must be >= 3");
         assert!(rounds > 0, "rounds must be positive");
 
+        match mode {
+            StreamMode::ModeA => Self::new_mode_a(
+                domains,
+                facts_per_domain,
+                span_tokens,
+                rounds,
+                zipf_s,
+                hub_ratio,
+                vocab,
+            ),
+            StreamMode::ModeB => Self::new_mode_b(
+                domains,
+                facts_per_domain,
+                span_tokens,
+                rounds,
+                zipf_s,
+                vocab,
+            ),
+        }
+    }
+
+    fn new_mode_a(
+        domains: usize,
+        facts_per_domain: usize,
+        span_tokens: usize,
+        rounds: usize,
+        zipf_s: f64,
+        hub_ratio: f64,
+        vocab: usize,
+    ) -> Self {
         let total_entities = (domains * facts_per_domain).max(128);
         let hub_count = ((total_entities as f64) * hub_ratio.clamp(0.15, 0.40))
             .round()
@@ -113,6 +169,7 @@ impl RelationalFactStream {
 
         let mut facts = Vec::with_capacity(domains);
         let mut walks = Vec::with_capacity(domains);
+        let mut prefixes = Vec::with_capacity(domains);
 
         for d in 0..domains {
             let spec_start = hub_count + d * domain_entity_count;
@@ -207,9 +264,11 @@ impl RelationalFactStream {
 
             facts.push(p_facts);
             walks.push(walk);
+            prefixes.push(Vec::new()); // Mode A does not require prefix conditioning
         }
 
         Self {
+            mode: StreamMode::ModeA,
             domains,
             facts_per_domain,
             span_tokens,
@@ -219,6 +278,114 @@ impl RelationalFactStream {
             vocab,
             facts,
             walks,
+            prefixes,
+        }
+    }
+
+    fn new_mode_b(
+        domains: usize,
+        facts_per_domain: usize,
+        span_tokens: usize,
+        rounds: usize,
+        zipf_s: f64,
+        vocab: usize,
+    ) -> Self {
+        let shared_entities_count = facts_per_domain.max(32);
+        let shared_rel_count = 4;
+        let rel_base = shared_entities_count;
+        let targets_base = rel_base + shared_rel_count;
+        let total_required = targets_base + domains * shared_entities_count;
+
+        assert!(
+            vocab >= total_required,
+            "vocab {vocab} too small for Mode B (needs {total_required})"
+        );
+
+        let mut rng = Rng::new(20260817);
+
+        let mut facts = Vec::with_capacity(domains);
+        let mut walks = Vec::with_capacity(domains);
+        let mut prefixes = Vec::with_capacity(domains);
+
+        let hub_count = (shared_entities_count as f64 * 0.20).round().max(2.0) as usize;
+        let mid_count = (shared_entities_count as f64 * 0.30).round().max(2.0) as usize;
+
+        for d in 0..domains {
+            let mut domain_facts = Vec::with_capacity(facts_per_domain);
+            let mut domain_all_edges = Vec::new();
+
+            for e in 0..shared_entities_count {
+                let rank_tier = if e < hub_count {
+                    0 // Hub
+                } else if e < hub_count + mid_count {
+                    1 // Mid
+                } else {
+                    2 // Tail
+                };
+
+                let rel = rel_base + (e % shared_rel_count);
+                // Domain-specific target mapping (100% collision on [entity, rel] across domains)
+                let target = targets_base + d * shared_entities_count + ((e * 7 + 13 + d * 31) % shared_entities_count);
+
+                let fact = RelationalFact {
+                    domain: d,
+                    entity: e,
+                    relation: rel,
+                    target,
+                    rank_tier,
+                };
+                domain_facts.push(fact);
+                domain_all_edges.push((e, rel, target, rank_tier));
+            }
+
+            // Continuous walk in Domain d with Zipfian selection:
+            let walk_steps = span_tokens / 3;
+            let mut walk = Vec::with_capacity(walk_steps);
+
+            let entity_weights: Vec<f64> = (0..shared_entities_count)
+                .map(|i| 1.0 / ((i + 1) as f64).powf(zipf_s))
+                .collect();
+            let sum_w: f64 = entity_weights.iter().sum();
+
+            for _ in 0..walk_steps {
+                let mut pick = rng.next_f64() * sum_w;
+                let mut chosen_e = 0;
+                for (idx, &w) in entity_weights.iter().enumerate() {
+                    if pick <= w {
+                        chosen_e = idx;
+                        break;
+                    }
+                    pick -= w;
+                }
+                walk.push(domain_facts[chosen_e]);
+            }
+
+            // Construct 16-token domain prefix sequence:
+            let mut prefix = Vec::with_capacity(16);
+            for fact in walk.iter().take(6) {
+                prefix.push(fact.entity);
+                prefix.push(fact.relation);
+                prefix.push(fact.target);
+            }
+            prefix.truncate(16);
+
+            facts.push(domain_facts);
+            walks.push(walk);
+            prefixes.push(prefix);
+        }
+
+        Self {
+            mode: StreamMode::ModeB,
+            domains,
+            facts_per_domain,
+            span_tokens,
+            rounds,
+            zipf_s,
+            hub_ratio: 0.20,
+            vocab,
+            facts,
+            walks,
+            prefixes,
         }
     }
 }
@@ -260,6 +427,7 @@ impl FrozenProbeSlice {
     /// Evaluates accuracy and cross-entropy loss over a set of relational facts without modifying memory state.
     pub fn evaluate(
         facts: &[RelationalFact],
+        prefix: &[usize],
         ladder_template: &InputContextLadder,
         proj: &RandomProjection,
         memory: &mut SdrMemory,
@@ -282,6 +450,9 @@ impl FrozenProbeSlice {
 
         for fact in facts {
             online_ladder.reset();
+            for &tok in prefix {
+                online_ladder.step(tok);
+            }
             online_ladder.step(fact.entity);
             online_ladder.step(fact.relation);
 
@@ -328,6 +499,7 @@ impl FrozenProbeSlice {
     /// across stratified Zipf rank tiers on isolated clones of memory state.
     pub fn evaluate_few_shot(
         facts: &[RelationalFact],
+        prefix: &[usize],
         ladder_template: &InputContextLadder,
         proj: &RandomProjection,
         memory: &SdrMemory,
@@ -335,7 +507,7 @@ impl FrozenProbeSlice {
         seed: u64,
     ) -> FewShotResult {
         let mut sim_rng = Rng::new(seed);
-        let base_probe = Self::evaluate(facts, ladder_template, proj, &mut memory.clone());
+        let base_probe = Self::evaluate(facts, prefix, ladder_template, proj, &mut memory.clone());
 
         let budgets = [5, 10, 20, 50, 200];
         let mut few_accs = [base_probe.accuracy; 5];
@@ -357,6 +529,9 @@ impl FrozenProbeSlice {
                 let fact = facts[fact_idx];
 
                 online_ladder.reset();
+                for &tok in prefix {
+                    online_ladder.step(tok);
+                }
                 online_ladder.step(fact.entity);
                 online_ladder.step(fact.relation);
 
@@ -366,7 +541,7 @@ impl FrozenProbeSlice {
                 temp_mem.observe(&active, &alphas, fact.target, eta);
             }
 
-            let probe = Self::evaluate(facts, ladder_template, proj, &mut temp_mem);
+            let probe = Self::evaluate(facts, prefix, ladder_template, proj, &mut temp_mem);
             few_accs[idx] = probe.accuracy;
             few_hub[idx] = probe.acc_hub;
             few_mid[idx] = probe.acc_mid;
@@ -473,6 +648,7 @@ pub struct ArmSummary {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct SdrConfig {
+    pub mode: StreamMode,
     pub domains: usize,
     pub facts_per_domain: usize,
     pub span_tokens: usize,
@@ -544,16 +720,18 @@ pub fn run_arm_trial(
 
         for d in 0..cfg.domains {
             let domain_facts = &stream.facts[d];
+            let domain_prefix = &stream.prefixes[d];
 
             // 1. Frozen 0-Shot probe (and full Multi-Range Few-Shot recovery probe in final round)
             let (pre_acc, pre_loss, acc_few5, acc_few10, acc_few20, acc_few50, acc_few200, spec_hub, spec_mid, spec_tail) =
                 if r == cfg.rounds {
                     let few = FrozenProbeSlice::evaluate_few_shot(
                         domain_facts,
+                        domain_prefix,
                         &ladder_template,
                         &proj,
                         &memory,
-                        eta,
+                        0.1,
                         cfg.seed + (r * 100 + d) as u64,
                     );
                     (
@@ -571,6 +749,7 @@ pub fn run_arm_trial(
                 } else {
                     let p = FrozenProbeSlice::evaluate(
                         domain_facts,
+                        domain_prefix,
                         &ladder_template,
                         &proj,
                         &mut memory.clone(),
@@ -585,7 +764,6 @@ pub fn run_arm_trial(
             // 2. Stream online learning in current domain via continuous random walk
             let domain_walk = &stream.walks[d];
             for fact in domain_walk {
-                online_ladder.reset();
                 online_ladder.step(fact.entity);
                 online_ladder.step(fact.relation);
 
@@ -599,11 +777,13 @@ pub fn run_arm_trial(
                 );
 
                 memory.observe(&active, &alphas, fact.target, eta);
+                online_ladder.step(fact.target);
             }
 
             // 3. Frozen probe immediately after training
             let post_probe = FrozenProbeSlice::evaluate(
                 domain_facts,
+                domain_prefix,
                 &ladder_template,
                 &proj,
                 &mut memory,
@@ -650,6 +830,7 @@ pub fn run_arm_trial(
 /// Runs the complete SDR benchmark suite across all 5 arms.
 pub fn run_sdr_experiment(cfg: &SdrConfig) -> Vec<ArmSummary> {
     let stream = RelationalFactStream::new(
+        cfg.mode,
         cfg.domains,
         cfg.facts_per_domain,
         cfg.span_tokens,
@@ -662,11 +843,11 @@ pub fn run_sdr_experiment(cfg: &SdrConfig) -> Vec<ArmSummary> {
     let eta_grid = if let Some(e) = cfg.eta {
         vec![e]
     } else {
-        vec![0.01, 0.03, 0.1, 0.3, 1.0, 3.0]
+        vec![0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0]
     };
 
     let min_grid_eta = 0.01;
-    let max_grid_eta = 3.0;
+    let max_grid_eta = 10.0;
 
     let base_arms = [
         ArmKind::Ladder8,
@@ -716,14 +897,14 @@ pub fn run_sdr_experiment(cfg: &SdrConfig) -> Vec<ArmSummary> {
             let few20_acc = final_r.iter().map(|r| r.acc_few20).sum::<f64>() / n_d;
             let post_acc = final_r.iter().map(|r| r.post_train_acc).sum::<f64>() / n_d;
 
-            let is_better = if (few20_acc - best_few20).abs() > 1e-4 {
-                few20_acc > best_few20
-            } else if (final_loss - best_loss).abs() > 1e-3 {
+            let is_better = if (final_loss - best_loss).abs() > 1e-3 {
                 final_loss < best_loss
             } else if (final_acc - best_acc).abs() > 1e-4 {
                 final_acc > best_acc
-            } else {
+            } else if (post_acc - best_post_acc).abs() > 1e-4 {
                 post_acc > best_post_acc
+            } else {
+                few20_acc > best_few20
             };
 
             if is_better {
@@ -845,14 +1026,14 @@ pub fn run_sdr_experiment(cfg: &SdrConfig) -> Vec<ArmSummary> {
         let few20_acc = final_r.iter().map(|r| r.acc_few20).sum::<f64>() / n_d;
         let post_acc = final_r.iter().map(|r| r.post_train_acc).sum::<f64>() / n_d;
 
-        let is_better = if (few20_acc - best_ewc_few20).abs() > 1e-4 {
-            few20_acc > best_ewc_few20
-        } else if (final_loss - best_ewc_loss).abs() > 1e-3 {
+        let is_better = if (final_loss - best_ewc_loss).abs() > 1e-3 {
             final_loss < best_ewc_loss
         } else if (final_acc - best_ewc_acc).abs() > 1e-4 {
             final_acc > best_ewc_acc
-        } else {
+        } else if (post_acc - best_ewc_post_acc).abs() > 1e-4 {
             post_acc > best_ewc_post_acc
+        } else {
+            few20_acc > best_ewc_few20
         };
 
         if is_better {
@@ -993,6 +1174,7 @@ pub fn export_summary_json(
 
     writeln!(writer, "{{")?;
     writeln!(writer, "  \"config\": {{")?;
+    writeln!(writer, "    \"mode\": \"{}\",", cfg.mode.name())?;
     writeln!(writer, "    \"domains\": {},", cfg.domains)?;
     writeln!(writer, "    \"facts_per_domain\": {},", cfg.facts_per_domain)?;
     writeln!(writer, "    \"span_tokens\": {},", cfg.span_tokens)?;
@@ -1046,6 +1228,7 @@ pub fn print_ascii_summary(cfg: &SdrConfig, summaries: &[ArmSummary]) {
     println!("\n=========================================================================================");
     println!("                     SDR Continual Learning Benchmark Results                             ");
     println!("=========================================================================================");
+    println!("Stream Mode: {}", cfg.mode.name());
     println!(
         "Zipf-s: {:.2} | Hub-Ratio: {:.2} | Domains: {} | Facts/Domain: {} | Span: {} tokens | Rounds: {}",
         cfg.zipf_s, cfg.hub_ratio, cfg.domains, cfg.facts_per_domain, cfg.span_tokens, cfg.rounds
@@ -1239,8 +1422,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zipf_graph_stream_generation() {
-        let stream = RelationalFactStream::new(4, 20, 200, 3, 1.0, 0.10, 512);
+    fn zipf_graph_stream_generation_mode_a() {
+        let stream = RelationalFactStream::new(StreamMode::ModeA, 4, 20, 200, 3, 1.0, 0.10, 512);
         assert_eq!(stream.facts.len(), 4);
         assert_eq!(stream.facts[0].len(), 20);
         assert_eq!(stream.walks.len(), 4);
@@ -1248,15 +1431,25 @@ mod tests {
     }
 
     #[test]
+    fn zipf_graph_stream_generation_mode_b() {
+        let stream = RelationalFactStream::new(StreamMode::ModeB, 4, 32, 200, 3, 1.0, 0.20, 512);
+        assert_eq!(stream.facts.len(), 4);
+        assert_eq!(stream.facts[0].len(), 32);
+        assert_eq!(stream.walks.len(), 4);
+        assert_eq!(stream.prefixes.len(), 4);
+        assert_eq!(stream.prefixes[0].len(), 16);
+    }
+
+    #[test]
     fn frozen_probe_slice_does_not_modify_memory() {
-        let stream = RelationalFactStream::new(2, 10, 100, 2, 1.0, 0.10, 512);
+        let stream = RelationalFactStream::new(StreamMode::ModeA, 2, 10, 100, 2, 1.0, 0.10, 512);
         let mut rng = Rng::new(20260817);
-        let ladder = InputContextLadder::new(16, 512, 3, 2.0, &mut rng);
-        let proj = RandomProjection::new(48, 64, 8, &mut rng);
+        let ladder = InputContextLadder::new(16, 512, 4, 2.0, &mut rng);
+        let proj = RandomProjection::new(ladder.total_dim(), 64, 8, &mut rng);
         let mut mem = SdrMemory::new_plain(512, 64);
 
         let w_before = mem.read_fast_weights().as_slice().to_vec();
-        let _ = FrozenProbeSlice::evaluate(&stream.facts[0], &ladder, &proj, &mut mem);
+        let _ = FrozenProbeSlice::evaluate(&stream.facts[0], &stream.prefixes[0], &ladder, &proj, &mut mem);
         let w_after = mem.read_fast_weights().as_slice().to_vec();
 
         assert_eq!(w_before, w_after, "frozen probe must not modify memory state");
@@ -1265,13 +1458,14 @@ mod tests {
     #[test]
     fn small_sdr_experiment_smoke_test() {
         let cfg = SdrConfig {
+            mode: StreamMode::ModeA,
             domains: 2,
             facts_per_domain: 5,
             span_tokens: 30,
             rounds: 2,
             vocab: 512,
             d_input: 16,
-            m_in: 3,
+            m_in: 4,
             d_sdr: 32,
             k_active: 4,
             ladder_r: 2.0,

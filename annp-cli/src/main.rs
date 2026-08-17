@@ -534,7 +534,7 @@ enum Command {
         #[arg(long, default_value_t = 512)]
         vocab: usize,
         /// Input causal trace embedding dimension.
-        #[arg(long, default_value_t = 64)]
+        #[arg(long, default_value_t = 32)]
         d_input: usize,
         /// High-dimensional SDR feature dimension D.
         #[arg(long, default_value_t = 128)]
@@ -543,7 +543,7 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         k_active: usize,
         /// Input context ladder rung count (replaces arbitrary single gamma).
-        #[arg(long, default_value_t = 4)]
+        #[arg(long, default_value_t = 8)]
         m_in: usize,
         /// Geometric ladder ratio r.
         #[arg(long, default_value_t = 2.0)]
@@ -560,6 +560,9 @@ enum Command {
         /// Online EWC regularisation lambda. If omitted, sweeps [0.0, 0.1, 1.0, 10.0, 100.0].
         #[arg(long)]
         ewc_lambda: Option<f64>,
+        /// Stream mode: "a" for orthogonal domains (disjoint entities), "b" for shared-entity semantic collision.
+        #[arg(long, default_value = "a")]
+        mode: String,
         #[arg(long, default_value_t = 20260817)]
         seed: u64,
         #[arg(long, default_value = "results/sdr")]
@@ -866,10 +869,12 @@ fn main() -> std::io::Result<()> {
             hub_ratio,
             eta,
             ewc_lambda,
+            mode,
             seed,
             out,
         } => {
             let cfg = sdr_exp::SdrConfig {
+                mode: sdr_exp::StreamMode::from_str(&mode),
                 domains,
                 facts_per_domain,
                 span_tokens,

@@ -295,6 +295,145 @@ impl RandomProjection {
     }
 }
 
+/// Hierarchical Multi-Band Random Projection (8-Band Isomorphic Cortical SDR).
+///
+/// Divides input multi-timescale trace `\hat{Z}_t \in \mathbb{R}^{m_{\text{in}} \cdot d}` into `m_{\text{in}}` independent slices `Z_b \in \mathbb{R}^d`.
+/// Each band `b \in [0, \text{num\_bands})` projects `Z_b` via dedicated `\Phi_b \in \mathbb{R}^{D_{\text{band}} \times d}` to `u_b \in \mathbb{R}^{D_{\text{band}}}`,
+/// and selects local `k_{\text{band}}` active neurons independently, completely eliminating cross-timescale crowding.
+#[derive(Clone, Debug)]
+pub struct HierarchicalBandsProjection {
+    num_bands: usize,
+    d_rung: usize,
+    d_band: usize,
+    k_band: usize,
+    d_sdr: usize,
+    k_active: usize,
+    phis: Vec<Mat>, // num_bands matrices of size d_band x d_rung
+}
+
+impl HierarchicalBandsProjection {
+    /// Initializes an isomorphic multi-band cortical projection module.
+    pub fn new(num_bands: usize, d_rung: usize, d_band: usize, k_band: usize, rng: &mut Rng) -> Self {
+        assert!(num_bands > 0 && d_rung > 0 && d_band > 0, "dimensions must be positive");
+        assert!(k_band > 0 && k_band <= d_band, "k_band must satisfy 1 <= k_band <= d_band");
+
+        let mut phis = Vec::with_capacity(num_bands);
+        for _ in 0..num_bands {
+            let mut phi = Mat::zeros(d_band, d_rung);
+            let slice = phi.as_mut_slice();
+            for r in 0..d_band {
+                let row = &mut slice[r * d_rung..(r + 1) * d_rung];
+                rng.fill_unit_vector(row);
+            }
+            phis.push(phi);
+        }
+
+        Self {
+            num_bands,
+            d_rung,
+            d_band,
+            k_band,
+            d_sdr: num_bands * d_band,
+            k_active: num_bands * k_band,
+            phis,
+        }
+    }
+
+    #[inline]
+    pub fn num_bands(&self) -> usize {
+        self.num_bands
+    }
+
+    #[inline]
+    pub fn d_sdr(&self) -> usize {
+        self.d_sdr
+    }
+
+    #[inline]
+    pub fn k(&self) -> usize {
+        self.k_active
+    }
+
+    #[inline]
+    pub fn d_in(&self) -> usize {
+        self.num_bands * self.d_rung
+    }
+
+    /// Projects input `z \in \mathbb{R}^{m_{\text{in}} \cdot d}`, extracts local `k_{\text{band}}` active neurons per band,
+    /// and populates global active indices and normalized cosine weights across all bands.
+    pub fn project_and_select(
+        &self,
+        z: &[f64],
+        u_buf: &mut [f64],
+        pairs_buf: &mut Vec<(usize, f64)>,
+        out_active: &mut Vec<usize>,
+        out_alphas: &mut Vec<f64>,
+    ) {
+        assert_eq!(z.len(), self.d_in(), "input dimension mismatch");
+        assert_eq!(u_buf.len(), self.d_sdr, "output buffer size mismatch");
+        out_active.clear();
+        out_alphas.clear();
+
+        // 1. Identify which bands have active non-zero input energy (Energy-Gated Quiescence)
+        let mut active_bands = Vec::with_capacity(self.num_bands);
+        for b in 0..self.num_bands {
+            let z_chunk = &z[b * self.d_rung..(b + 1) * self.d_rung];
+            let mut energy = 0.0;
+            for &val in z_chunk {
+                energy += val * val;
+            }
+            if energy > 1e-12 {
+                active_bands.push(b);
+            }
+        }
+
+        if active_bands.is_empty() {
+            return;
+        }
+
+        let inv_bands = 1.0 / active_bands.len() as f64;
+
+        for &b in &active_bands {
+            let z_chunk = &z[b * self.d_rung..(b + 1) * self.d_rung];
+            let u_chunk = &mut u_buf[b * self.d_band..(b + 1) * self.d_band];
+            self.phis[b].mul_vec(z_chunk, u_chunk);
+
+            pairs_buf.clear();
+            pairs_buf.extend(u_chunk.iter().copied().enumerate());
+            let k_b = self.k_band;
+            pairs_buf.select_nth_unstable_by(k_b - 1, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let top = &mut pairs_buf[..k_b];
+            top.sort_unstable_by_key(|(idx, _)| *idx);
+
+            let band_offset = b * self.d_band;
+            let mut sum_pos = 0.0;
+            let start_alpha_idx = out_alphas.len();
+
+            for &(local_idx, val) in top.iter() {
+                out_active.push(band_offset + local_idx);
+                let pos = val.max(0.0);
+                out_alphas.push(pos);
+                sum_pos += pos;
+            }
+
+            if sum_pos > 1e-12 {
+                let inv_sum = inv_bands / sum_pos;
+                for alpha in &mut out_alphas[start_alpha_idx..] {
+                    *alpha *= inv_sum;
+                }
+            } else {
+                let uniform = inv_bands / k_b as f64;
+                for alpha in &mut out_alphas[start_alpha_idx..] {
+                    *alpha = uniform;
+                }
+            }
+        }
+    }
+}
+
 /// Underlying state backend for `SdrMemory`.
 #[derive(Clone, Debug)]
 pub enum MemoryBackend {
@@ -836,5 +975,77 @@ mod tests {
             logits1[2] > 0.0,
             "diffusive flux from deep rung U_2 must replenish surface U_1"
         );
+    }
+
+    #[test]
+    fn hierarchical_bands_projection_produces_exact_k_per_band() {
+        let mut rng = Rng::new(20260817);
+        let num_bands = 8;
+        let d_rung = 16;
+        let d_band = 16;
+        let k_band = 1;
+        let proj = HierarchicalBandsProjection::new(num_bands, d_rung, d_band, k_band, &mut rng);
+
+        assert_eq!(proj.d_sdr(), 128);
+        assert_eq!(proj.k(), 8);
+
+        let z = vec![0.5; num_bands * d_rung];
+        let mut u_buf = vec![0.0; 128];
+        let mut pairs_buf = Vec::new();
+        let mut active = Vec::new();
+        let mut alphas = Vec::new();
+
+        proj.project_and_select(&z, &mut u_buf, &mut pairs_buf, &mut active, &mut alphas);
+
+        assert_eq!(active.len(), 8);
+        assert_eq!(alphas.len(), 8);
+
+        // Verify each band contributed exactly 1 active neuron in its own interval [b*16, (b+1)*16)
+        for (b, &act) in active.iter().enumerate() {
+            assert!(
+                act >= b * 16 && act < (b + 1) * 16,
+                "Band {} active column {} out of expected interval [{}, {})",
+                b, act, b * 16, (b + 1) * 16
+            );
+        }
+
+        // Verify sum of alphas is strictly 1.0
+        let sum_alpha: f64 = alphas.iter().sum();
+        assert!((sum_alpha - 1.0).abs() < 1e-6, "alphas must sum to 1.0");
+    }
+
+    #[test]
+    fn hierarchical_bands_energy_gating_quiescence() {
+        let mut rng = Rng::new(20260817);
+        let num_bands = 8;
+        let d_rung = 16;
+        let d_band = 16;
+        let k_band = 1;
+        let proj = HierarchicalBandsProjection::new(num_bands, d_rung, d_band, k_band, &mut rng);
+
+        // Only Band 0 and Band 1 have energy, Bands 2..8 are strictly 0.0
+        let mut z = vec![0.0; num_bands * d_rung];
+        for i in 0..2 * d_rung {
+            z[i] = 1.0;
+        }
+
+        let mut u_buf = vec![0.0; 128];
+        let mut pairs_buf = Vec::new();
+        let mut active = Vec::new();
+        let mut alphas = Vec::new();
+
+        proj.project_and_select(&z, &mut u_buf, &mut pairs_buf, &mut active, &mut alphas);
+
+        // Exactly 2 active neurons from the 2 active bands, zero noise from inactive bands
+        assert_eq!(active.len(), 2, "only 2 bands with energy should activate");
+        assert_eq!(alphas.len(), 2);
+        assert!(active[0] < 16, "first neuron must be in Band 0");
+        assert!(active[1] >= 16 && active[1] < 32, "second neuron must be in Band 1");
+
+        // Alphas must sum to 1.0 and each be 0.5
+        let sum_alpha: f64 = alphas.iter().sum();
+        assert!((sum_alpha - 1.0).abs() < 1e-6, "alphas must sum to 1.0");
+        assert!((alphas[0] - 0.5).abs() < 1e-6);
+        assert!((alphas[1] - 0.5).abs() < 1e-6);
     }
 }
