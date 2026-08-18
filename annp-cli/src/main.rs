@@ -893,6 +893,21 @@ fn main() -> std::io::Result<()> {
                 out: out.clone(),
             };
             write_manifest(&out, "sdr", &cfg);
+            // Manipulation checks first: a null result cannot be read without
+            // knowing whether the isolation the design depends on has formed and
+            // whether the facts were seen often enough to learn at all.
+            let stream_for_checks = sdr_exp::RelationalFactStream::new(
+                cfg.mode,
+                cfg.domains,
+                cfg.facts_per_domain,
+                cfg.span_tokens,
+                cfg.rounds,
+                cfg.zipf_s,
+                cfg.hub_ratio,
+                cfg.vocab,
+            );
+            let checks = sdr_exp::measure_source(&cfg, &stream_for_checks);
+            sdr_exp::print_source_checks(&checks);
             let summaries = sdr_exp::run_sdr_experiment(&cfg);
             sdr_exp::export_and_print_results(&cfg, &summaries, &out)
         }

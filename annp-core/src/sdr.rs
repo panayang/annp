@@ -80,7 +80,11 @@ impl InputContextLadder {
         ladder_r: f64,
         embeddings: Vec<f64>,
     ) -> Self {
-        assert_eq!(embeddings.len(), vocab * d, "embedding buffer size mismatch");
+        assert_eq!(
+            embeddings.len(),
+            vocab * d,
+            "embedding buffer size mismatch"
+        );
         assert!(m_in >= 2, "input ladder requires at least 2 rungs");
 
         let schedule = Schedule::Geometric {
@@ -313,9 +317,21 @@ pub struct HierarchicalBandsProjection {
 
 impl HierarchicalBandsProjection {
     /// Initializes an isomorphic multi-band cortical projection module.
-    pub fn new(num_bands: usize, d_rung: usize, d_band: usize, k_band: usize, rng: &mut Rng) -> Self {
-        assert!(num_bands > 0 && d_rung > 0 && d_band > 0, "dimensions must be positive");
-        assert!(k_band > 0 && k_band <= d_band, "k_band must satisfy 1 <= k_band <= d_band");
+    pub fn new(
+        num_bands: usize,
+        d_rung: usize,
+        d_band: usize,
+        k_band: usize,
+        rng: &mut Rng,
+    ) -> Self {
+        assert!(
+            num_bands > 0 && d_rung > 0 && d_band > 0,
+            "dimensions must be positive"
+        );
+        assert!(
+            k_band > 0 && k_band <= d_band,
+            "k_band must satisfy 1 <= k_band <= d_band"
+        );
 
         let mut phis = Vec::with_capacity(num_bands);
         for _ in 0..num_bands {
@@ -581,8 +597,16 @@ impl SdrMemory {
     /// Forward pass: computes logits via non-negative cosine weighted summation of surface conductances U_1:
     /// `logits[v] = \sum_{j=0}^{k-1} alphas[j] * U_1(v, active[j])`.
     pub fn forward(&self, active: &[usize], alphas: &[f64], out_logits: &mut [f64]) {
-        assert_eq!(out_logits.len(), self.vocab, "output logits buffer size mismatch");
-        assert_eq!(active.len(), alphas.len(), "active and alphas length mismatch");
+        assert_eq!(
+            out_logits.len(),
+            self.vocab,
+            "output logits buffer size mismatch"
+        );
+        assert_eq!(
+            active.len(),
+            alphas.len(),
+            "active and alphas length mismatch"
+        );
         out_logits.fill(0.0);
 
         let d = self.d_sdr;
@@ -606,10 +630,7 @@ impl SdrMemory {
         assert_eq!(out_probs.len(), v_len, "probs buffer size mismatch");
         assert!(target < v_len, "target index out of bounds");
 
-        let peak = logits
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
+        let peak = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
         let mut sum_exp = 0.0;
         let mut best_v = 0;
@@ -664,7 +685,11 @@ impl SdrMemory {
         probs: &[f64],
     ) {
         assert_eq!(probs.len(), self.vocab, "probs size mismatch");
-        assert_eq!(active.len(), alphas.len(), "active and alphas length mismatch");
+        assert_eq!(
+            active.len(),
+            alphas.len(),
+            "active and alphas length mismatch"
+        );
         assert!(target < self.vocab, "target index out of bounds");
 
         if eta <= 0.0 {
@@ -787,7 +812,10 @@ mod tests {
         for k in 0..3 {
             let chunk = &z[k * 16..(k + 1) * 16];
             let sq: f64 = chunk.iter().map(|x| x * x).sum();
-            assert!((sq.sqrt() - 1.0).abs() < 1e-10, "rung {k} chunk must have unit norm");
+            assert!(
+                (sq.sqrt() - 1.0).abs() < 1e-10,
+                "rung {k} chunk must have unit norm"
+            );
         }
     }
 
@@ -839,7 +867,10 @@ mod tests {
 
         let r0_init = mem.read_rung(0).get(3, 0);
         let r1_init = mem.read_rung(1).get(3, 0);
-        assert!(r0_init > 0.0 && r1_init > 0.0, "rungs should have accumulated charge");
+        assert!(
+            r0_init > 0.0 && r1_init > 0.0,
+            "rungs should have accumulated charge"
+        );
 
         // Now train disjoint columns [5, 6, 7] on target 1 for 1000 steps
         // Column 0 is SILENT throughout this period
@@ -888,7 +919,10 @@ mod tests {
         }
 
         let deep_charge = mem.read_rung(2).get(5, 2);
-        assert!(deep_charge > 0.0, "deep rung must have absorbed consolidated charge");
+        assert!(
+            deep_charge > 0.0,
+            "deep rung must have absorbed consolidated charge"
+        );
 
         // 2. Now apply conflicting gradient on target 1 into column 2 for a few steps
         for _ in 0..5 {
@@ -897,7 +931,10 @@ mod tests {
 
         // Deep rung 2 still maintains positive memory for target 5
         let deep_after = mem.read_rung(2).get(5, 2);
-        assert!(deep_after > 0.0, "deep memory must persist through short conflicting bursts");
+        assert!(
+            deep_after > 0.0,
+            "deep memory must persist through short conflicting bursts"
+        );
     }
 
     #[test]
@@ -922,8 +959,14 @@ mod tests {
         let w_stiff = mem_stiff.read_fast_weights().get(2, 2);
 
         // Under high EWC lambda, weights move less towards new target
-        assert!(w_stiff < w_free, "EWC must restrain weights from rapid shifting");
-        assert!(!w_stiff.is_nan() && !w_stiff.is_infinite(), "EWC proximal update must be stable");
+        assert!(
+            w_stiff < w_free,
+            "EWC must restrain weights from rapid shifting"
+        );
+        assert!(
+            !w_stiff.is_nan() && !w_stiff.is_infinite(),
+            "EWC proximal update must be stable"
+        );
     }
 
     #[test]
@@ -1005,7 +1048,10 @@ mod tests {
             assert!(
                 act >= b * 16 && act < (b + 1) * 16,
                 "Band {} active column {} out of expected interval [{}, {})",
-                b, act, b * 16, (b + 1) * 16
+                b,
+                act,
+                b * 16,
+                (b + 1) * 16
             );
         }
 
@@ -1025,8 +1071,8 @@ mod tests {
 
         // Only Band 0 and Band 1 have energy, Bands 2..8 are strictly 0.0
         let mut z = vec![0.0; num_bands * d_rung];
-        for i in 0..2 * d_rung {
-            z[i] = 1.0;
+        for v in z.iter_mut().take(2 * d_rung) {
+            *v = 1.0;
         }
 
         let mut u_buf = vec![0.0; 128];
@@ -1040,7 +1086,10 @@ mod tests {
         assert_eq!(active.len(), 2, "only 2 bands with energy should activate");
         assert_eq!(alphas.len(), 2);
         assert!(active[0] < 16, "first neuron must be in Band 0");
-        assert!(active[1] >= 16 && active[1] < 32, "second neuron must be in Band 1");
+        assert!(
+            active[1] >= 16 && active[1] < 32,
+            "second neuron must be in Band 1"
+        );
 
         // Alphas must sum to 1.0 and each be 0.5
         let sum_alpha: f64 = alphas.iter().sum();
