@@ -123,7 +123,11 @@ impl RelationalFactStream {
         vocab: usize,
     ) -> Self {
         let total_entities = (domains * facts_per_domain).max(128);
-        let hub_count = ((total_entities as f64) * hub_ratio.clamp(0.15, 0.40))
+        // Clamp bounds match section 2.1's stated range so a caller's value is
+        // honoured rather than silently overridden. The old floor of 0.15
+        // exceeded the CLI default of 0.10, so every run using the default
+        // was actually running at 0.15 without any indication of it.
+        let hub_count = ((total_entities as f64) * hub_ratio.clamp(0.05, 0.40))
             .round()
             .max(4.0) as usize;
         let domain_entity_count = (total_entities - hub_count) / domains;
@@ -929,7 +933,20 @@ pub fn run_arm_trial(
         ArmKind::Ladder4 => SdrMemory::new_ladder(cfg.vocab, cfg.d_sdr, 4, schedule),
         ArmKind::Ladder2 => SdrMemory::new_ladder(cfg.vocab, cfg.d_sdr, 2, schedule),
         ArmKind::Plain => SdrMemory::new_plain(cfg.vocab, cfg.d_sdr),
-        ArmKind::ProximalEwc { lambda } => SdrMemory::new_ewc(cfg.vocab, cfg.d_sdr, lambda, 0.05),
+        // Anchor/Fisher follow rate. Its inverse is EWC's memory timescale, and
+        // it has to span what the stream asks it to hold. The old value 0.05
+        // gives tau=20 steps against a domain visit of span_tokens/3 (~6666)
+        // and a full cycle of domains*span_tokens/3 (~26664): by five time
+        // constants (~100 steps) into a new domain the anchor has already
+        // converged onto it and forgotten the one before, so the penalty pulls
+        // toward a moving target rather than toward old-domain knowledge --
+        // indistinguishable from no anchor at all. Same failure as the
+        // hardcoded ladder g1 fixed earlier and the grow.rs EWC trail fixed
+        // days ago; this call site was never updated to match.
+        ArmKind::ProximalEwc { lambda } => {
+            let cycle = (cfg.domains * (cfg.span_tokens / 3)).max(1) as f64;
+            SdrMemory::new_ewc(cfg.vocab, cfg.d_sdr, lambda, 1.0 / cycle)
+        }
     };
 
     let mut records = Vec::new();

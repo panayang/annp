@@ -551,7 +551,8 @@ enum Command {
         /// Zipf power-law exponent s.
         #[arg(long, default_value_t = 1.0)]
         zipf_s: f64,
-        /// Fraction of entities that are global cross-domain hubs.
+        /// Fraction of entities that are global cross-domain hubs. Clamped to
+        /// [0.05, 0.40] in the stream generator.
         #[arg(long, default_value_t = 0.10)]
         hub_ratio: f64,
         /// Learning rate eta. If omitted, sweeps grid [0.01, 0.03, 0.1, 0.3, 1.0, 3.0].
