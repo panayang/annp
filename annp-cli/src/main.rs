@@ -565,6 +565,10 @@ enum Command {
         mode: String,
         #[arg(long, default_value_t = 20260817)]
         seed: u64,
+        /// Print the source checks and stop. They depend only on the stream
+        /// and the fixed projection, so they cost nothing next to the arms.
+        #[arg(long)]
+        source_only: bool,
         #[arg(long, default_value = "results/sdr")]
         out: PathBuf,
     },
@@ -870,6 +874,7 @@ fn main() -> std::io::Result<()> {
             eta,
             ewc_lambda,
             mode,
+            source_only,
             seed,
             out,
         } => {
@@ -908,6 +913,9 @@ fn main() -> std::io::Result<()> {
             );
             let checks = sdr_exp::measure_source(&cfg, &stream_for_checks);
             sdr_exp::print_source_checks(&checks);
+            if source_only {
+                return Ok(());
+            }
             let summaries = sdr_exp::run_sdr_experiment(&cfg);
             sdr_exp::export_and_print_results(&cfg, &summaries, &out)
         }

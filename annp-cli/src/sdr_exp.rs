@@ -783,6 +783,12 @@ pub struct SourceChecks {
     pub mean_overlap: f64,
     pub exposure_by_tier: [(f64, f64, f64); 3],
     pub active_fraction: f64,
+    /// Fraction of the active set retained from one step to the next, and from
+    /// a hundred steps earlier. A code that does not turn over is not encoding
+    /// the input, and then a high domain overlap and a small set of neurons
+    /// ever used are both consequences of that rather than separate problems.
+    pub retention_1: f64,
+    pub retention_100: f64,
 }
 
 pub fn measure_source(cfg: &SdrConfig, stream: &RelationalFactStream) -> SourceChecks {
@@ -796,6 +802,8 @@ pub fn measure_source(cfg: &SdrConfig, stream: &RelationalFactStream) -> SourceC
     let mut active = Vec::with_capacity(cfg.k_active);
     let mut alphas = Vec::with_capacity(cfg.k_active);
     let mut walk_ladder = ladder.clone();
+    let mut history: std::collections::VecDeque<Vec<usize>> = std::collections::VecDeque::new();
+    let (mut keep1, mut keep100, mut n1, mut n100) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
 
     // One full pass of the cycling stream, exactly as training sees it.
     for _ in 0..cfg.rounds {
@@ -812,6 +820,26 @@ pub fn measure_source(cfg: &SdrConfig, stream: &RelationalFactStream) -> SourceC
                 );
                 for &i in &active {
                     act[i] += 1.0;
+                }
+                let now: Vec<usize> = {
+                    let mut v = active.clone();
+                    v.sort_unstable();
+                    v
+                };
+                if let Some(prev) = history.back() {
+                    let shared = now.iter().filter(|i| prev.binary_search(i).is_ok()).count();
+                    keep1 += shared as f64 / now.len() as f64;
+                    n1 += 1.0;
+                }
+                if history.len() >= 100 {
+                    let old = &history[history.len() - 100];
+                    let shared = now.iter().filter(|i| old.binary_search(i).is_ok()).count();
+                    keep100 += shared as f64 / now.len() as f64;
+                    n100 += 1.0;
+                }
+                history.push_back(now);
+                if history.len() > 101 {
+                    history.pop_front();
                 }
                 walk_ladder.step(fact.target);
             }
@@ -869,6 +897,8 @@ pub fn measure_source(cfg: &SdrConfig, stream: &RelationalFactStream) -> SourceC
         mean_overlap: if off_n > 0.0 { off_sum / off_n } else { 0.0 },
         exposure_by_tier,
         active_fraction: used,
+        retention_1: if n1 > 0.0 { keep1 / n1 } else { f64::NAN },
+        retention_100: if n100 > 0.0 { keep100 / n100 } else { f64::NAN },
     }
 }
 
@@ -1070,6 +1100,14 @@ pub fn print_source_checks(c: &SourceChecks) {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+    }
+    println!(
+        "  active set retained: {:.3} after 1 step, {:.3} after 100 steps  (chance {:.3})",
+        c.retention_1, c.retention_100, 0.0
+    );
+    if c.retention_1 > 0.9 {
+        println!("  !! the code barely turns over -- it is not encoding the input, and the");
+        println!("     domain overlap above is a consequence of that rather than a separate fact");
     }
     println!(
         "  neurons ever used: {:.1}% of D",

@@ -153,6 +153,31 @@ impl InputContextLadder {
         // 2. Advance multi-timescale diffusion
         self.ladder.relax();
 
+        // 2b. Leak each rung to an outside sink at its own timescale.
+        //
+        // The ladder conserves sum_k C_k U_k by construction -- that is the
+        // whole point when it holds weights, where deep rungs are meant to
+        // never forget. A context trace needs the opposite: recent input
+        // should dominate, and with no outflow the raw state accumulates one
+        // unit-norm vector every step forever. Measured before this fix:
+        // ||rung0|| grew as 1.1*sqrt(t) -- 2.1 at t=10, 69.0 at t=3999, a
+        // textbook random walk with zero leak. Adding a unit vector to a
+        // vector of norm N rotates it by ~1/N radians, so the code's direction
+        // -- and therefore which neurons win top-k -- froze regardless of
+        // m_in or hub_ratio, since every m_in inherits this from rung 0 alone.
+        //
+        // The fix reuses tau_k = relaxation_time(k), the same per-rung
+        // timescale the design already claims (Z_1 ~ 2 steps ... Z_8 ~ 256+
+        // steps), so this is the first place that promise is actually
+        // realised rather than asserted in prose.
+        for k in 0..self.ladder.num_rungs() {
+            let tau = self.ladder.relaxation_time(k);
+            let decay = (-1.0 / tau).exp();
+            for v in self.ladder.rungs_mut()[k].as_mut_slice() {
+                *v *= decay;
+            }
+        }
+
         // 3. Normalize each rung independently and concatenate into buffer
         let d = self.d;
         for (k, rung) in self.ladder.rungs_mut().iter().enumerate() {
@@ -794,6 +819,46 @@ impl SdrMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_rung_norm_growth_diagnostic() {
+        // Diagnostic, not an assertion: does the ladder's internal state ever
+        // saturate, or does it accumulate without bound? `step()` adds the
+        // embedding into rung 0 directly and only divides by the norm at read
+        // time -- nothing caps the raw magnitude in between. If inflow (one
+        // unit-norm vector per step) exceeds outflow (leak at rate g1 to the
+        // next rung), the raw norm grows unboundedly, and since adding a unit
+        // vector to a vector of norm N rotates it by roughly 1/N radians, a
+        // large norm means the code stops turning over regardless of what the
+        // input actually is. That would explain the committee staying fixed
+        // across every m_in and hub_ratio swept so far, since it is purely
+        // geometric and does not depend on either.
+        let mut rng = Rng::new(1);
+        let vocab = 1024;
+        let mut ladder = InputContextLadder::new(32, vocab, 8, 2.0, &mut rng);
+        // Zipf-biased repetition, matching what a hub entity sees in the real
+        // stream: token 0 dominant, a long tail of others.
+        let mut draw = Rng::new(2);
+        for step in 0..4000usize {
+            let tok = if draw.next_f64() < 0.6 {
+                0
+            } else {
+                (draw.next_below(vocab as u64 - 1) + 1) as usize
+            };
+            ladder.step(tok);
+            if step == 10
+                || step == 100
+                || step == 500
+                || step == 1000
+                || step == 2000
+                || step == 3999
+            {
+                let raw: Vec<f64> = ladder.ladder.rungs()[0].as_slice().to_vec();
+                let norm = raw.iter().map(|v| v * v).sum::<f64>().sqrt();
+                println!("step {step:>5}: ||rung0|| = {norm:.4}");
+            }
+        }
+    }
 
     #[test]
     fn input_context_ladder_diffuses_and_normalizes() {
