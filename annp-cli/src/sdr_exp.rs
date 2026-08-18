@@ -108,6 +108,7 @@ impl RelationalFactStream {
                 span_tokens,
                 rounds,
                 zipf_s,
+                hub_ratio,
                 vocab,
             ),
         }
@@ -349,6 +350,7 @@ impl RelationalFactStream {
         span_tokens: usize,
         rounds: usize,
         zipf_s: f64,
+        hub_ratio: f64,
         vocab: usize,
     ) -> Self {
         let shared_entities_count = facts_per_domain.max(32);
@@ -368,7 +370,13 @@ impl RelationalFactStream {
         let mut walks = Vec::with_capacity(domains);
         let mut prefixes = Vec::with_capacity(domains);
 
-        let hub_count = (shared_entities_count as f64 * 0.20).round().max(2.0) as usize;
+        // Was hardcoded to 0.20 regardless of what was passed in, so
+        // --hub-ratio was a no-op for Mode B: both benches run before this fix
+        // produced byte-identical results across a change that only touched
+        // hub_ratio, because Mode B never saw it. Clamp matches Mode A's.
+        let hub_count = (shared_entities_count as f64 * hub_ratio.clamp(0.05, 0.40))
+            .round()
+            .max(2.0) as usize;
         let mid_count = (shared_entities_count as f64 * 0.30).round().max(2.0) as usize;
 
         for d in 0..domains {
@@ -444,7 +452,7 @@ impl RelationalFactStream {
             span_tokens,
             rounds,
             zipf_s,
-            hub_ratio: 0.20,
+            hub_ratio,
             vocab,
             facts,
             walks,
