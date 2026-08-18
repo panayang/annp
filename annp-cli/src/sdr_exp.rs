@@ -1126,10 +1126,27 @@ pub fn run_sdr_experiment(cfg: &SdrConfig) -> Vec<ArmSummary> {
         }
     }
 
+    // Progress, because a silent three-hour run is indistinguishable from a
+    // stalled one. Nothing was printed between the source checks and the final
+    // table, so the only way to tell a slow bench from a dead one was to read
+    // process CPU counters over ssh.
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let total_base = base_tasks.len();
+    let started = std::time::Instant::now();
     let base_results: Vec<TrialResult> = base_tasks
         .into_par_iter()
         .map(|(arm, eta)| {
-            let (records, round_accs, round_losses) = run_arm_trial(arm, eta, cfg, &stream);
+            let out = run_arm_trial(arm, eta, cfg, &stream);
+            let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let secs = started.elapsed().as_secs_f64();
+            println!(
+                "  [{n}/{total_base}] {} eta={eta} done, {secs:.0}s elapsed, ~{:.0}s left",
+                arm.short_name(),
+                secs / n as f64 * (total_base - n) as f64
+            );
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            let (records, round_accs, round_losses) = out;
             (arm, eta, records, round_accs, round_losses)
         })
         .collect();
@@ -1269,11 +1286,26 @@ pub fn run_sdr_experiment(cfg: &SdrConfig) -> Vec<ArmSummary> {
         }
     }
 
+    // EWC updates the whole `vocab x d_sdr` matrix every step while the ladder
+    // arms touch only the k active columns, so these trials cost roughly twenty
+    // times more each and dominate the wall clock.
+    let ewc_done = std::sync::atomic::AtomicUsize::new(0);
+    let total_ewc = ewc_tasks.len();
+    let ewc_started = std::time::Instant::now();
     let ewc_trials: Vec<EwcTrialResult> = ewc_tasks
         .into_par_iter()
         .map(|(lam, eta)| {
             let arm = ArmKind::ProximalEwc { lambda: lam };
-            let (records, round_accs, round_losses) = run_arm_trial(arm, eta, cfg, &stream);
+            let out = run_arm_trial(arm, eta, cfg, &stream);
+            let n = ewc_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let secs = ewc_started.elapsed().as_secs_f64();
+            println!(
+                "  [ewc {n}/{total_ewc}] lambda={lam} eta={eta} done, {secs:.0}s elapsed, ~{:.0}s left",
+                secs / n as f64 * (total_ewc - n) as f64
+            );
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            let (records, round_accs, round_losses) = out;
             (lam, eta, records, round_accs, round_losses)
         })
         .collect();
