@@ -77,6 +77,7 @@ pub struct RelationalFactStream {
 impl RelationalFactStream {
     /// Constructs a stream generator under either Mode A (orthogonal) or Mode B (semantic collision).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mode: StreamMode,
         domains: usize,
@@ -86,6 +87,7 @@ impl RelationalFactStream {
         zipf_s: f64,
         hub_ratio: f64,
         vocab: usize,
+        seed: u64,
     ) -> Self {
         assert!(domains > 0, "domains must be positive");
         assert!(facts_per_domain >= 3, "facts_per_domain must be >= 3");
@@ -101,6 +103,7 @@ impl RelationalFactStream {
                 zipf_s,
                 hub_ratio,
                 vocab,
+                seed,
             ),
             StreamMode::ModeB => Self::new_mode_b(
                 domains,
@@ -110,10 +113,12 @@ impl RelationalFactStream {
                 zipf_s,
                 hub_ratio,
                 vocab,
+                seed,
             ),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_mode_a(
         domains: usize,
         facts_per_domain: usize,
@@ -122,6 +127,7 @@ impl RelationalFactStream {
         zipf_s: f64,
         hub_ratio: f64,
         vocab: usize,
+        seed: u64,
     ) -> Self {
         let total_entities = (domains * facts_per_domain).max(128);
         // Clamp bounds match section 2.1's stated range so a caller's value is
@@ -142,7 +148,7 @@ impl RelationalFactStream {
             "vocab size {vocab} too small for entities ({total_entities}) + relations ({rel_count})"
         );
 
-        let mut rng = Rng::new(20260817);
+        let mut rng = Rng::new(seed);
 
         // Entity zipfian weights: w(e_i) = 1 / (i + 1)^s
         let entity_weights: Vec<f64> = (0..total_entities)
@@ -344,6 +350,7 @@ impl RelationalFactStream {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_mode_b(
         domains: usize,
         facts_per_domain: usize,
@@ -352,6 +359,7 @@ impl RelationalFactStream {
         zipf_s: f64,
         hub_ratio: f64,
         vocab: usize,
+        seed: u64,
     ) -> Self {
         let shared_entities_count = facts_per_domain.max(32);
         let shared_rel_count = 4;
@@ -364,7 +372,15 @@ impl RelationalFactStream {
             "vocab {vocab} too small for Mode B (needs {total_required})"
         );
 
-        let mut rng = Rng::new(20260817);
+        // Stream (entities, edges, probe facts, walk) was hardcoded to seed
+        // 20260817 regardless of --seed, so every "multi-seed" run so far
+        // would have varied only embeddings and weight init while probing the
+        // exact same facts with the exact same walk. That matters specifically
+        // because tail_0shot is a small-sample statistic (~136 facts at
+        // facts_per_domain=100) where a handful of facts changes the number by
+        // several points -- multi-seeding without this fix would not have
+        // averaged out that noise at all.
+        let mut rng = Rng::new(seed);
 
         let mut facts = Vec::with_capacity(domains);
         let mut walks = Vec::with_capacity(domains);
@@ -1163,6 +1179,7 @@ pub fn run_sdr_experiment(cfg: &SdrConfig) -> Vec<ArmSummary> {
         cfg.zipf_s,
         cfg.hub_ratio,
         cfg.vocab,
+        cfg.seed,
     );
 
     let eta_grid = if let Some(e) = cfg.eta {
@@ -1336,10 +1353,16 @@ pub fn run_sdr_experiment(cfg: &SdrConfig) -> Vec<ArmSummary> {
     }
 
     // Evaluate Online Proximal EWC arm across lambda and eta grids in parallel
+    // Trimmed from five points to three. The small fixed-eta sweep that
+    // verified the trail fix (0, 10, 100, 1000) showed lambda 10 and 100
+    // already sit on the same smooth 0-shot/few-shot trade-off curve, so the
+    // omitted 0.1 and 1.0 points would not have changed which lambda wins;
+    // this halves the EWC grid's trial count for a multi-seed pass under a
+    // tight budget.
     let lambda_grid = if let Some(l) = cfg.ewc_lambda {
         vec![l]
     } else {
-        vec![0.0, 0.1, 1.0, 10.0, 100.0]
+        vec![0.0, 10.0, 100.0]
     };
 
     let mut ewc_tasks = Vec::with_capacity(lambda_grid.len() * eta_grid.len());
@@ -1896,7 +1919,8 @@ mod tests {
 
     #[test]
     fn zipf_graph_stream_generation_mode_a() {
-        let stream = RelationalFactStream::new(StreamMode::ModeA, 4, 20, 200, 3, 1.0, 0.10, 512);
+        let stream =
+            RelationalFactStream::new(StreamMode::ModeA, 4, 20, 200, 3, 1.0, 0.10, 512, 20260817);
         assert_eq!(stream.facts.len(), 4);
         assert_eq!(stream.facts[0].len(), 20);
         assert_eq!(stream.walks.len(), 4);
@@ -1905,7 +1929,8 @@ mod tests {
 
     #[test]
     fn zipf_graph_stream_generation_mode_b() {
-        let stream = RelationalFactStream::new(StreamMode::ModeB, 4, 32, 200, 3, 1.0, 0.20, 512);
+        let stream =
+            RelationalFactStream::new(StreamMode::ModeB, 4, 32, 200, 3, 1.0, 0.20, 512, 20260817);
         assert_eq!(stream.facts.len(), 4);
         assert_eq!(stream.facts[0].len(), 32);
         assert_eq!(stream.walks.len(), 4);
@@ -1915,7 +1940,8 @@ mod tests {
 
     #[test]
     fn frozen_probe_slice_does_not_modify_memory() {
-        let stream = RelationalFactStream::new(StreamMode::ModeA, 2, 10, 100, 2, 1.0, 0.10, 512);
+        let stream =
+            RelationalFactStream::new(StreamMode::ModeA, 2, 10, 100, 2, 1.0, 0.10, 512, 20260817);
         let mut rng = Rng::new(20260817);
         let ladder = InputContextLadder::new(16, 512, 4, 2.0, &mut rng);
         let proj = RandomProjection::new(ladder.total_dim(), 64, 8, &mut rng);

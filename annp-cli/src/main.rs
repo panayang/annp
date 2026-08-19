@@ -911,6 +911,7 @@ fn main() -> std::io::Result<()> {
                 cfg.zipf_s,
                 cfg.hub_ratio,
                 cfg.vocab,
+                cfg.seed,
             );
             let checks = sdr_exp::measure_source(&cfg, &stream_for_checks);
             sdr_exp::print_source_checks(&checks);
