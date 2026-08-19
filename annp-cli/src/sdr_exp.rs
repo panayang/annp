@@ -1353,16 +1353,17 @@ pub fn run_sdr_experiment(cfg: &SdrConfig) -> Vec<ArmSummary> {
     }
 
     // Evaluate Online Proximal EWC arm across lambda and eta grids in parallel
-    // Trimmed from five points to three. The small fixed-eta sweep that
-    // verified the trail fix (0, 10, 100, 1000) showed lambda 10 and 100
-    // already sit on the same smooth 0-shot/few-shot trade-off curve, so the
-    // omitted 0.1 and 1.0 points would not have changed which lambda wins;
-    // this halves the EWC grid's trial count for a multi-seed pass under a
-    // tight budget.
+    // Trimmed from five points to three. The first cut (0, 10, 100) was
+    // wrong: those two nonzero points already sit on the same saturated
+    // trade-off curve in the fixed-eta check, which says nothing about
+    // whether the real optimum sits somewhere in the untested (0, 10) gap.
+    // Bracketing the low end instead -- where the transition from "off" to
+    // "engaged" actually happens -- is where a smaller-than-10 optimum would
+    // show up if one exists.
     let lambda_grid = if let Some(l) = cfg.ewc_lambda {
         vec![l]
     } else {
-        vec![0.0, 10.0, 100.0]
+        vec![0.0, 1.0, 10.0]
     };
 
     let mut ewc_tasks = Vec::with_capacity(lambda_grid.len() * eta_grid.len());
