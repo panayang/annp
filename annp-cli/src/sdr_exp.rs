@@ -490,6 +490,12 @@ pub struct ProbeResult {
     pub acc_mid: f64,
     pub acc_tail: f64,
     pub mean_loss: f64,
+    /// Mean loss restricted to mid+tail facts -- the domain-specific ones.
+    /// Hub facts (Tier 0) are shared identically across every domain in
+    /// Mode A, so other domains keep training them while this domain is
+    /// "away"; a retention probe that includes hub facts is not measuring
+    /// forgetting for roughly a third of its own sample.
+    pub mean_loss_domain_specific: f64,
     pub count: usize,
 }
 
@@ -516,10 +522,11 @@ impl FrozenProbeSlice {
         facts: &[RelationalFact],
         prefix: &[usize],
         ladder_template: &InputContextLadder,
-        proj: &RandomProjection,
+        proj: &mut RandomProjection,
         memory: &mut SdrMemory,
     ) -> ProbeResult {
         let mut u_buf = vec![0.0; proj.d_sdr()];
+        let mut calib_buf = vec![0.0; proj.d_sdr()];
         let mut pairs_buf = Vec::with_capacity(proj.d_sdr());
         let mut active = Vec::with_capacity(proj.k());
         let mut alphas = Vec::with_capacity(proj.k());
@@ -533,6 +540,8 @@ impl FrozenProbeSlice {
         let mut count_tail = 0;
 
         let mut total_loss = 0.0;
+        let mut domain_specific_loss = 0.0;
+        let mut domain_specific_count = 0usize;
         let mut online_ladder = ladder_template.clone();
 
         for fact in facts {
@@ -544,7 +553,14 @@ impl FrozenProbeSlice {
             online_ladder.step(fact.relation);
 
             let z = online_ladder.normalized_trace();
-            proj.project_and_select(z, &mut u_buf, &mut pairs_buf, &mut active, &mut alphas);
+            proj.project_and_select(
+                z,
+                &mut u_buf,
+                &mut calib_buf,
+                &mut pairs_buf,
+                &mut active,
+                &mut alphas,
+            );
 
             let (loss, is_correct) = memory.predict(&active, &alphas, fact.target);
             if is_correct {
@@ -559,6 +575,10 @@ impl FrozenProbeSlice {
                 0 => count_hub += 1,
                 1 => count_mid += 1,
                 _ => count_tail += 1,
+            }
+            if fact.rank_tier != 0 {
+                domain_specific_loss += loss;
+                domain_specific_count += 1;
             }
             total_loss += loss;
         }
@@ -581,6 +601,11 @@ impl FrozenProbeSlice {
             accuracy
         };
         let mean_loss = total_loss / count as f64;
+        let mean_loss_domain_specific = if domain_specific_count > 0 {
+            domain_specific_loss / domain_specific_count as f64
+        } else {
+            mean_loss
+        };
         let domain = facts.first().map(|f| f.domain).unwrap_or(0);
 
         ProbeResult {
@@ -590,6 +615,7 @@ impl FrozenProbeSlice {
             acc_mid,
             acc_tail,
             mean_loss,
+            mean_loss_domain_specific,
             count,
         }
     }
@@ -600,7 +626,7 @@ impl FrozenProbeSlice {
         facts: &[RelationalFact],
         prefix: &[usize],
         ladder_template: &InputContextLadder,
-        proj: &RandomProjection,
+        proj: &mut RandomProjection,
         memory: &SdrMemory,
         eta: f64,
         seed: u64,
@@ -615,6 +641,7 @@ impl FrozenProbeSlice {
         let mut few_tail = [base_probe.acc_tail; 5];
 
         let mut u_buf = vec![0.0; proj.d_sdr()];
+        let mut calib_buf = vec![0.0; proj.d_sdr()];
         let mut pairs_buf = Vec::with_capacity(proj.d_sdr());
         let mut active = Vec::with_capacity(proj.k());
         let mut alphas = Vec::with_capacity(proj.k());
@@ -635,7 +662,14 @@ impl FrozenProbeSlice {
                 online_ladder.step(fact.relation);
 
                 let z = online_ladder.normalized_trace();
-                proj.project_and_select(z, &mut u_buf, &mut pairs_buf, &mut active, &mut alphas);
+                proj.project_and_select(
+                    z,
+                    &mut u_buf,
+                    &mut calib_buf,
+                    &mut pairs_buf,
+                    &mut active,
+                    &mut alphas,
+                );
 
                 temp_mem.observe(&active, &alphas, fact.target, eta);
             }
@@ -809,6 +843,13 @@ pub struct SdrConfig {
 pub struct SourceChecks {
     pub overlap: Vec<Vec<f64>>,
     pub mean_overlap: f64,
+    /// Same shared-activation-mass overlap, but the activity histogram only
+    /// counts steps on domain-specific (mid+tail, rank_tier != 0) facts --
+    /// hub-tier (rank_tier == 0) steps are excluded from the histogram
+    /// entirely, not just from the probe loss. Separates "domains overlap
+    /// because they share a hub layer by design" from "domains overlap
+    /// because distinct leaf entities collide in D_sdr space regardless".
+    pub mean_overlap_leaf_only: f64,
     pub exposure_by_tier: [(f64, f64, f64); 3],
     pub active_fraction: f64,
     /// Fraction of the active set retained from one step to the next, and from
@@ -817,15 +858,48 @@ pub struct SourceChecks {
     /// ever used are both consequences of that rather than separate problems.
     pub retention_1: f64,
     pub retention_100: f64,
+    /// Share of total win-mass (activation count, pooled across all domains)
+    /// held by the single most-selected column, and by the top 10. If the
+    /// fixed random projection has hubs -- some columns winning top-k for a
+    /// disproportionate share of contexts purely from concentration of
+    /// measure in high dimensions, independent of content -- this is where
+    /// it would show up: skew far beyond what 44.6%-of-D-ever-used alone
+    /// tells you, since that stat is silent on how uneven the used half is.
+    pub top1_win_share: f64,
+    pub top10_win_share: f64,
+    /// How many columns (out of D_sdr, sorted by win count descending)
+    /// account for half of all activation mass. A uniform code would need
+    /// close to D_sdr/2; a hub-dominated one needs far fewer.
+    pub cols_for_half_mass: usize,
+}
+
+/// EMA follow rate for `RandomProjection`'s per-column hub-correction
+/// statistics. Unlike the EWC anchor/Fisher trail, this stat chases a
+/// roughly stationary target (Phi is fixed and the trace's marginal
+/// distribution doesn't shift at domain boundaries the way a per-domain
+/// anchor would need to track), so there's no moving-target risk in
+/// picking a window shorter than a full cycle -- one domain visit is enough
+/// for it to lock in and then stay a smooth running statistic for the rest
+/// of the run.
+fn calib_rate(cfg: &SdrConfig) -> f64 {
+    1.0 / cfg.span_tokens.max(1) as f64
 }
 
 pub fn measure_source(cfg: &SdrConfig, stream: &RelationalFactStream) -> SourceChecks {
     let mut rng = Rng::new(cfg.seed);
     let ladder = InputContextLadder::new(cfg.d_input, cfg.vocab, cfg.m_in, cfg.ladder_r, &mut rng);
-    let proj = RandomProjection::new(ladder.total_dim(), cfg.d_sdr, cfg.k_active, &mut rng);
+    let mut proj = RandomProjection::new(
+        ladder.total_dim(),
+        cfg.d_sdr,
+        cfg.k_active,
+        calib_rate(cfg),
+        &mut rng,
+    );
 
     let mut activity = vec![vec![0.0f64; cfg.d_sdr]; cfg.domains];
+    let mut activity_leaf = vec![vec![0.0f64; cfg.d_sdr]; cfg.domains];
     let mut u_buf = vec![0.0; cfg.d_sdr];
+    let mut calib_buf = vec![0.0; cfg.d_sdr];
     let mut pairs = Vec::with_capacity(cfg.d_sdr);
     let mut active = Vec::with_capacity(cfg.k_active);
     let mut alphas = Vec::with_capacity(cfg.k_active);
@@ -835,19 +909,29 @@ pub fn measure_source(cfg: &SdrConfig, stream: &RelationalFactStream) -> SourceC
 
     // One full pass of the cycling stream, exactly as training sees it.
     for _ in 0..cfg.rounds {
-        for (act, walk) in activity.iter_mut().zip(&stream.walks) {
+        for ((act, act_leaf), walk) in activity
+            .iter_mut()
+            .zip(activity_leaf.iter_mut())
+            .zip(&stream.walks)
+        {
             for fact in walk {
                 walk_ladder.step(fact.entity);
                 walk_ladder.step(fact.relation);
                 proj.project_and_select(
                     walk_ladder.normalized_trace(),
                     &mut u_buf,
+                    &mut calib_buf,
                     &mut pairs,
                     &mut active,
                     &mut alphas,
                 );
                 for &i in &active {
                     act[i] += 1.0;
+                }
+                if fact.rank_tier != 0 {
+                    for &i in &active {
+                        act_leaf[i] += 1.0;
+                    }
                 }
                 let now: Vec<usize> = {
                     let mut v = active.clone();
@@ -875,30 +959,60 @@ pub fn measure_source(cfg: &SdrConfig, stream: &RelationalFactStream) -> SourceC
     }
 
     // Shared activation mass between each pair of domains.
-    let norm: Vec<Vec<f64>> = activity
-        .iter()
-        .map(|a| {
-            let s: f64 = a.iter().sum::<f64>().max(f64::MIN_POSITIVE);
-            a.iter().map(|v| v / s).collect()
-        })
-        .collect();
-    let mut overlap = vec![vec![0.0; cfg.domains]; cfg.domains];
-    let (mut off_sum, mut off_n) = (0.0, 0.0);
-    for a in 0..cfg.domains {
-        for b in 0..cfg.domains {
-            let o: f64 = norm[a].iter().zip(&norm[b]).map(|(x, y)| x.min(*y)).sum();
-            overlap[a][b] = o;
-            if a != b {
-                off_sum += o;
-                off_n += 1.0;
+    let pairwise_overlap = |raw: &[Vec<f64>]| -> (Vec<Vec<f64>>, f64) {
+        let norm: Vec<Vec<f64>> = raw
+            .iter()
+            .map(|a| {
+                let s: f64 = a.iter().sum::<f64>().max(f64::MIN_POSITIVE);
+                a.iter().map(|v| v / s).collect()
+            })
+            .collect();
+        let mut overlap = vec![vec![0.0; raw.len()]; raw.len()];
+        let (mut off_sum, mut off_n) = (0.0, 0.0);
+        for a in 0..raw.len() {
+            for b in 0..raw.len() {
+                let o: f64 = norm[a].iter().zip(&norm[b]).map(|(x, y)| x.min(*y)).sum();
+                overlap[a][b] = o;
+                if a != b {
+                    off_sum += o;
+                    off_n += 1.0;
+                }
             }
         }
-    }
-    let used: f64 = norm
+        (overlap, if off_n > 0.0 { off_sum / off_n } else { 0.0 })
+    };
+    let (overlap, mean_overlap) = pairwise_overlap(&activity);
+    let (_, mean_overlap_leaf_only) = pairwise_overlap(&activity_leaf);
+    let used: f64 = activity
         .iter()
-        .map(|p| p.iter().filter(|v| **v > 0.0).count() as f64)
+        .map(|a| a.iter().filter(|v| **v > 0.0).count() as f64)
         .sum::<f64>()
         / (cfg.domains * cfg.d_sdr) as f64;
+
+    // Win-count concentration, pooled across domains -- does a fixed random
+    // column win top-k for a disproportionate share of contexts regardless
+    // of which domain/content is driving it (hubness), or is the used half
+    // of D roughly evenly shared?
+    let mut pooled_wins = vec![0.0f64; cfg.d_sdr];
+    for a in &activity {
+        for (p, &v) in pooled_wins.iter_mut().zip(a) {
+            *p += v;
+        }
+    }
+    let total_wins: f64 = pooled_wins.iter().sum::<f64>().max(f64::MIN_POSITIVE);
+    let mut sorted_wins = pooled_wins.clone();
+    sorted_wins.sort_by(|a, b| b.total_cmp(a));
+    let top1_win_share = sorted_wins[0] / total_wins;
+    let top10_win_share = sorted_wins.iter().take(10).sum::<f64>() / total_wins;
+    let mut cols_for_half_mass = 0usize;
+    let mut running = 0.0;
+    for &w in &sorted_wins {
+        running += w;
+        cols_for_half_mass += 1;
+        if running >= 0.5 * total_wins {
+            break;
+        }
+    }
 
     // Exposure counts per probe fact, split by Zipf tier.
     let mut tier: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
@@ -922,11 +1036,15 @@ pub fn measure_source(cfg: &SdrConfig, stream: &RelationalFactStream) -> SourceC
 
     SourceChecks {
         overlap,
-        mean_overlap: if off_n > 0.0 { off_sum / off_n } else { 0.0 },
+        mean_overlap,
+        mean_overlap_leaf_only,
         exposure_by_tier,
         active_fraction: used,
         retention_1: if n1 > 0.0 { keep1 / n1 } else { f64::NAN },
         retention_100: if n100 > 0.0 { keep100 / n100 } else { f64::NAN },
+        top1_win_share,
+        top10_win_share,
+        cols_for_half_mass,
     }
 }
 
@@ -939,10 +1057,11 @@ pub fn run_arm_trial(
     let mut rng = Rng::new(cfg.seed);
     let ladder_template =
         InputContextLadder::new(cfg.d_input, cfg.vocab, cfg.m_in, cfg.ladder_r, &mut rng);
-    let proj = RandomProjection::new(
+    let mut proj = RandomProjection::new(
         ladder_template.total_dim(),
         cfg.d_sdr,
         cfg.k_active,
+        calib_rate(cfg),
         &mut rng,
     );
 
@@ -978,6 +1097,7 @@ pub fn run_arm_trial(
     let mut round_losses = Vec::with_capacity(cfg.rounds);
 
     let mut u_buf = vec![0.0; cfg.d_sdr];
+    let mut calib_buf = vec![0.0; cfg.d_sdr];
     let mut pairs_buf = Vec::with_capacity(cfg.d_sdr);
     let mut active = Vec::with_capacity(cfg.k_active);
     let mut alphas = Vec::with_capacity(cfg.k_active);
@@ -1009,7 +1129,7 @@ pub fn run_arm_trial(
                     domain_facts,
                     domain_prefix,
                     &ladder_template,
-                    &proj,
+                    &mut proj,
                     &memory,
                     0.1,
                     cfg.seed + (r * 100 + d) as u64,
@@ -1031,7 +1151,7 @@ pub fn run_arm_trial(
                     domain_facts,
                     domain_prefix,
                     &ladder_template,
-                    &proj,
+                    &mut proj,
                     &mut memory.clone(),
                 );
                 let zero_spec = [p.accuracy; 6];
@@ -1059,7 +1179,14 @@ pub fn run_arm_trial(
                 online_ladder.step(fact.relation);
 
                 let z = online_ladder.normalized_trace();
-                proj.project_and_select(z, &mut u_buf, &mut pairs_buf, &mut active, &mut alphas);
+                proj.project_and_select(
+                    z,
+                    &mut u_buf,
+                    &mut calib_buf,
+                    &mut pairs_buf,
+                    &mut active,
+                    &mut alphas,
+                );
 
                 memory.observe(&active, &alphas, fact.target, eta);
                 online_ladder.step(fact.target);
@@ -1070,7 +1197,7 @@ pub fn run_arm_trial(
                 domain_facts,
                 domain_prefix,
                 &ladder_template,
-                &proj,
+                &mut proj,
                 &mut memory,
             );
 
@@ -1126,6 +1253,10 @@ pub fn print_source_checks(c: &SourceChecks) {
         "  domain activation overlap: mean {:.3}   (1.000 = same neurons, 0.000 = disjoint)",
         c.mean_overlap
     );
+    println!(
+        "  domain activation overlap, leaf-only (hub-tier steps excluded): mean {:.3}",
+        c.mean_overlap_leaf_only
+    );
     if c.mean_overlap > 0.5 {
         println!("  !! domains share most of their activation mass -- the sparse isolation that");
         println!("     DESIGN-SDR lesson 1 makes the whole design depend on has not formed, and a");
@@ -1154,6 +1285,17 @@ pub fn print_source_checks(c: &SourceChecks) {
         "  neurons ever used: {:.1}% of D",
         100.0 * c.active_fraction
     );
+    println!(
+        "  win-count concentration: top-1 column {:.1}% of all wins, top-10 {:.1}%, {} columns hold half the mass",
+        100.0 * c.top1_win_share,
+        100.0 * c.top10_win_share,
+        c.cols_for_half_mass
+    );
+    if c.top10_win_share > 0.10 {
+        println!("  !! a handful of fixed columns win top-k for a disproportionate share of all");
+        println!("     contexts -- a hubness effect in the random projection, not a domain-specific");
+        println!("     signal, and likely the same mechanism behind the domain-overlap numbers above");
+    }
     println!("  probe-fact exposures over the whole run (min / median / max):");
     for (i, name) in ["hub ", "mid ", "tail"].iter().enumerate() {
         let (lo, md, hi) = c.exposure_by_tier[i];
@@ -1167,6 +1309,167 @@ pub fn print_source_checks(c: &SourceChecks) {
         println!("     flat accuracy curve and a learning rate pinned at the grid's top are");
         println!("     expected regardless of architecture");
     }
+}
+
+/// One probe reading: which round, tokens elapsed since domain 0 was last
+/// trained, accuracy, and mean bits, over domain 0's probe facts.
+pub struct EbbinghausPoint {
+    pub round: usize,
+    pub tokens_since_visit: usize,
+    pub accuracy: f64,
+    pub bits: f64,
+    /// Bits restricted to mid+tail (domain-specific) facts. Mode A's hub
+    /// facts are shared, identical edges across every domain, so other
+    /// domains keep training them while this one is "away" -- `bits` is
+    /// contaminated by that for roughly a third of the probe set, this is
+    /// not.
+    pub bits_domain_specific: f64,
+}
+
+/// Ebbinghaus-shaped decay and savings probe, for one arm at a time.
+///
+/// v1 probed only at domain boundaries (4 points per cycle at `domains=4`)
+/// and read raw accuracy at a fixed delay across rounds. Both were wrong.
+///
+/// **Resolution.** Domain-boundary delay is measured in "how many domains
+/// intervened", not "how much time passed" -- Ebbinghaus's own axis is time
+/// since last study. This checkpoints domain 0 at `CHECKPOINTS_PER_DOMAIN`
+/// even points *inside* each intervening domain's walk as well as at its
+/// end, so delay is reported in actual tokens elapsed and a cycle carries
+/// roughly `(domains-1)*CHECKPOINTS_PER_DOMAIN + 1` points instead of
+/// `domains`.
+///
+/// **The confound.** v1's four delay curves moved in lockstep across
+/// rounds -- delay 0 (just trained) and delay "one full cycle" were nearly
+/// identical at every round -- which means the numbers were dominated by
+/// how much of domain 0 had been learned *overall* by that point in
+/// training, not by how much was forgotten *this cycle*. Reading a fixed
+/// delay's absolute accuracy cannot separate those two. The fix is the same
+/// one this project has already learned elsewhere: read the gap, not the
+/// absolute number. Every round now also reports
+/// `bits(max delay) - bits(delay 0)`, the within-round forgetting, and it is
+/// *that* trend across rounds -- not the raw accuracy trend -- that tests
+/// savings: forgetting shrinking round over round is the Ebbinghaus-savings
+/// signature, independent of how much overall competence is still rising.
+pub fn ebbinghaus_probe(
+    arm: ArmKind,
+    eta: f64,
+    cfg: &SdrConfig,
+    stream: &RelationalFactStream,
+) -> Vec<EbbinghausPoint> {
+    const CHECKPOINTS_PER_DOMAIN: usize = 4;
+
+    let mut rng = Rng::new(cfg.seed);
+    let ladder_template =
+        InputContextLadder::new(cfg.d_input, cfg.vocab, cfg.m_in, cfg.ladder_r, &mut rng);
+    let mut proj = RandomProjection::new(
+        ladder_template.total_dim(),
+        cfg.d_sdr,
+        cfg.k_active,
+        calib_rate(cfg),
+        &mut rng,
+    );
+    let g1 = 0.1;
+    let schedule = Schedule::Geometric {
+        r: cfg.ladder_r,
+        g1,
+    };
+    let mut memory = match arm {
+        ArmKind::Ladder8 => SdrMemory::new_ladder(cfg.vocab, cfg.d_sdr, 8, schedule),
+        ArmKind::Ladder4 => SdrMemory::new_ladder(cfg.vocab, cfg.d_sdr, 4, schedule),
+        ArmKind::Ladder2 => SdrMemory::new_ladder(cfg.vocab, cfg.d_sdr, 2, schedule),
+        ArmKind::Plain => SdrMemory::new_plain(cfg.vocab, cfg.d_sdr),
+        ArmKind::ProximalEwc { lambda } => {
+            let cycle = (cfg.domains * (cfg.span_tokens / 3)).max(1) as f64;
+            SdrMemory::new_ewc(cfg.vocab, cfg.d_sdr, lambda, 1.0 / cycle)
+        }
+    };
+    let mut online_ladder = ladder_template.clone();
+    let mut u_buf = vec![0.0; cfg.d_sdr];
+    let mut calib_buf = vec![0.0; cfg.d_sdr];
+    let mut pairs_buf = Vec::with_capacity(cfg.d_sdr);
+    let mut active = Vec::with_capacity(cfg.k_active);
+    let mut alphas = Vec::with_capacity(cfg.k_active);
+
+    let mut points = Vec::new();
+    let mut tokens_since_visit = 0usize;
+    let started = std::time::Instant::now();
+    for r in 1..=cfg.rounds {
+        // Progress per round, not silence for the whole run. A round here
+        // does a full training pass over every domain plus roughly
+        // domains*CHECKPOINTS_PER_DOMAIN frozen evaluations, and at the
+        // scale this probe needs to resolve savings (many facts, many
+        // rounds) that is not fast enough to run unannounced.
+        let secs = started.elapsed().as_secs_f64();
+        let eta_secs = if r > 1 {
+            secs / (r - 1) as f64 * (cfg.rounds - r + 1) as f64
+        } else {
+            0.0
+        };
+        println!(
+            "  round {r}/{}, {secs:.0}s elapsed, ~{eta_secs:.0}s left",
+            cfg.rounds
+        );
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        for d in 0..cfg.domains {
+            let walk = &stream.walks[d];
+            // Evenly spaced checkpoints inside this domain's walk, plus its
+            // end, at which to probe domain 0 -- but only while domain 0 is
+            // NOT the one training (d==0 gets a single delay-0 reading once
+            // it finishes, same as before, since there is nothing to
+            // checkpoint mid-walk for the domain currently being taught).
+            let mut checkpoints: Vec<usize> = if d == 0 {
+                vec![walk.len()]
+            } else {
+                (1..=CHECKPOINTS_PER_DOMAIN)
+                    .map(|k| walk.len() * k / CHECKPOINTS_PER_DOMAIN)
+                    .collect()
+            };
+            checkpoints.dedup();
+            let mut next_checkpoint = 0usize;
+
+            for (i, fact) in walk.iter().enumerate() {
+                online_ladder.step(fact.entity);
+                online_ladder.step(fact.relation);
+                proj.project_and_select(
+                    online_ladder.normalized_trace(),
+                    &mut u_buf,
+                    &mut calib_buf,
+                    &mut pairs_buf,
+                    &mut active,
+                    &mut alphas,
+                );
+                memory.observe(&active, &alphas, fact.target, eta);
+                online_ladder.step(fact.target);
+                tokens_since_visit += 3;
+
+                if next_checkpoint < checkpoints.len() && i + 1 == checkpoints[next_checkpoint] {
+                    next_checkpoint += 1;
+                    let delay = if d == 0 { 0 } else { tokens_since_visit };
+                    let probe = FrozenProbeSlice::evaluate(
+                        &stream.facts[0],
+                        &stream.prefixes[0],
+                        &ladder_template,
+                        &mut proj,
+                        &mut memory.clone(),
+                    );
+                    points.push(EbbinghausPoint {
+                        round: r,
+                        tokens_since_visit: delay,
+                        accuracy: probe.accuracy,
+                        bits: probe.mean_loss * std::f64::consts::LOG2_E,
+                        bits_domain_specific: probe.mean_loss_domain_specific
+                            * std::f64::consts::LOG2_E,
+                    });
+                }
+            }
+            if d == 0 {
+                tokens_since_visit = 0;
+            }
+        }
+    }
+    points
 }
 
 pub fn run_sdr_experiment(cfg: &SdrConfig) -> Vec<ArmSummary> {
@@ -1945,7 +2248,7 @@ mod tests {
             RelationalFactStream::new(StreamMode::ModeA, 2, 10, 100, 2, 1.0, 0.10, 512, 20260817);
         let mut rng = Rng::new(20260817);
         let ladder = InputContextLadder::new(16, 512, 4, 2.0, &mut rng);
-        let proj = RandomProjection::new(ladder.total_dim(), 64, 8, &mut rng);
+        let mut proj = RandomProjection::new(ladder.total_dim(), 64, 8, 0.01, &mut rng);
         let mut mem = SdrMemory::new_plain(512, 64);
 
         let w_before = mem.read_fast_weights().as_slice().to_vec();
@@ -1953,7 +2256,7 @@ mod tests {
             &stream.facts[0],
             &stream.prefixes[0],
             &ladder,
-            &proj,
+            &mut proj,
             &mut mem,
         );
         let w_after = mem.read_fast_weights().as_slice().to_vec();

@@ -570,6 +570,15 @@ enum Command {
         /// and the fixed projection, so they cost nothing next to the arms.
         #[arg(long)]
         source_only: bool,
+        /// Run the Ebbinghaus decay-and-savings probe on domain 0 instead of
+        /// the full arm sweep: accuracy at every domain boundary within a
+        /// round (the decay shape) across rounds (the savings trend). Uses
+        /// --eta and defaults to the Ladder-4 arm.
+        #[arg(long)]
+        ebbinghaus: bool,
+        /// Arm for --ebbinghaus: plain, ladder2, ladder4, ladder8.
+        #[arg(long, default_value = "ladder4")]
+        ebbinghaus_arm: String,
         #[arg(long, default_value = "results/sdr")]
         out: PathBuf,
     },
@@ -876,6 +885,8 @@ fn main() -> std::io::Result<()> {
             ewc_lambda,
             mode,
             source_only,
+            ebbinghaus,
+            ebbinghaus_arm,
             seed,
             out,
         } => {
@@ -916,6 +927,67 @@ fn main() -> std::io::Result<()> {
             let checks = sdr_exp::measure_source(&cfg, &stream_for_checks);
             sdr_exp::print_source_checks(&checks);
             if source_only {
+                return Ok(());
+            }
+            if ebbinghaus {
+                let arm = match ebbinghaus_arm.as_str() {
+                    "plain" => sdr_exp::ArmKind::Plain,
+                    "ladder2" => sdr_exp::ArmKind::Ladder2,
+                    "ladder8" => sdr_exp::ArmKind::Ladder8,
+                    _ => sdr_exp::ArmKind::Ladder4,
+                };
+                let e = cfg.eta.unwrap_or(0.3);
+                let points = sdr_exp::ebbinghaus_probe(arm, e, &cfg, &stream_for_checks);
+                println!();
+                println!("=== Ebbinghaus decay-and-savings probe: {} ===", arm.name());
+                println!(
+                    "  tokens since domain 0 was last trained -> accuracy -> bits (all / domain-specific), by round"
+                );
+                println!("  round  tokens   accuracy   bits-all  bits-specific");
+                for p in &points {
+                    println!(
+                        "  {:>5}  {:>6}   {:>8.4}   {:>8.3}  {:>13.3}",
+                        p.round, p.tokens_since_visit, p.accuracy, p.bits, p.bits_domain_specific
+                    );
+                }
+                // v2's confound: Mode A's hub facts are the same edges shared
+                // identically across every domain, so while domain 0 is
+                // "away" the other domains keep training exactly those hub
+                // facts through their own walks. A third of domain 0's probe
+                // set was therefore never actually away, and the resulting
+                // gap can run negative -- accuracy improving with delay --
+                // which is what the first run of this probe showed. Restrict
+                // to mid+tail (domain-specific) facts for the real signal.
+                //
+                // The remaining confound (savings vs overall-progress) is
+                // handled the same way as before: the within-round gap
+                // cancels whatever is common to delay 0 and max delay in the
+                // same round, leaving only what changed *during* the gap.
+                println!();
+                println!("  within-round forgetting, domain-specific bits (max delay minus delay 0):");
+                print!("   ");
+                for r in 1..=cfg.rounds {
+                    let row: Vec<&sdr_exp::EbbinghausPoint> =
+                        points.iter().filter(|p| p.round == r).collect();
+                    let Some(first) = row.first() else { continue };
+                    let Some(last) = row.iter().max_by_key(|p| p.tokens_since_visit) else {
+                        continue;
+                    };
+                    print!(" {:+.3}", last.bits_domain_specific - first.bits_domain_specific);
+                }
+                println!();
+                println!("  (for comparison) within-round forgetting, all facts including shared hub:");
+                print!("   ");
+                for r in 1..=cfg.rounds {
+                    let row: Vec<&sdr_exp::EbbinghausPoint> =
+                        points.iter().filter(|p| p.round == r).collect();
+                    let Some(first) = row.first() else { continue };
+                    let Some(last) = row.iter().max_by_key(|p| p.tokens_since_visit) else {
+                        continue;
+                    };
+                    print!(" {:+.3}", last.bits - first.bits);
+                }
+                println!();
                 return Ok(());
             }
             let summaries = sdr_exp::run_sdr_experiment(&cfg);

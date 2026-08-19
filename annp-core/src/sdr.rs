@@ -210,20 +210,47 @@ impl InputContextLadder {
 /// and direct non-negative cosine projection weighting.
 ///
 /// Matrix Phi \in R^{D x d_in}, where each row phi_i is a unit-norm standard Gaussian random vector.
-/// Lifetime frozen: no gradients, no updates.
+/// Phi itself is lifetime frozen: no gradients, no updates. But an isotropic
+/// Phi against a non-uniform query distribution still produces hubs -- a
+/// small set of columns whose raw potential u_i = phi_i . z runs high for
+/// most inputs regardless of content, purely from concentration of measure
+/// in high dimensions. Measured on the Mode A stream at D=512: the top 10
+/// columns (2% of D) captured 26% of all top-k wins and 25 columns (5% of D)
+/// held half the win mass, against a uniform 2%/50% respectively -- and
+/// 55% of columns never won even once across a 40-round run. This is not a
+/// per-domain effect (hubness is shared across all domains, hence hard to
+/// see in a domain-specific probe), so the fix is a per-column, domain-
+/// agnostic calibration: each column tracks a running mean/variance of its
+/// own raw potential and both k-WTA selection and the alpha write/read
+/// weight use the z-scored potential, not the raw one. This is the only
+/// state in this struct that updates online; Phi never does.
 #[derive(Clone, Debug)]
 pub struct RandomProjection {
     d_in: usize,
     d_sdr: usize,
     k: usize,
     phi: Mat, // d_sdr rows, d_in cols
+    calib_rate: f64,
+    col_mean: Vec<f64>,
+    col_var: Vec<f64>,
 }
 
 impl RandomProjection {
+    const CALIB_VAR_FLOOR: f64 = 1e-9;
+
     /// Initializes a random projection matrix with unit-norm Gaussian rows.
-    pub fn new(d_in: usize, d_sdr: usize, k: usize, rng: &mut Rng) -> Self {
+    ///
+    /// `calib_rate` is the EMA follow rate for the per-column hub-correction
+    /// statistics (see struct docs); 0 disables calibration (z-scoring
+    /// reduces to a no-op forever, since mean/var never move off their
+    /// cold-start values of 0/1).
+    pub fn new(d_in: usize, d_sdr: usize, k: usize, calib_rate: f64, rng: &mut Rng) -> Self {
         assert!(d_in > 0 && d_sdr > 0, "dimensions must be positive");
         assert!(k > 0 && k <= d_sdr, "k must satisfy 1 <= k <= D");
+        assert!(
+            (0.0..=1.0).contains(&calib_rate),
+            "calib_rate must be in [0, 1]"
+        );
         let mut phi = Mat::zeros(d_sdr, d_in);
         let slice = phi.as_mut_slice();
         for r in 0..d_sdr {
@@ -235,6 +262,9 @@ impl RandomProjection {
             d_sdr,
             k,
             phi,
+            calib_rate,
+            col_mean: vec![0.0; d_sdr],
+            col_var: vec![1.0; d_sdr],
         }
     }
 
@@ -310,17 +340,64 @@ impl RandomProjection {
         }
     }
 
-    /// Projects input z to u, extracts top-k active neuron indices, and computes non-negative cosine weights.
+    /// Z-scores each column of a raw potential `u` against its own running
+    /// mean/variance (hub correction, see struct docs) into `calib_buf`.
+    fn calibrate(&self, u: &[f64], calib_buf: &mut [f64]) {
+        for i in 0..self.d_sdr {
+            let var = self.col_var[i].max(Self::CALIB_VAR_FLOOR);
+            calib_buf[i] = (u[i] - self.col_mean[i]) / var.sqrt();
+        }
+    }
+
+    /// Online per-column mean/variance EMA, same style as the Fisher EMA in
+    /// SdrMemory::update_sparse (f += tr * (g*g - f)): delta uses the mean
+    /// from before this step's update, consistent with an online
+    /// normalization scheme rather than a same-step self-referential one.
+    fn update_calibration(&mut self, u: &[f64]) {
+        let rate = self.calib_rate;
+        for ((mean, var), &raw) in self
+            .col_mean
+            .iter_mut()
+            .zip(self.col_var.iter_mut())
+            .zip(u)
+        {
+            let delta = raw - *mean;
+            *var += rate * (delta * delta - *var);
+            *mean += rate * delta;
+        }
+    }
+
+    /// Projects input z to raw potential u, z-scores each column against its
+    /// own running mean/variance (hub correction, see struct docs), then
+    /// extracts top-k active neuron indices and non-negative cosine weights
+    /// from the calibrated potential -- not the raw one, so a column that is
+    /// chronically high loses both its selection edge and its write/read
+    /// weight once selected, not just the former.
+    ///
+    /// Always updates the calibration state, including from probe/evaluation
+    /// callers -- unlike memory's predict/observe split, which exists only
+    /// because 0-shot measurement requires not leaking the probed fact's
+    /// answer into the weights before scoring it, calibration is not
+    /// fact-specific (just which columns run hot), so there is no protocol
+    /// reason to freeze it, and freezing it would be a train/eval mode split
+    /// this project does not otherwise have.
+    ///
+    /// `u_buf` is left holding the raw (uncalibrated) potential on return.
+    /// `calib_buf` is scratch, same length as `u_buf`.
+    #[allow(clippy::too_many_arguments)]
     pub fn project_and_select(
-        &self,
+        &mut self,
         z: &[f64],
         u_buf: &mut [f64],
+        calib_buf: &mut [f64],
         pairs_buf: &mut Vec<(usize, f64)>,
         out_active: &mut Vec<usize>,
         out_alphas: &mut Vec<f64>,
     ) {
         self.project(z, u_buf);
-        self.select_top_k_weighted(u_buf, pairs_buf, out_active, out_alphas);
+        self.calibrate(u_buf, calib_buf);
+        self.select_top_k_weighted(calib_buf, pairs_buf, out_active, out_alphas);
+        self.update_calibration(u_buf);
     }
 }
 
@@ -887,17 +964,18 @@ mod tests {
     #[test]
     fn random_projection_produces_exact_k_weighted_neurons() {
         let mut rng = Rng::new(20260817);
-        let proj = RandomProjection::new(48, 128, 8, &mut rng);
+        let mut proj = RandomProjection::new(48, 128, 8, 0.01, &mut rng);
 
         let mut z = vec![0.0; 48];
         rng.fill_unit_vector(&mut z);
 
         let mut u = vec![0.0; 128];
+        let mut calib = vec![0.0; 128];
         let mut pairs = Vec::new();
         let mut active = Vec::new();
         let mut alphas = Vec::new();
 
-        proj.project_and_select(&z, &mut u, &mut pairs, &mut active, &mut alphas);
+        proj.project_and_select(&z, &mut u, &mut calib, &mut pairs, &mut active, &mut alphas);
 
         assert_eq!(active.len(), 8);
         assert_eq!(alphas.len(), 8);
