@@ -10,7 +10,9 @@ mod e0;
 mod grow;
 mod head;
 mod next;
+mod edge;
 mod sdr_exp;
+mod topo;
 
 /// Git revision, or `unknown` outside a checkout.
 pub fn git_revision() -> String {
@@ -579,6 +581,132 @@ enum Command {
         /// Arm for --ebbinghaus: plain, ladder2, ladder4, ladder8.
         #[arg(long, default_value = "ladder4")]
         ebbinghaus_arm: String,
+        /// Split the input ladder's rungs across N product-of-experts groups,
+        /// each with its own projection and memory, logits summed before one
+        /// shared softmax. 1 is the single-projection architecture exactly.
+        /// D and k are divided by N so every setting has the same parameter
+        /// and active-unit budget.
+        #[arg(long, default_value_t = 1)]
+        experts: usize,
+        /// Skip the EWC sweep. It is most of the wall clock and answers no
+        /// question about how content and context should be addressed.
+        #[arg(long)]
+        no_ewc: bool,
+        /// Comma-separated eta grid, replacing the seven-point default.
+        #[arg(long, value_delimiter = ',')]
+        etas: Option<Vec<f64>>,
+        /// Weight-ladder base conductance; tau_k = ladder_r^(2k) / g1 sets the
+        /// whole timescale range. Must be < 1 for the explicit-Euler
+        /// integration to stay monotone.
+        #[arg(long, default_value_t = 0.1)]
+        ladder_g1: f64,
+        /// Context-axis width for outer-product addressing (0 = off). The
+        /// content axis becomes d_sdr / this, so the budget is unchanged.
+        #[arg(long, default_value_t = 0)]
+        tensor_d2: usize,
+        /// Active columns on the context axis; content gets k_active / this.
+        #[arg(long, default_value_t = 2)]
+        tensor_k2: usize,
+        /// Rung where context begins: content is [0, split), context is
+        /// [split, m_in). 0 means m_in / 2.
+        #[arg(long, default_value_t = 0)]
+        tensor_split: usize,
+        /// Rotate the content code by a context-generated orthogonal
+        /// transform instead of letting the context in additively. Keeps k/D,
+        /// and therefore within-fact code stability, untouched while still
+        /// separating domains.
+        #[arg(long)]
+        rotate: bool,
+        /// Rotation gain in radians. 0 is the internal control: content-only
+        /// projection with no rotation at all.
+        #[arg(long, default_value_t = 1.0)]
+        rotate_gain: f64,
+        /// Nodes in the topological distributed memory (0 = off). The memory
+        /// becomes R[node, vocab, d_payload]; at N*d_payload = d_sdr the
+        /// parameter count matches the monolithic baseline exactly.
+        #[arg(long, default_value_t = 0)]
+        topo_nodes: usize,
+        /// Long-range contacts per node, on top of the two ring neighbours.
+        #[arg(long, default_value_t = 2)]
+        topo_shortcuts: usize,
+        /// Routing steps taken before the particle is absorbed.
+        #[arg(long, default_value_t = 3)]
+        topo_hops: usize,
+        /// Payload width. topo_nodes * this should equal d_sdr for a matched
+        /// parameter budget against the monolithic arms.
+        #[arg(long, default_value_t = 32)]
+        topo_payload: usize,
+        /// Directed forgetting rate: how fast a node's slice decays per unit
+        /// of the traffic share it is failing to earn. 0 disables it, which
+        /// is the internal control for whether forgetting is doing anything.
+        #[arg(long, default_value_t = 0.0)]
+        topo_forget: f64,
+        /// EMA rate for node expectations -- how fast nodes specialise.
+        #[arg(long, default_value_t = 0.01)]
+        topo_expect: f64,
+        /// How strongly a node's held mass counts against it when routing.
+        /// 0 is the internal control: pure rich-get-richer, which collapses.
+        #[arg(long, default_value_t = 1.0)]
+        topo_crowd: f64,
+        /// Nodes that keep a share of the particle's mass after routing.
+        /// 1 is the internal control: the hard single-node routing that
+        /// scored 0.0% because a fact could not find its way back.
+        #[arg(long, default_value_t = 4)]
+        topo_keep: usize,
+        /// Nodes for the edge-memory arm (0 = off). Routing is fixed at
+        /// construction; memory lives on the edges, sliced by class.
+        #[arg(long, default_value_t = 0)]
+        edge_nodes: usize,
+        #[arg(long, default_value_t = 2)]
+        edge_shortcuts: usize,
+        #[arg(long, default_value_t = 3)]
+        edge_hops: usize,
+        /// Class slices per edge. The class is inferred online from a slow
+        /// context EMA; this is not the number of domains and the system is
+        /// never told it.
+        #[arg(long, default_value_t = 8)]
+        edge_classes: usize,
+        #[arg(long, default_value_t = 32)]
+        edge_dim: usize,
+        /// Directed forgetting: how fast an (edge, class) slice decays per
+        /// unit of the traffic share it is failing to earn. 0 is the control.
+        #[arg(long, default_value_t = 0.0)]
+        edge_forget: f64,
+        /// Assign the class by hashing the fact's own tokens instead of
+        /// inferring it from context. Same slice count, no context in it --
+        /// the control that says whether the class is carrying the regime or
+        /// merely widening the address.
+        #[arg(long)]
+        edge_hash_class: bool,
+        /// Give each class its own readout slice. Without it the readout is
+        /// shared and is the one place domains still overwrite each other,
+        /// however well the edge slices are allocated.
+        #[arg(long)]
+        edge_class_readout: bool,
+        /// Benna-Fusi rungs behind each class readout slice (1 = off). Only
+        /// meaningful with --edge-class-readout: on a shared readout the deep
+        /// rungs would average across domains, which is the configuration
+        /// already falsified.
+        #[arg(long, default_value_t = 1)]
+        edge_rungs: usize,
+        /// How many domain visits the first hidden rung averages over. The
+        /// conductance is derived from this and the visit length; it is not
+        /// settable directly, so it cannot be given in the wrong units.
+        #[arg(long, default_value_t = 1.0)]
+        edge_ladder_visits: f64,
+        /// Classes live at the start; the rest are grown when a genuinely
+        /// novel context appears. Equal to --edge-classes disables growth.
+        #[arg(long, default_value_t = 8)]
+        edge_init_classes: usize,
+        /// How many standard deviations below the running mean best-match
+        /// counts as a new regime worth its own class.
+        #[arg(long, default_value_t = 3.0)]
+        edge_grow_k: f64,
+        /// Retire the first half of the domains after this round. Creates the
+        /// genuine capacity pressure that directed forgetting needs in order
+        /// to be worth anything; without it nothing ever becomes obsolete.
+        #[arg(long, default_value_t = 0)]
+        retire_after: usize,
         #[arg(long, default_value = "results/sdr")]
         out: PathBuf,
     },
@@ -887,6 +1015,36 @@ fn main() -> std::io::Result<()> {
             source_only,
             ebbinghaus,
             ebbinghaus_arm,
+            experts,
+            no_ewc,
+            etas,
+            ladder_g1,
+            tensor_d2,
+            tensor_k2,
+            tensor_split,
+            rotate,
+            rotate_gain,
+            topo_nodes,
+            topo_shortcuts,
+            topo_hops,
+            topo_payload,
+            topo_forget,
+            topo_expect,
+            topo_crowd,
+            topo_keep,
+            edge_nodes,
+            edge_shortcuts,
+            edge_hops,
+            edge_classes,
+            edge_dim,
+            edge_forget,
+            edge_hash_class,
+            edge_class_readout,
+            edge_rungs,
+            edge_ladder_visits,
+            edge_init_classes,
+            edge_grow_k,
+            retire_after,
             seed,
             out,
         } => {
@@ -907,6 +1065,36 @@ fn main() -> std::io::Result<()> {
                 eta,
                 ewc_lambda,
                 seed,
+                experts,
+                no_ewc,
+                etas,
+                ladder_g1,
+                tensor_d2,
+                tensor_k2,
+                tensor_split,
+                rotate,
+                rotate_gain,
+                topo_nodes,
+                topo_shortcuts,
+                topo_hops,
+                topo_payload,
+                topo_forget,
+                topo_expect,
+                topo_crowd,
+                topo_keep,
+                edge_nodes,
+                edge_shortcuts,
+                edge_hops,
+                edge_classes,
+                edge_dim,
+                edge_forget,
+                edge_hash_class,
+                edge_class_readout,
+                edge_rungs,
+                edge_ladder_visits,
+                edge_init_classes,
+                edge_grow_k,
+                retire_after,
                 out: out.clone(),
             };
             write_manifest(&out, "sdr", &cfg);

@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use annp_core::ladder::Schedule;
+use annp_core::linalg::Mat;
 use annp_core::rng::Rng;
 use annp_core::sdr::{InputContextLadder, RandomProjection, SdrMemory};
 
@@ -490,6 +491,15 @@ pub struct ProbeResult {
     pub acc_mid: f64,
     pub acc_tail: f64,
     pub mean_loss: f64,
+    /// How many distinct targets the arm actually predicted across the whole
+    /// probe set. A model whose ranking is dominated by a component that is
+    /// constant within a domain -- the restored context is identical for
+    /// every fact probed in that domain -- predicts the same target for all
+    /// of them and scores near zero while its loss still falls, because the
+    /// probability mass on the right answer rises without ever taking the
+    /// top slot. Accuracy alone cannot tell that apart from "the mechanism
+    /// is weak"; this can.
+    pub distinct_predictions: usize,
     /// Mean loss restricted to mid+tail facts -- the domain-specific ones.
     /// Hub facts (Tier 0) are shared identically across every domain in
     /// Mode A, so other domains keep training them while this domain is
@@ -518,19 +528,17 @@ pub struct FewShotResult {
 
 impl FrozenProbeSlice {
     /// Evaluates accuracy and cross-entropy loss over a set of relational facts without modifying memory state.
+    /// `ctx` must already be sitting in the probed domain's context -- see
+    /// `InputContextLadder::snapshot_state`. Each fact is scored from that
+    /// state plus its own entity and relation, so the slow rungs carry the
+    /// domain history the model was trained under instead of the 18 steps a
+    /// reset-and-replay-a-short-prefix probe could deliver.
     pub fn evaluate(
         facts: &[RelationalFact],
-        prefix: &[usize],
-        ladder_template: &InputContextLadder,
-        proj: &mut RandomProjection,
-        memory: &mut SdrMemory,
+        ctx: &InputContextLadder,
+        bank: &mut ExpertBank,
     ) -> ProbeResult {
-        let mut u_buf = vec![0.0; proj.d_sdr()];
-        let mut calib_buf = vec![0.0; proj.d_sdr()];
-        let mut pairs_buf = Vec::with_capacity(proj.d_sdr());
-        let mut active = Vec::with_capacity(proj.k());
-        let mut alphas = Vec::with_capacity(proj.k());
-
+        let mut predicted: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut correct = 0;
         let mut correct_hub = 0;
         let mut count_hub = 0;
@@ -542,27 +550,22 @@ impl FrozenProbeSlice {
         let mut total_loss = 0.0;
         let mut domain_specific_loss = 0.0;
         let mut domain_specific_count = 0usize;
-        let mut online_ladder = ladder_template.clone();
+        let mut online_ladder = ctx.clone();
+        let snap = ctx.snapshot_state();
 
         for fact in facts {
-            online_ladder.reset();
-            for &tok in prefix {
-                online_ladder.step(tok);
-            }
+            online_ladder.restore_state(&snap);
             online_ladder.step(fact.entity);
             online_ladder.step(fact.relation);
 
-            let z = online_ladder.normalized_trace();
-            proj.project_and_select(
-                z,
-                &mut u_buf,
-                &mut calib_buf,
-                &mut pairs_buf,
-                &mut active,
-                &mut alphas,
+            let (loss, is_correct) = bank.predict_fact(
+                fact.entity,
+                fact.relation,
+                online_ladder.normalized_trace(),
+                fact.target,
             );
-
-            let (loss, is_correct) = memory.predict(&active, &alphas, fact.target);
+            bank.note_consistency(fact.entity, fact.relation);
+            predicted.insert(bank.last_argmax());
             if is_correct {
                 correct += 1;
                 match fact.rank_tier {
@@ -616,6 +619,7 @@ impl FrozenProbeSlice {
             acc_tail,
             mean_loss,
             mean_loss_domain_specific,
+            distinct_predictions: predicted.len(),
             count,
         }
     }
@@ -624,15 +628,14 @@ impl FrozenProbeSlice {
     /// across stratified Zipf rank tiers on isolated clones of memory state.
     pub fn evaluate_few_shot(
         facts: &[RelationalFact],
-        prefix: &[usize],
-        ladder_template: &InputContextLadder,
-        proj: &mut RandomProjection,
-        memory: &SdrMemory,
+        ctx: &InputContextLadder,
+        bank: &ExpertBank,
         eta: f64,
         seed: u64,
     ) -> FewShotResult {
         let mut sim_rng = Rng::new(seed);
-        let base_probe = Self::evaluate(facts, prefix, ladder_template, proj, &mut memory.clone());
+        let base_probe = Self::evaluate(facts, ctx, &mut bank.clone());
+        let snap = ctx.snapshot_state();
 
         let budgets = [5, 10, 20, 50, 200];
         let mut few_accs = [base_probe.accuracy; 5];
@@ -640,41 +643,28 @@ impl FrozenProbeSlice {
         let mut few_mid = [base_probe.acc_mid; 5];
         let mut few_tail = [base_probe.acc_tail; 5];
 
-        let mut u_buf = vec![0.0; proj.d_sdr()];
-        let mut calib_buf = vec![0.0; proj.d_sdr()];
-        let mut pairs_buf = Vec::with_capacity(proj.d_sdr());
-        let mut active = Vec::with_capacity(proj.k());
-        let mut alphas = Vec::with_capacity(proj.k());
-
         for (idx, &budget) in budgets.iter().enumerate() {
-            let mut temp_mem = memory.clone();
-            let mut online_ladder = ladder_template.clone();
+            let mut temp_bank = bank.clone();
+            let mut online_ladder = ctx.clone();
 
             for _ in 0..budget {
                 let fact_idx = sim_rng.next_below(facts.len() as u64) as usize;
                 let fact = facts[fact_idx];
 
-                online_ladder.reset();
-                for &tok in prefix {
-                    online_ladder.step(tok);
-                }
+                online_ladder.restore_state(&snap);
                 online_ladder.step(fact.entity);
                 online_ladder.step(fact.relation);
 
-                let z = online_ladder.normalized_trace();
-                proj.project_and_select(
-                    z,
-                    &mut u_buf,
-                    &mut calib_buf,
-                    &mut pairs_buf,
-                    &mut active,
-                    &mut alphas,
+                temp_bank.observe_fact(
+                    fact.entity,
+                    fact.relation,
+                    online_ladder.normalized_trace(),
+                    fact.target,
+                    eta,
                 );
-
-                temp_mem.observe(&active, &alphas, fact.target, eta);
             }
 
-            let probe = Self::evaluate(facts, prefix, ladder_template, proj, &mut temp_mem);
+            let probe = Self::evaluate(facts, ctx, &mut temp_bank);
             few_accs[idx] = probe.accuracy;
             few_hub[idx] = probe.acc_hub;
             few_mid[idx] = probe.acc_mid;
@@ -725,6 +715,16 @@ pub enum ArmKind {
     Ladder4,
     Ladder2,
     Plain,
+    /// No projection, no k-WTA, no sparse addressing: a linear softmax model
+    /// read straight off the same input trace. This is the baseline the
+    /// "Plain" arm is not -- Plain still carries the 8-rung input ladder, the
+    /// calibrated projection, the top-k code and the cosine weights, and only
+    /// drops the weight-side consolidation ladder. Linear drops all of it and
+    /// uses HALF the parameters (V x m_in*d_input against V x d_sdr).
+    Linear,
+    /// As `Linear`, but reading only rung 0 -- roughly "the last token" as
+    /// context. Isolates what the eight input timescales are worth.
+    LinearFast,
     ProximalEwc { lambda: f64 },
 }
 
@@ -735,6 +735,8 @@ impl ArmKind {
             ArmKind::Ladder4 => "Ladder-4 (m=4)".to_string(),
             ArmKind::Ladder2 => "Ladder-2 (m=2)".to_string(),
             ArmKind::Plain => "Plain (m=1)".to_string(),
+            ArmKind::Linear => "Linear (no SDR)".to_string(),
+            ArmKind::LinearFast => "Linear-fast (rung 0)".to_string(),
             ArmKind::ProximalEwc { lambda } => format!("Proximal EWC (lam={:.1})", lambda),
         }
     }
@@ -745,6 +747,8 @@ impl ArmKind {
             ArmKind::Ladder4 => "ladder_4",
             ArmKind::Ladder2 => "ladder_2",
             ArmKind::Plain => "plain_m1",
+            ArmKind::Linear => "linear",
+            ArmKind::LinearFast => "linear_fast",
             ArmKind::ProximalEwc { .. } => "proximal_ewc",
         }
     }
@@ -770,6 +774,26 @@ pub struct TrajectoryRecord {
     pub spec_mid: [f64; 6],
     pub spec_tail: [f64; 6],
     pub post_train_acc: f64,
+    /// Entropy of the node-visit distribution in bits, and the maximum the
+    /// topology allows. Zero for the non-topological arms. Printed with the
+    /// results rather than checked afterwards: a run whose routing collapsed
+    /// still yields a perfectly plausible accuracy number, so the mechanism
+    /// has to be shown present in the same table that reports the outcome.
+    /// Fraction of probed facts that route back to the node training left
+    /// them at. Spread without this is meaningless: a code that scatters
+    /// every fact to a fresh node each time scores maximal entropy and
+    /// retrieves nothing.
+    pub routing_consistency: f64,
+    pub class_switch_rate: f64,
+    pub class_collision: f64,
+    pub classes_live: f64,
+    pub growth_steal: f64,
+    pub path_entropy_bits: f64,
+    pub path_entropy_max: f64,
+    /// Distinct targets predicted across the probe set, from the
+    /// post-training probe. Collapse to a handful means the ranking is
+    /// driven by something constant within the domain, not by the fact.
+    pub post_distinct_predictions: usize,
     pub post_train_loss: f64,
     pub retention_gap: f64,
 }
@@ -818,7 +842,845 @@ pub struct SdrConfig {
     pub eta: Option<f64>,
     pub ewc_lambda: Option<f64>,
     pub seed: u64,
+    /// Number of product-of-experts groups the input rungs are split across.
+    /// 1 reproduces the single-projection architecture exactly.
+    pub experts: usize,
+    /// Skip the EWC sweep entirely. It is two thirds of the wall clock and
+    /// contributes nothing to a content-vs-context question.
+    pub no_ewc: bool,
+    /// Explicit eta grid, for cutting the seven-point default down when the
+    /// useful range is already known from a previous sweep.
+    pub etas: Option<Vec<f64>>,
+    /// Weight-ladder base conductance. tau_k = r^(2k) / g1, so this sets the
+    /// whole timescale range. It has to be matched to the period of whatever
+    /// the stream asks the ladder to hold: a rung whose tau exceeds one
+    /// domain visit averages across domains, which is exactly what destroys
+    /// a Mode B mapping. Stability needs g1 < 1 (rung 0's outflow rate).
+    pub ladder_g1: f64,
+    /// Context-axis width for outer-product addressing. 0 disables it and
+    /// leaves the flat/product-of-experts addressing in place.
+    pub tensor_d2: usize,
+    /// Active columns on the context axis under outer-product addressing.
+    pub tensor_k2: usize,
+    /// Rung index where context begins; content is [0, split), context is
+    /// [split, m_in). 0 means m_in / 2.
+    pub tensor_split: usize,
+    /// Enable context-conditioned rotation of the content code.
+    pub rotate: bool,
+    /// Topological distributed memory: node count (0 = off) and its shape.
+    pub topo_nodes: usize,
+    pub topo_shortcuts: usize,
+    pub topo_hops: usize,
+    pub topo_payload: usize,
+    pub topo_forget: f64,
+    pub topo_expect: f64,
+    pub topo_crowd: f64,
+    pub topo_keep: usize,
+    pub edge_nodes: usize,
+    pub edge_shortcuts: usize,
+    pub edge_hops: usize,
+    pub edge_classes: usize,
+    pub edge_dim: usize,
+    pub edge_forget: f64,
+    pub edge_hash_class: bool,
+    pub edge_class_readout: bool,
+    /// Benna-Fusi rungs behind each class readout slice; 1 disables it.
+    pub edge_rungs: usize,
+    /// How many domain visits the first hidden rung should average over.
+    ///
+    /// Not a conductance. g1 is derived from this and the visit length in
+    /// `run_arm_trial`, because every time this project has let a time
+    /// constant be typed in as a literal it has ended up expressed in the
+    /// wrong units (DESIGN-EDGE.md s12 lists six). A slice's clock is
+    /// activity-gated, so it advances only while its own domain is being
+    /// written -- one visit is span/3 activations, and an absence is zero.
+    pub edge_ladder_visits: f64,
+    /// Classes live at the start; the rest are grown on demand.
+    pub edge_init_classes: usize,
+    /// Novelty threshold for growing a class, in standard deviations below
+    /// the running mean best-match. Self-scaling, so no similarity constant.
+    pub edge_grow_k: f64,
+    /// Retire the first half of the domains after this round, and start
+    /// training the second half.
+    ///
+    /// Without it the four domains cycle for ever and nothing ever becomes
+    /// permanently obsolete, so directed forgetting has no situation in which
+    /// to pay: its premise is that capacity is genuinely exhausted and the
+    /// knowledge being dropped is genuinely no longer wanted, and the endless
+    /// cycle never presents that. 0 disables retirement.
+    pub retire_after: usize,
+    /// Rotation gain. Angles are gamma * (a_p . z_ctx) with unit-norm a_p, so
+    /// this is roughly the maximum rotation in radians. 0 reduces the arm to
+    /// a content-only projection, which is the internal control: it isolates
+    /// what the rotation itself contributes from what merely dropping the
+    /// context out of the additive projection does.
+    pub rotate_gain: f64,
     pub out: PathBuf,
+}
+
+/// A product-of-experts bank: the input ladder's rungs are partitioned into
+/// `n` contiguous groups, each group gets its own calibrated projection and
+/// its own memory, and the per-expert logits are summed before one shared
+/// softmax.
+///
+/// Summing logits is multiplying probabilities. Each expert contributes
+/// `P(target | its own slice of the trace)` and the product keeps what they
+/// agree on. What motivates it is the measured per-rung profile: the fast
+/// rungs carry content (high cross-domain overlap, and correctly so in Mode
+/// B, where the entity genuinely is the same entity in every domain), a mid
+/// rung carries a near-clean domain code (overlap 0.105 at rung 5, against
+/// 0.446 for the joint projection over the same stream), and concatenating
+/// everything into one projection destroys that code by letting the
+/// high-magnitude fast rungs dominate the top-k. The joint projection is
+/// four times worse at separating domains than its own best component.
+///
+/// `n = 1` is exactly the previous architecture, so the expert count is an
+/// ablation axis rather than a separate code path.
+///
+/// The split holds the budget fixed: `D_b = d_sdr / n` columns and
+/// `k_b = k_active / n` active per expert, so every setting has the same
+/// total column count, active count and parameter count as the n=1
+/// baseline. That keeps the comparison fair (lesson 11) and stays well away
+/// from the `k=1` quantisation that actually sank the band-split experiment
+/// behind lesson 17 -- at d_sdr=512, k=16 even n=8 leaves k_b=2.
+/// Outer-product (tensor) addressing: content and context are projected
+/// separately and the memory cell is indexed by the *pair* rather than by a
+/// single column.
+///
+/// The cell index is flattened to `i * d2 + j`, so the memory stays a
+/// `V x (d1*d2)` matrix and every existing mechanism -- Benna-Fusi
+/// diffusion, activity gating, the EWC anchor -- operates unchanged on the
+/// flattened columns. The only thing that changes is how the active set and
+/// its weights are computed, which is why this costs no new memory code.
+///
+/// This is the strictly more expressive sibling of the product-of-experts
+/// bank. Summing logits constrains the joint to a rank-1 factorisation
+/// `P(v|i)P(v|j)`; a cell per `(i,j)` holds an arbitrary joint, at the cost
+/// of address space. Budget is held fixed the same way: `d1*d2 = d_sdr` and
+/// `k1*k2 = k_active`, so the parameter and active-unit counts match the
+/// flat baseline exactly.
+/// Context-conditioned rotation of the content code.
+///
+/// Enlarging D was supposed to answer "is addressing the bottleneck" and did
+/// not, because D moves two things at once. Measured at k=16, span 8000,
+/// Mode B: going from D=512 to D=8192 halved cross-domain overlap
+/// (0.463 -> 0.256, the separation we wanted) and simultaneously wrecked the
+/// stability of a fact's own code (active-set retention at lag 1
+/// 0.378 -> 0.221, at lag 100 0.120 -> 0.039). Retention came out flat
+/// (38.1% -> 37.1%). Top-k's sensitivity to input perturbation is set by the
+/// single scalar k/D, so that one knob separates what should be apart and
+/// what should stay together by the same amount. They cannot be set
+/// independently.
+///
+/// A rotation decouples them. `R` is a product of Givens rotations, hence
+/// orthogonal: the content space keeps every dimension it had and k/D is
+/// untouched, so within-fact stability is whatever it already was. The
+/// angles come from the context, which is near-constant inside a domain
+/// visit (measured active-set retention 0.92 on the context rungs) and
+/// differs across domains -- so R is near-constant where codes should hold
+/// together and differs where they should come apart. Separation is a
+/// continuous function of context distance, with no threshold anywhere.
+///
+/// The address stays a function of (context, key) alone, which is what makes
+/// it retrievable: surprise cannot enter here, because at probe time there is
+/// no target to compute it from, and an address that cannot be recomputed at
+/// read time cannot be read. The angles also depend only on the current
+/// context and not on the path taken to reach it, so cycling the domains
+/// returns a domain to its own addresses -- a path-dependent transport would
+/// leave last lap's writes somewhere this lap does not look.
+#[derive(Clone)]
+struct ContextRotation {
+    /// (d_content / 2) x d_context, unit-norm rows.
+    a: Mat,
+    gain: f64,
+    n_pairs: usize,
+    d_content: usize,
+    theta: Vec<f64>,
+    rotated: Vec<f64>,
+}
+
+impl ContextRotation {
+    fn new(d_content: usize, d_context: usize, gain: f64, rng: &mut Rng) -> Self {
+        let n_pairs = d_content / 2;
+        let mut a = Mat::zeros(n_pairs.max(1), d_context);
+        let slice = a.as_mut_slice();
+        for r in 0..n_pairs.max(1) {
+            rng.fill_unit_vector(&mut slice[r * d_context..(r + 1) * d_context]);
+        }
+        Self {
+            a,
+            gain,
+            n_pairs,
+            d_content,
+            theta: vec![0.0; n_pairs.max(1)],
+            rotated: vec![0.0; d_content],
+        }
+    }
+
+    /// Writes `R(z_ctx) z_content` into the internal buffer and returns it.
+    fn apply(&mut self, z_content: &[f64], z_context: &[f64]) -> &[f64] {
+        self.a.mul_vec(z_context, &mut self.theta);
+        self.rotated.copy_from_slice(z_content);
+        for p in 0..self.n_pairs {
+            let (s, c) = (self.gain * self.theta[p]).sin_cos();
+            let (x, y) = (self.rotated[2 * p], self.rotated[2 * p + 1]);
+            self.rotated[2 * p] = c * x - s * y;
+            self.rotated[2 * p + 1] = s * x + c * y;
+        }
+        debug_assert_eq!(self.rotated.len(), self.d_content);
+        &self.rotated
+    }
+}
+
+#[derive(Clone)]
+struct TensorAddr {
+    proj_c: RandomProjection,
+    proj_x: RandomProjection,
+    d2: usize,
+    split: usize,
+    u_c: Vec<f64>,
+    calib_c: Vec<f64>,
+    pairs_c: Vec<(usize, f64)>,
+    act_c: Vec<usize>,
+    alp_c: Vec<f64>,
+    u_x: Vec<f64>,
+    calib_x: Vec<f64>,
+    pairs_x: Vec<(usize, f64)>,
+    act_x: Vec<usize>,
+    alp_x: Vec<f64>,
+}
+
+#[derive(Clone)]
+pub struct ExpertBank {
+    /// Non-zero for the Linear arms: every input dimension is "active", the
+    /// weights are the trace itself, and there is no projection at all.
+    edge: Option<crate::edge::EdgeMemory>,
+    topo: Option<crate::topo::TopoMemory>,
+    linear_dim: usize,
+    rotation: Option<ContextRotation>,
+    rot_split: usize,
+    tensor: Option<TensorAddr>,
+    groups: Vec<(usize, usize)>,
+    projs: Vec<RandomProjection>,
+    mems: Vec<SdrMemory>,
+    d_input: usize,
+    u_buf: Vec<f64>,
+    calib_buf: Vec<f64>,
+    pairs_buf: Vec<(usize, f64)>,
+    active: Vec<Vec<usize>>,
+    alphas: Vec<Vec<f64>>,
+    logits: Vec<f64>,
+    partial: Vec<f64>,
+    probs: Vec<f64>,
+}
+
+impl ExpertBank {
+    pub fn new(cfg: &SdrConfig, arm: ArmKind, rng: &mut Rng) -> Self {
+        let n = cfg.experts.clamp(1, cfg.m_in);
+        let d_b = (cfg.d_sdr / n).max(1);
+        let k_b = (cfg.k_active / n).max(1);
+        let schedule = Schedule::Geometric {
+            r: cfg.ladder_r,
+            g1: cfg.ladder_g1,
+        };
+
+        if cfg.edge_nodes > 0 && !matches!(arm, ArmKind::Linear | ArmKind::LinearFast) {
+            let em = crate::edge::EdgeMemory::new(
+                cfg.edge_nodes,
+                cfg.edge_shortcuts,
+                cfg.edge_hops,
+                cfg.edge_classes,
+                cfg.edge_dim,
+                cfg.vocab,
+                // Slow enough to hold inside a visit, quick enough to follow
+                // a switch: tau = span/5.
+                5.0 / cfg.span_tokens.max(1) as f64,
+                cfg.edge_forget,
+                cfg.edge_hash_class,
+                cfg.edge_class_readout,
+                cfg.edge_init_classes,
+                cfg.edge_grow_k,
+                // One full rotation of the stream, in observations.
+                (cfg.domains * (cfg.span_tokens / 3)) as f64,
+                cfg.edge_rungs,
+                cfg.ladder_r,
+                {
+                    // tau_1 = r^2 / g1 activations, and we want that to equal
+                    // `edge_ladder_visits` visits' worth of activations. The
+                    // slice advances once per observe, and a visit is span/3
+                    // observes, all of them landing on the live domain's class.
+                    let per_visit = (cfg.span_tokens / 3) as f64;
+                    cfg.ladder_r.powi(2) / (cfg.edge_ladder_visits * per_visit)
+                },
+                rng,
+            );
+            return Self {
+                edge: Some(em),
+                topo: None,
+                linear_dim: 0,
+                rotation: None,
+                rot_split: 0,
+                tensor: None,
+                groups: Vec::new(),
+                projs: Vec::new(),
+                mems: Vec::new(),
+                d_input: cfg.d_input,
+                u_buf: Vec::new(),
+                calib_buf: Vec::new(),
+                pairs_buf: Vec::new(),
+                active: Vec::new(),
+                alphas: Vec::new(),
+                logits: vec![0.0; cfg.vocab],
+                partial: Vec::new(),
+                probs: vec![0.0; cfg.vocab],
+            };
+        }
+
+        if cfg.topo_nodes > 0 && !matches!(arm, ArmKind::Linear | ArmKind::LinearFast) {
+            let topo = crate::topo::TopoMemory::new(
+                cfg.topo_nodes,
+                cfg.topo_shortcuts,
+                cfg.topo_hops,
+                cfg.topo_payload,
+                cfg.vocab,
+                cfg.topo_forget,
+                cfg.topo_expect,
+                cfg.topo_crowd,
+                cfg.topo_keep,
+                rng,
+            );
+            return Self {
+                edge: None,
+                topo: Some(topo),
+                linear_dim: 0,
+                rotation: None,
+                rot_split: 0,
+                tensor: None,
+                groups: Vec::new(),
+                projs: Vec::new(),
+                mems: Vec::new(),
+                d_input: cfg.d_input,
+                u_buf: Vec::new(),
+                calib_buf: Vec::new(),
+                pairs_buf: Vec::new(),
+                active: Vec::new(),
+                alphas: Vec::new(),
+                logits: vec![0.0; cfg.vocab],
+                partial: Vec::new(),
+                probs: vec![0.0; cfg.vocab],
+            };
+        }
+
+        if matches!(arm, ArmKind::Linear | ArmKind::LinearFast) {
+            let dim = if matches!(arm, ArmKind::LinearFast) {
+                cfg.d_input
+            } else {
+                cfg.m_in * cfg.d_input
+            };
+            return Self {
+                edge: None,
+                topo: None,
+                rotation: None,
+                rot_split: 0,
+                tensor: None,
+                groups: vec![(0, if matches!(arm, ArmKind::LinearFast) { 1 } else { cfg.m_in })],
+                projs: Vec::new(),
+                mems: vec![SdrMemory::new_plain(cfg.vocab, dim)],
+                d_input: cfg.d_input,
+                u_buf: Vec::new(),
+                calib_buf: Vec::new(),
+                pairs_buf: Vec::new(),
+                active: vec![(0..dim).collect()],
+                alphas: vec![vec![0.0; dim]],
+                logits: vec![0.0; cfg.vocab],
+                partial: vec![0.0; cfg.vocab],
+                probs: vec![0.0; cfg.vocab],
+                linear_dim: dim,
+            };
+        }
+
+        if cfg.rotate {
+            let split = if cfg.tensor_split == 0 {
+                cfg.m_in / 2
+            } else {
+                cfg.tensor_split
+            }
+            .clamp(1, cfg.m_in - 1);
+            let d_content = split * cfg.d_input;
+            let d_context = (cfg.m_in - split) * cfg.d_input;
+            let mem = match arm {
+                ArmKind::Ladder8 => SdrMemory::new_ladder(cfg.vocab, cfg.d_sdr, 8, schedule),
+                ArmKind::Ladder4 => SdrMemory::new_ladder(cfg.vocab, cfg.d_sdr, 4, schedule),
+                ArmKind::Ladder2 => SdrMemory::new_ladder(cfg.vocab, cfg.d_sdr, 2, schedule),
+                ArmKind::Plain => SdrMemory::new_plain(cfg.vocab, cfg.d_sdr),
+                ArmKind::ProximalEwc { lambda } => {
+                    let cycle = (cfg.domains * (cfg.span_tokens / 3)).max(1) as f64;
+                    SdrMemory::new_ewc(cfg.vocab, cfg.d_sdr, lambda, 1.0 / cycle)
+                }
+                ArmKind::Linear | ArmKind::LinearFast => unreachable!("handled above"),
+            };
+            return Self {
+                edge: None,
+                topo: None,
+                linear_dim: 0,
+                rotation: Some(ContextRotation::new(
+                    d_content,
+                    d_context,
+                    cfg.rotate_gain,
+                    rng,
+                )),
+                rot_split: split,
+                tensor: None,
+                groups: vec![(0, split)],
+                // Phi now sees only the content rungs; the context enters
+                // through the rotation, not as extra additive dimensions.
+                projs: vec![RandomProjection::new(
+                    d_content,
+                    cfg.d_sdr,
+                    cfg.k_active,
+                    calib_rate(cfg),
+                    rng,
+                )],
+                mems: vec![mem],
+                d_input: cfg.d_input,
+                u_buf: vec![0.0; cfg.d_sdr],
+                calib_buf: vec![0.0; cfg.d_sdr],
+                pairs_buf: Vec::with_capacity(cfg.d_sdr),
+                active: vec![Vec::with_capacity(cfg.k_active)],
+                alphas: vec![Vec::with_capacity(cfg.k_active)],
+                logits: vec![0.0; cfg.vocab],
+                partial: vec![0.0; cfg.vocab],
+                probs: vec![0.0; cfg.vocab],
+            };
+        }
+
+        if cfg.tensor_d2 > 0 {
+            let d2 = cfg.tensor_d2;
+            let k2 = cfg.tensor_k2.clamp(1, d2);
+            let d1 = (cfg.d_sdr / d2).max(1);
+            let k1 = (cfg.k_active / k2).max(1);
+            let split = if cfg.tensor_split == 0 {
+                cfg.m_in / 2
+            } else {
+                cfg.tensor_split
+            }
+            .clamp(1, cfg.m_in - 1);
+
+            let tensor = TensorAddr {
+                proj_c: RandomProjection::new(
+                    split * cfg.d_input,
+                    d1,
+                    k1.min(d1),
+                    calib_rate(cfg),
+                    rng,
+                ),
+                proj_x: RandomProjection::new(
+                    (cfg.m_in - split) * cfg.d_input,
+                    d2,
+                    k2,
+                    calib_rate(cfg),
+                    rng,
+                ),
+                d2,
+                split,
+                u_c: vec![0.0; d1],
+                calib_c: vec![0.0; d1],
+                pairs_c: Vec::with_capacity(d1),
+                act_c: Vec::with_capacity(k1),
+                alp_c: Vec::with_capacity(k1),
+                u_x: vec![0.0; d2],
+                calib_x: vec![0.0; d2],
+                pairs_x: Vec::with_capacity(d2),
+                act_x: Vec::with_capacity(k2),
+                alp_x: Vec::with_capacity(k2),
+            };
+            let flat = d1 * d2;
+            let mem = match arm {
+                ArmKind::Ladder8 => SdrMemory::new_ladder(cfg.vocab, flat, 8, schedule),
+                ArmKind::Ladder4 => SdrMemory::new_ladder(cfg.vocab, flat, 4, schedule),
+                ArmKind::Ladder2 => SdrMemory::new_ladder(cfg.vocab, flat, 2, schedule),
+                ArmKind::Plain => SdrMemory::new_plain(cfg.vocab, flat),
+                ArmKind::ProximalEwc { lambda } => {
+                    let cycle = (cfg.domains * (cfg.span_tokens / 3)).max(1) as f64;
+                    SdrMemory::new_ewc(cfg.vocab, flat, lambda, 1.0 / cycle)
+                }
+                ArmKind::Linear | ArmKind::LinearFast => unreachable!("handled above"),
+            };
+            return Self {
+                edge: None,
+                topo: None,
+                linear_dim: 0,
+                rotation: None,
+                rot_split: 0,
+                tensor: Some(tensor),
+                groups: Vec::new(),
+                projs: Vec::new(),
+                mems: vec![mem],
+                d_input: cfg.d_input,
+                u_buf: Vec::new(),
+                calib_buf: Vec::new(),
+                pairs_buf: Vec::new(),
+                active: vec![Vec::with_capacity(k1 * k2)],
+                alphas: vec![Vec::with_capacity(k1 * k2)],
+                logits: vec![0.0; cfg.vocab],
+                partial: vec![0.0; cfg.vocab],
+                probs: vec![0.0; cfg.vocab],
+            };
+        }
+
+        let mut groups = Vec::with_capacity(n);
+        let mut projs = Vec::with_capacity(n);
+        let mut mems = Vec::with_capacity(n);
+        for b in 0..n {
+            let lo = b * cfg.m_in / n;
+            let hi = (b + 1) * cfg.m_in / n;
+            groups.push((lo, hi));
+            projs.push(RandomProjection::new(
+                (hi - lo) * cfg.d_input,
+                d_b,
+                k_b,
+                calib_rate(cfg),
+                rng,
+            ));
+            mems.push(match arm {
+                ArmKind::Ladder8 => SdrMemory::new_ladder(cfg.vocab, d_b, 8, schedule),
+                ArmKind::Ladder4 => SdrMemory::new_ladder(cfg.vocab, d_b, 4, schedule),
+                ArmKind::Ladder2 => SdrMemory::new_ladder(cfg.vocab, d_b, 2, schedule),
+                ArmKind::Plain => SdrMemory::new_plain(cfg.vocab, d_b),
+                ArmKind::ProximalEwc { lambda } => {
+                    let cycle = (cfg.domains * (cfg.span_tokens / 3)).max(1) as f64;
+                    SdrMemory::new_ewc(cfg.vocab, d_b, lambda, 1.0 / cycle)
+                }
+                ArmKind::Linear | ArmKind::LinearFast => unreachable!("handled above"),
+            });
+        }
+
+        Self {
+            edge: None,
+            topo: None,
+            linear_dim: 0,
+            rotation: None,
+            rot_split: 0,
+            tensor: None,
+            groups,
+            projs,
+            mems,
+            d_input: cfg.d_input,
+            u_buf: vec![0.0; d_b],
+            calib_buf: vec![0.0; d_b],
+            pairs_buf: Vec::with_capacity(d_b),
+            active: vec![Vec::with_capacity(k_b); n],
+            alphas: vec![Vec::with_capacity(k_b); n],
+            logits: vec![0.0; cfg.vocab],
+            partial: vec![0.0; cfg.vocab],
+            probs: vec![0.0; cfg.vocab],
+        }
+    }
+
+    /// Selects each expert's active set from its own slice of the trace and
+    /// accumulates the summed logits. Calibration updates here as everywhere
+    /// else, including on probe paths.
+    fn select_and_forward(&mut self, trace: &[f64]) {
+        if self.linear_dim > 0 {
+            let n = self.linear_dim;
+            // alphas are the trace itself, L1-normalised. Signs are kept --
+            // a linear model needs them, and this is the one place the
+            // architecture's non-negative cosine weighting is deliberately
+            // not imposed. The normalisation only matches the scale
+            // convention the sparse arms already satisfy (their alphas sum
+            // to 1), so one eta grid covers both; it is a fixed gain on the
+            // logits, not a change of model class.
+            let l1: f64 = trace[..n].iter().map(|z| z.abs()).sum::<f64>().max(1e-12);
+            for (a, z) in self.alphas[0].iter_mut().zip(&trace[..n]) {
+                *a = z / l1;
+            }
+            self.mems[0].forward(&self.active[0], &self.alphas[0], &mut self.logits);
+            return;
+        }
+
+        if self.rotation.is_some() {
+            let Self {
+                rotation,
+                rot_split,
+                projs,
+                mems,
+                d_input,
+                u_buf,
+                calib_buf,
+                pairs_buf,
+                active,
+                alphas,
+                logits,
+                ..
+            } = self;
+            let cut = *rot_split * *d_input;
+            let rot = rotation.as_mut().expect("rotation branch");
+            let z = rot.apply(&trace[..cut], &trace[cut..]);
+            projs[0].project_and_select(
+                z,
+                u_buf,
+                calib_buf,
+                pairs_buf,
+                &mut active[0],
+                &mut alphas[0],
+            );
+            mems[0].forward(&active[0], &alphas[0], logits);
+            return;
+        }
+
+        if self.tensor.is_some() {
+            let Self {
+                tensor,
+                mems,
+                d_input,
+                active,
+                alphas,
+                logits,
+                ..
+            } = self;
+            let t = tensor.as_mut().expect("tensor branch");
+            let cut = t.split * *d_input;
+            t.proj_c.project_and_select(
+                &trace[..cut],
+                &mut t.u_c,
+                &mut t.calib_c,
+                &mut t.pairs_c,
+                &mut t.act_c,
+                &mut t.alp_c,
+            );
+            t.proj_x.project_and_select(
+                &trace[cut..],
+                &mut t.u_x,
+                &mut t.calib_x,
+                &mut t.pairs_x,
+                &mut t.act_x,
+                &mut t.alp_x,
+            );
+            // Every (content, context) pair is one cell. Both alpha vectors
+            // already sum to 1, so their products do too -- no renormalising.
+            let a = &mut active[0];
+            let al = &mut alphas[0];
+            a.clear();
+            al.clear();
+            for (ii, &i) in t.act_c.iter().enumerate() {
+                for (jj, &j) in t.act_x.iter().enumerate() {
+                    a.push(i * t.d2 + j);
+                    al.push(t.alp_c[ii] * t.alp_x[jj]);
+                }
+            }
+            mems[0].forward(a, al, logits);
+            return;
+        }
+
+        let Self {
+            groups,
+            projs,
+            mems,
+            d_input,
+            u_buf,
+            calib_buf,
+            pairs_buf,
+            active,
+            alphas,
+            logits,
+            partial,
+            ..
+        } = self;
+
+        logits.fill(0.0);
+        for b in 0..projs.len() {
+            let (lo, hi) = groups[b];
+            let slice = &trace[lo * *d_input..hi * *d_input];
+            projs[b].project_and_select(
+                slice,
+                u_buf,
+                calib_buf,
+                pairs_buf,
+                &mut active[b],
+                &mut alphas[b],
+            );
+            mems[b].forward(&active[b], &alphas[b], partial);
+            for (l, p) in logits.iter_mut().zip(partial.iter()) {
+                *l += *p;
+            }
+        }
+    }
+
+    /// Reads without writing any weight, matching `SdrMemory::predict`'s
+    /// contract -- the 0-shot protocol needs the probed fact not to teach
+    /// itself before it is scored.
+    /// Index of the highest logit from the last `predict`. Used by the
+    /// prediction-collapse check, not by the model itself.
+    pub fn path_entropy(&self) -> Option<(f64, f64)> {
+        self.edge
+            .as_ref()
+            .map(|e| e.edge_entropy())
+            .or_else(|| self.topo.as_ref().map(|t| t.path_entropy()))
+    }
+
+    pub fn last_argmax(&self) -> usize {
+        if let Some(e) = self.edge.as_ref() {
+            return e.last_argmax();
+        }
+        let mut best = 0;
+        let mut best_v = f64::NEG_INFINITY;
+        for (i, &l) in self.logits.iter().enumerate() {
+            if l > best_v {
+                best_v = l;
+                best = i;
+            }
+        }
+        best
+    }
+
+    /// Reads a fact. The topological arm needs the tokens themselves, since
+    /// it builds its own payload and keeps its context in the nodes rather
+    /// than reading a globally computed trace.
+    pub fn predict_fact(
+        &mut self,
+        entity: usize,
+        relation: usize,
+        trace: &[f64],
+        target: usize,
+    ) -> (f64, bool) {
+        if let Some(e) = self.edge.as_mut() {
+            return e.predict_fact(entity, relation, target);
+        }
+        if let Some(t) = self.topo.as_mut() {
+            return t.predict_fact(entity, relation, target);
+        }
+        self.predict(trace, target)
+    }
+
+    pub fn predict(&mut self, trace: &[f64], target: usize) -> (f64, bool) {
+        assert!(
+            self.topo.is_none() && self.edge.is_none(),
+            "the topological and edge arms must be read through predict_fact"
+        );
+        self.select_and_forward(trace);
+        let mut probs = std::mem::take(&mut self.probs);
+        let out = SdrMemory::score_logits(&self.logits, target, &mut probs);
+        self.probs = probs;
+        out
+    }
+
+    /// Every expert's surface weights concatenated, for tests that assert a
+    /// read path left the memory untouched.
+    #[cfg(test)]
+    pub fn fast_weights_snapshot(&self) -> Vec<f64> {
+        self.mems
+            .iter()
+            .flat_map(|m| m.read_fast_weights().as_slice().to_vec())
+            .collect()
+    }
+
+    /// Records where this fact's mass landed, so the probe can be asked
+    /// whether it returns there.
+    pub fn note_consistency(&mut self, entity: usize, relation: usize) {
+        if let Some(e) = self.edge.as_mut() {
+            e.note_consistency(entity, relation);
+        }
+        if let Some(t) = self.topo.as_mut() {
+            t.note_consistency(entity, relation);
+        }
+    }
+
+    /// The node states, so the probe can put the network back where the
+    /// domain left it -- the topological counterpart of restoring the input
+    /// ladder, and what makes a written fact findable again.
+    pub fn topo_snapshot(&self) -> Option<Vec<f64>> {
+        self.edge
+            .as_ref()
+            .map(|e| e.snapshot())
+            .or_else(|| self.topo.as_ref().map(|t| t.snapshot()))
+    }
+
+    pub fn topo_restore(&mut self, snap: &[f64]) {
+        if let Some(e) = self.edge.as_mut() {
+            e.restore(snap);
+            return;
+        }
+        if let Some(t) = self.topo.as_mut() {
+            t.restore(snap);
+        }
+    }
+
+    pub fn routing_consistency(&self) -> Option<f64> {
+        self.edge
+            .as_ref()
+            .map(|e| e.routing_consistency())
+            .or_else(|| self.topo.as_ref().map(|t| t.routing_consistency()))
+    }
+
+    /// Class switches per token. Near zero inside a visit and non-zero across
+    /// them is what a working class axis looks like; never switching, or
+    /// switching constantly, means it is decoration.
+    pub fn set_domain(&mut self, d: usize) {
+        if let Some(e) = self.edge.as_mut() {
+            e.set_domain(d);
+        }
+    }
+
+    pub fn growth_stats(&self) -> Option<(f64, f64)> {
+        self.edge.as_ref().map(|e| e.growth_stats())
+    }
+
+    pub fn class_collision(&self) -> Option<f64> {
+        self.edge.as_ref().map(|e| e.class_collision())
+    }
+
+    pub fn take_write_norms(&mut self) -> Option<(f64, f64)> {
+        self.edge.as_mut().map(|e| e.take_write_norms())
+    }
+
+    pub fn class_switch_rate(&self) -> Option<f64> {
+        self.edge.as_ref().map(|e| e.class_switch_rate())
+    }
+
+    pub fn observe_fact(
+        &mut self,
+        entity: usize,
+        relation: usize,
+        trace: &[f64],
+        target: usize,
+        eta: f64,
+    ) {
+        if let Some(t) = self.topo.as_mut() {
+            t.observe_fact(entity, relation, target, eta);
+            return;
+        }
+        if let Some(e) = self.edge.as_mut() {
+            e.observe_fact(entity, relation, target, eta);
+            // The target is a stream token too, and in Mode B it is the only
+            // one that differs by domain -- absorbing it is what lets the
+            // class tell the domains apart.
+            e.absorb_token(target);
+            return;
+        }
+        self.observe(trace, target, eta);
+    }
+
+    pub fn observe(&mut self, trace: &[f64], target: usize, eta: f64) {
+        assert!(
+            self.topo.is_none() && self.edge.is_none(),
+            "the topological and edge arms must be written through observe_fact: \
+             routing them here silently trains nothing, because their projection \
+             list is empty and the loop below runs zero times"
+        );
+        self.select_and_forward(trace);
+        let mut probs = std::mem::take(&mut self.probs);
+        let _ = SdrMemory::score_logits(&self.logits, target, &mut probs);
+        // One shared residual, each expert charged on its own active set.
+        // That shared residual is what makes this a product of experts and
+        // not an ensemble of separately-trained models: each expert is
+        // trained on what the *combined* prediction still gets wrong, so
+        // they specialise against each other instead of all learning the
+        // same marginal.
+        for b in 0..self.mems.len() {
+            self.mems[b].update_sparse(&self.active[b], &self.alphas[b], target, eta, &probs);
+        }
+        self.probs = probs;
+    }
 }
 
 /// Runs a single trial of an arm under a specific learning rate eta.
@@ -871,6 +1733,36 @@ pub struct SourceChecks {
     /// account for half of all activation mass. A uniform code would need
     /// close to D_sdr/2; a hub-dominated one needs far fewer.
     pub cols_for_half_mass: usize,
+    /// Per-input-rung cross-domain overlap: each rung projected on its own
+    /// through an independent calibrated projection, at the same D and k as
+    /// the joint one so the numbers are directly comparable.
+    ///
+    /// Read together with `rung_retention_100`, never alone. A context code
+    /// worth building an expert on needs BOTH a low cross-domain overlap (it
+    /// separates domains) AND a high within-domain retention (it is a stable
+    /// code rather than noise). A rung carrying nothing but noise scores a
+    /// low overlap for entirely the wrong reason, and the pair is what tells
+    /// the two apart.
+    pub rung_overlap: Vec<f64>,
+    /// Per-rung fraction of the active set still active 100 steps later,
+    /// measured only within a domain visit -- comparing across a domain
+    /// boundary would score the domain switch itself as instability.
+    pub rung_retention_100: Vec<f64>,
+    /// Relaxation time of each rung, in events, for labelling the profile.
+    pub rung_tau: Vec<f64>,
+    /// Overlap between a domain's activation histogram in consecutive rounds,
+    /// averaged over domains and round pairs.
+    ///
+    /// Domain cycling is a closed loop in context space. If the address map
+    /// does not return a domain to its own addresses after one full lap, then
+    /// what was written on the previous lap is not where the next lap looks
+    /// for it, and retrieval fails structurally -- no memory mechanism can
+    /// repair that, because nothing is wrong with the memory. 1.0 means the
+    /// addresses come back exactly; low values mean the code drifts lap over
+    /// lap. Worth measuring on our own account: the online z-score
+    /// calibration is itself a slowly-moving state, so it can introduce
+    /// exactly this drift.
+    pub cycle_return: f64,
 }
 
 /// EMA follow rate for `RandomProjection`'s per-column hub-correction
@@ -897,6 +1789,7 @@ pub fn measure_source(cfg: &SdrConfig, stream: &RelationalFactStream) -> SourceC
     );
 
     let mut activity = vec![vec![0.0f64; cfg.d_sdr]; cfg.domains];
+    let mut activity_round = vec![vec![vec![0.0f64; cfg.d_sdr]; cfg.domains]; cfg.rounds];
     let mut activity_leaf = vec![vec![0.0f64; cfg.d_sdr]; cfg.domains];
     let mut u_buf = vec![0.0; cfg.d_sdr];
     let mut calib_buf = vec![0.0; cfg.d_sdr];
@@ -907,18 +1800,50 @@ pub fn measure_source(cfg: &SdrConfig, stream: &RelationalFactStream) -> SourceC
     let mut history: std::collections::VecDeque<Vec<usize>> = std::collections::VecDeque::new();
     let (mut keep1, mut keep100, mut n1, mut n100) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
 
+    // One independent projection per input rung, each seeing only that rung's
+    // slice of the trace, at the same D and k as the joint projection. This
+    // measures how much domain information each timescale carries on its own,
+    // which is the question a per-timescale expert decomposition turns on --
+    // and which the band-split experiment behind lesson 17 could not answer,
+    // since it never separated domains and ran k=1 per band.
+    let mut rung_projs: Vec<RandomProjection> = (0..cfg.m_in)
+        .map(|_| {
+            RandomProjection::new(
+                cfg.d_input,
+                cfg.d_sdr,
+                cfg.k_active,
+                calib_rate(cfg),
+                &mut rng,
+            )
+        })
+        .collect();
+    let mut rung_activity = vec![vec![vec![0.0f64; cfg.d_sdr]; cfg.domains]; cfg.m_in];
+    let mut rung_history: Vec<std::collections::VecDeque<Vec<usize>>> =
+        vec![std::collections::VecDeque::new(); cfg.m_in];
+    let mut rung_keep100 = vec![0.0f64; cfg.m_in];
+    let mut rung_n100 = vec![0.0f64; cfg.m_in];
+    let mut r_active = Vec::with_capacity(cfg.k_active);
+    let mut r_alphas = Vec::with_capacity(cfg.k_active);
+
     // One full pass of the cycling stream, exactly as training sees it.
-    for _ in 0..cfg.rounds {
-        for ((act, act_leaf), walk) in activity
-            .iter_mut()
-            .zip(activity_leaf.iter_mut())
-            .zip(&stream.walks)
-        {
-            for fact in walk {
+    // round_idx and d index several parallel collections; the index reads
+    // better here than zipping four of them.
+    #[allow(clippy::needless_range_loop)]
+    for round_idx in 0..cfg.rounds {
+        for d in 0..cfg.domains {
+            // Per-rung stability is measured within a domain visit only; a
+            // pair straddling a boundary would count the domain switch itself
+            // as the code failing to hold, which is the opposite of what this
+            // number is for.
+            for h in rung_history.iter_mut() {
+                h.clear();
+            }
+            for fact in &stream.walks[d] {
                 walk_ladder.step(fact.entity);
                 walk_ladder.step(fact.relation);
+                let trace = walk_ladder.normalized_trace();
                 proj.project_and_select(
-                    walk_ladder.normalized_trace(),
+                    trace,
                     &mut u_buf,
                     &mut calib_buf,
                     &mut pairs,
@@ -926,11 +1851,12 @@ pub fn measure_source(cfg: &SdrConfig, stream: &RelationalFactStream) -> SourceC
                     &mut alphas,
                 );
                 for &i in &active {
-                    act[i] += 1.0;
+                    activity[d][i] += 1.0;
+                    activity_round[round_idx][d][i] += 1.0;
                 }
                 if fact.rank_tier != 0 {
                     for &i in &active {
-                        act_leaf[i] += 1.0;
+                        activity_leaf[d][i] += 1.0;
                     }
                 }
                 let now: Vec<usize> = {
@@ -952,6 +1878,36 @@ pub fn measure_source(cfg: &SdrConfig, stream: &RelationalFactStream) -> SourceC
                 history.push_back(now);
                 if history.len() > 101 {
                     history.pop_front();
+                }
+
+                for k in 0..cfg.m_in {
+                    let slice = &trace[k * cfg.d_input..(k + 1) * cfg.d_input];
+                    rung_projs[k].project_and_select(
+                        slice,
+                        &mut u_buf,
+                        &mut calib_buf,
+                        &mut pairs,
+                        &mut r_active,
+                        &mut r_alphas,
+                    );
+                    for &i in &r_active {
+                        rung_activity[k][d][i] += 1.0;
+                    }
+                    let r_now: Vec<usize> = {
+                        let mut v = r_active.clone();
+                        v.sort_unstable();
+                        v
+                    };
+                    if rung_history[k].len() >= 100 {
+                        let old = &rung_history[k][rung_history[k].len() - 100];
+                        let shared = r_now.iter().filter(|i| old.binary_search(i).is_ok()).count();
+                        rung_keep100[k] += shared as f64 / r_now.len() as f64;
+                        rung_n100[k] += 1.0;
+                    }
+                    rung_history[k].push_back(r_now);
+                    if rung_history[k].len() > 101 {
+                        rung_history[k].pop_front();
+                    }
                 }
                 walk_ladder.step(fact.target);
             }
@@ -1034,6 +1990,32 @@ pub fn measure_source(cfg: &SdrConfig, stream: &RelationalFactStream) -> SourceC
     };
     let exposure_by_tier = [stat(&mut tier[0]), stat(&mut tier[1]), stat(&mut tier[2])];
 
+    let rung_overlap: Vec<f64> = rung_activity
+        .iter()
+        .map(|per_domain| pairwise_overlap(per_domain).1)
+        .collect();
+    let rung_retention_100: Vec<f64> = rung_keep100
+        .iter()
+        .zip(&rung_n100)
+        .map(|(s, n)| if *n > 0.0 { s / n } else { f64::NAN })
+        .collect();
+    let rung_tau: Vec<f64> = (0..cfg.m_in).map(|k| ladder.relaxation_time(k)).collect();
+
+    let norm1 = |a: &[f64]| -> Vec<f64> {
+        let s: f64 = a.iter().sum::<f64>().max(f64::MIN_POSITIVE);
+        a.iter().map(|v| v / s).collect()
+    };
+    let (mut cyc_sum, mut cyc_n) = (0.0f64, 0.0f64);
+    for pair in activity_round.windows(2) {
+        for (prev, next) in pair[0].iter().zip(&pair[1]) {
+            let a = norm1(prev);
+            let b = norm1(next);
+            cyc_sum += a.iter().zip(&b).map(|(x, y)| x.min(*y)).sum::<f64>();
+            cyc_n += 1.0;
+        }
+    }
+    let cycle_return = if cyc_n > 0.0 { cyc_sum / cyc_n } else { f64::NAN };
+
     SourceChecks {
         overlap,
         mean_overlap,
@@ -1045,6 +2027,23 @@ pub fn measure_source(cfg: &SdrConfig, stream: &RelationalFactStream) -> SourceC
         top1_win_share,
         top10_win_share,
         cols_for_half_mass,
+        rung_overlap,
+        rung_retention_100,
+        rung_tau,
+        cycle_return,
+    }
+}
+
+/// Whether domain `d` is still being trained in round `r`.
+fn trains(cfg: &SdrConfig, r: usize, d: usize) -> bool {
+    if cfg.retire_after == 0 {
+        return true;
+    }
+    let half = cfg.domains / 2;
+    if r <= cfg.retire_after {
+        d < half
+    } else {
+        d >= half
     }
 }
 
@@ -1057,60 +2056,51 @@ pub fn run_arm_trial(
     let mut rng = Rng::new(cfg.seed);
     let ladder_template =
         InputContextLadder::new(cfg.d_input, cfg.vocab, cfg.m_in, cfg.ladder_r, &mut rng);
-    let mut proj = RandomProjection::new(
-        ladder_template.total_dim(),
-        cfg.d_sdr,
-        cfg.k_active,
-        calib_rate(cfg),
-        &mut rng,
-    );
-
-    let g1 = 0.1;
-    let schedule = Schedule::Geometric {
-        r: cfg.ladder_r,
-        g1,
-    };
-
-    let mut memory = match arm {
-        ArmKind::Ladder8 => SdrMemory::new_ladder(cfg.vocab, cfg.d_sdr, 8, schedule),
-        ArmKind::Ladder4 => SdrMemory::new_ladder(cfg.vocab, cfg.d_sdr, 4, schedule),
-        ArmKind::Ladder2 => SdrMemory::new_ladder(cfg.vocab, cfg.d_sdr, 2, schedule),
-        ArmKind::Plain => SdrMemory::new_plain(cfg.vocab, cfg.d_sdr),
-        // Anchor/Fisher follow rate. Its inverse is EWC's memory timescale, and
-        // it has to span what the stream asks it to hold. The old value 0.05
-        // gives tau=20 steps against a domain visit of span_tokens/3 (~6666)
-        // and a full cycle of domains*span_tokens/3 (~26664): by five time
-        // constants (~100 steps) into a new domain the anchor has already
-        // converged onto it and forgotten the one before, so the penalty pulls
-        // toward a moving target rather than toward old-domain knowledge --
-        // indistinguishable from no anchor at all. Same failure as the
-        // hardcoded ladder g1 fixed earlier and the grow.rs EWC trail fixed
-        // days ago; this call site was never updated to match.
-        ArmKind::ProximalEwc { lambda } => {
-            let cycle = (cfg.domains * (cfg.span_tokens / 3)).max(1) as f64;
-            SdrMemory::new_ewc(cfg.vocab, cfg.d_sdr, lambda, 1.0 / cycle)
-        }
-    };
+    // The EWC anchor/Fisher follow rate lives in ExpertBank::new now. Its
+    // inverse is EWC's memory timescale and it has to span what the stream
+    // asks it to hold: the old value 0.05 gives tau=20 steps against a domain
+    // visit of span_tokens/3 and a full cycle of domains*span_tokens/3, so by
+    // five time constants into a new domain the anchor had already converged
+    // onto it and forgotten the one before -- a penalty pulling toward a
+    // moving target rather than toward old-domain knowledge.
+    let mut bank = ExpertBank::new(cfg, arm, &mut rng);
 
     let mut records = Vec::new();
     let mut round_accs = Vec::with_capacity(cfg.rounds);
     let mut round_losses = Vec::with_capacity(cfg.rounds);
 
-    let mut u_buf = vec![0.0; cfg.d_sdr];
-    let mut calib_buf = vec![0.0; cfg.d_sdr];
-    let mut pairs_buf = Vec::with_capacity(cfg.d_sdr);
-    let mut active = Vec::with_capacity(cfg.k_active);
-    let mut alphas = Vec::with_capacity(cfg.k_active);
-
     let mut online_ladder = ladder_template.clone();
+    // The input-ladder state each domain was left in, saved at the end of its
+    // visit and restored to ask the retention question in that domain's own
+    // context. Before a domain's first visit there is nothing to restore, so
+    // the short prefix stands in -- nothing has been learned to retain then
+    // anyway.
+    let mut domain_ctx: Vec<Option<Vec<f64>>> = vec![None; cfg.domains];
+    let mut domain_nodes: Vec<Option<Vec<f64>>> = vec![None; cfg.domains];
+    let mut probe_ladder = ladder_template.clone();
 
     for r in 1..=cfg.rounds {
         let mut round_pre_acc_sum = 0.0;
         let mut round_pre_loss_sum = 0.0;
 
+        // d indexes facts, walks, prefixes and the saved contexts together;
+        // zipping four collections reads worse than the index does.
+        #[allow(clippy::needless_range_loop)]
         for d in 0..cfg.domains {
             let domain_facts = &stream.facts[d];
-            let domain_prefix = &stream.prefixes[d];
+            bank.set_domain(d);
+            if let Some(snap) = &domain_nodes[d] {
+                bank.topo_restore(snap);
+            }
+            match &domain_ctx[d] {
+                Some(snap) => probe_ladder.restore_state(snap),
+                None => {
+                    probe_ladder.reset();
+                    for &tok in &stream.prefixes[d] {
+                        probe_ladder.step(tok);
+                    }
+                }
+            }
 
             // 1. Frozen 0-Shot probe (and full Multi-Range Few-Shot recovery probe in final round)
             let (
@@ -1127,10 +2117,8 @@ pub fn run_arm_trial(
             ) = if r == cfg.rounds {
                 let few = FrozenProbeSlice::evaluate_few_shot(
                     domain_facts,
-                    domain_prefix,
-                    &ladder_template,
-                    &mut proj,
-                    &memory,
+                    &probe_ladder,
+                    &bank,
                     0.1,
                     cfg.seed + (r * 100 + d) as u64,
                 );
@@ -1147,13 +2135,7 @@ pub fn run_arm_trial(
                     few.spec_tail,
                 )
             } else {
-                let p = FrozenProbeSlice::evaluate(
-                    domain_facts,
-                    domain_prefix,
-                    &ladder_template,
-                    &mut proj,
-                    &mut memory.clone(),
-                );
+                let p = FrozenProbeSlice::evaluate(domain_facts, &probe_ladder, &mut bank);
                 let zero_spec = [p.accuracy; 6];
                 (
                     p.accuracy,
@@ -1173,33 +2155,41 @@ pub fn run_arm_trial(
             round_pre_loss_sum += pre_loss;
 
             // 2. Stream online learning in current domain via continuous random walk
-            let domain_walk = &stream.walks[d];
+            let domain_walk: &[RelationalFact] = if trains(cfg, r, d) {
+                &stream.walks[d]
+            } else {
+                &[]
+            };
             for fact in domain_walk {
                 online_ladder.step(fact.entity);
                 online_ladder.step(fact.relation);
 
-                let z = online_ladder.normalized_trace();
-                proj.project_and_select(
-                    z,
-                    &mut u_buf,
-                    &mut calib_buf,
-                    &mut pairs_buf,
-                    &mut active,
-                    &mut alphas,
+                bank.observe_fact(
+                    fact.entity,
+                    fact.relation,
+                    online_ladder.normalized_trace(),
+                    fact.target,
+                    eta,
                 );
-
-                memory.observe(&active, &alphas, fact.target, eta);
                 online_ladder.step(fact.target);
             }
 
+            // The context this domain is now in, kept for the next round's
+            // retention probe as well as the post-training one below.
+            // A retired domain trains no further, so it has no new context to
+            // save and the post-probe reads it in whatever context the
+            // pre-probe already established -- which is the right question to
+            // ask of a domain that has stopped being visited.
+            if trains(cfg, r, d) {
+                domain_ctx[d] = Some(online_ladder.snapshot_state());
+                domain_nodes[d] = bank.topo_snapshot();
+                if let Some(snap) = &domain_ctx[d] {
+                    probe_ladder.restore_state(snap);
+                }
+            }
+
             // 3. Frozen probe immediately after training
-            let post_probe = FrozenProbeSlice::evaluate(
-                domain_facts,
-                domain_prefix,
-                &ladder_template,
-                &mut proj,
-                &mut memory,
-            );
+            let post_probe = FrozenProbeSlice::evaluate(domain_facts, &probe_ladder, &mut bank);
 
             let retention_gap = post_probe.accuracy - pre_acc;
             let ewc_lambda = match arm {
@@ -1225,6 +2215,14 @@ pub fn run_arm_trial(
                 spec_mid,
                 spec_tail,
                 post_train_acc: post_probe.accuracy,
+                routing_consistency: bank.routing_consistency().unwrap_or(f64::NAN),
+                class_switch_rate: bank.class_switch_rate().unwrap_or(f64::NAN),
+                class_collision: bank.class_collision().unwrap_or(f64::NAN),
+                classes_live: bank.growth_stats().map(|g| g.0).unwrap_or(f64::NAN),
+                growth_steal: bank.growth_stats().map(|g| g.1).unwrap_or(f64::NAN),
+                path_entropy_bits: bank.path_entropy().map(|e| e.0).unwrap_or(0.0),
+                path_entropy_max: bank.path_entropy().map(|e| e.1).unwrap_or(0.0),
+                post_distinct_predictions: post_probe.distinct_predictions,
                 post_train_loss: post_probe.mean_loss,
                 retention_gap,
             });
@@ -1296,6 +2294,29 @@ pub fn print_source_checks(c: &SourceChecks) {
         println!("     contexts -- a hubness effect in the random projection, not a domain-specific");
         println!("     signal, and likely the same mechanism behind the domain-overlap numbers above");
     }
+    println!("  per-input-rung profile (each rung projected alone, same D and k as the joint one):");
+    println!("    rung      tau   cross-domain overlap   within-domain retention@100");
+    for k in 0..c.rung_overlap.len() {
+        println!(
+            "    {:>4}  {:>7.0}   {:>19.3}   {:>27.3}",
+            k, c.rung_tau[k], c.rung_overlap[k], c.rung_retention_100[k]
+        );
+    }
+    println!(
+        "    (joint, for reference: overlap {:.3}, retention@100 {:.3})",
+        c.mean_overlap, c.retention_100
+    );
+    println!("    a rung worth building a context expert on needs BOTH a low overlap and a high");
+    println!("    retention -- low overlap with low retention is noise, not a context code");
+    println!(
+        "  address return after one domain cycle: {:.3}   (1.000 = a domain comes back to its own addresses)",
+        c.cycle_return
+    );
+    if c.cycle_return < 0.7 {
+        println!("  !! addresses drift lap over lap -- what was written last lap is not where this");
+        println!("     lap looks for it, so part of the retention loss is structural and no memory");
+        println!("     mechanism can repair it");
+    }
     println!("  probe-fact exposures over the whole run (min / median / max):");
     for (i, name) in ["hub ", "mid ", "tail"].iter().enumerate() {
         let (lo, md, hi) = c.exposure_by_tier[i];
@@ -1362,34 +2383,25 @@ pub fn ebbinghaus_probe(
     let mut rng = Rng::new(cfg.seed);
     let ladder_template =
         InputContextLadder::new(cfg.d_input, cfg.vocab, cfg.m_in, cfg.ladder_r, &mut rng);
-    let mut proj = RandomProjection::new(
-        ladder_template.total_dim(),
-        cfg.d_sdr,
-        cfg.k_active,
-        calib_rate(cfg),
-        &mut rng,
-    );
-    let g1 = 0.1;
-    let schedule = Schedule::Geometric {
-        r: cfg.ladder_r,
-        g1,
-    };
-    let mut memory = match arm {
-        ArmKind::Ladder8 => SdrMemory::new_ladder(cfg.vocab, cfg.d_sdr, 8, schedule),
-        ArmKind::Ladder4 => SdrMemory::new_ladder(cfg.vocab, cfg.d_sdr, 4, schedule),
-        ArmKind::Ladder2 => SdrMemory::new_ladder(cfg.vocab, cfg.d_sdr, 2, schedule),
-        ArmKind::Plain => SdrMemory::new_plain(cfg.vocab, cfg.d_sdr),
-        ArmKind::ProximalEwc { lambda } => {
-            let cycle = (cfg.domains * (cfg.span_tokens / 3)).max(1) as f64;
-            SdrMemory::new_ewc(cfg.vocab, cfg.d_sdr, lambda, 1.0 / cycle)
-        }
-    };
+    let mut bank = ExpertBank::new(cfg, arm, &mut rng);
     let mut online_ladder = ladder_template.clone();
-    let mut u_buf = vec![0.0; cfg.d_sdr];
-    let mut calib_buf = vec![0.0; cfg.d_sdr];
-    let mut pairs_buf = Vec::with_capacity(cfg.d_sdr);
-    let mut active = Vec::with_capacity(cfg.k_active);
-    let mut alphas = Vec::with_capacity(cfg.k_active);
+    // Domain 0's own context, saved whenever its visit ends. Probing it from
+    // a reset ladder would leave the slow rungs -- the ones carrying the
+    // domain code -- effectively uncharged, so the delay curve would measure
+    // an off-distribution cue rather than retention.
+    let mut ctx0: Option<Vec<f64>> = None;
+    // The class state has to come back too, not just the input ladder.
+    //
+    // Restoring only the ladder left the class to whatever the global context
+    // EMA had drifted to -- which, at maximum delay, is the *last* domain
+    // trained. Domain 0's facts were then looked up through domain 3's slice,
+    // so the number being reported was "what happens when you read a fact
+    // under the wrong context", not retention. That is why it swung either
+    // way by seed and went negative at d=16: it was reading whatever happened
+    // to be in the wrong slice. Same failure as the input-ladder probe bug in
+    // DESIGN-SDR appendix C.1, on the axis that was added later.
+    let mut nodes0: Option<Vec<f64>> = None;
+    let mut probe_ladder = ladder_template.clone();
 
     let mut points = Vec::new();
     let mut tokens_since_visit = 0usize;
@@ -1406,8 +2418,14 @@ pub fn ebbinghaus_probe(
         } else {
             0.0
         };
+        // Write magnitude alongside progress: forgetting that falls only
+        // because every write is getting smaller is convergence, not savings.
+        let wn = bank
+            .take_write_norms()
+            .map(|(r, e)| format!(", write |readout| {r:.1} |edge| {e:.1}"))
+            .unwrap_or_default();
         println!(
-            "  round {r}/{}, {secs:.0}s elapsed, ~{eta_secs:.0}s left",
+            "  round {r}/{}, {secs:.0}s elapsed, ~{eta_secs:.0}s left{wn}",
             cfg.rounds
         );
         use std::io::Write as _;
@@ -1432,28 +2450,37 @@ pub fn ebbinghaus_probe(
             for (i, fact) in walk.iter().enumerate() {
                 online_ladder.step(fact.entity);
                 online_ladder.step(fact.relation);
-                proj.project_and_select(
+                bank.observe_fact(
+                    fact.entity,
+                    fact.relation,
                     online_ladder.normalized_trace(),
-                    &mut u_buf,
-                    &mut calib_buf,
-                    &mut pairs_buf,
-                    &mut active,
-                    &mut alphas,
+                    fact.target,
+                    eta,
                 );
-                memory.observe(&active, &alphas, fact.target, eta);
                 online_ladder.step(fact.target);
                 tokens_since_visit += 3;
+                if d == 0 && i + 1 == walk.len() {
+                    ctx0 = Some(online_ladder.snapshot_state());
+                    nodes0 = bank.topo_snapshot();
+                }
 
                 if next_checkpoint < checkpoints.len() && i + 1 == checkpoints[next_checkpoint] {
                     next_checkpoint += 1;
                     let delay = if d == 0 { 0 } else { tokens_since_visit };
-                    let probe = FrozenProbeSlice::evaluate(
-                        &stream.facts[0],
-                        &stream.prefixes[0],
-                        &ladder_template,
-                        &mut proj,
-                        &mut memory.clone(),
-                    );
+                    if let Some(snap) = &nodes0 {
+                        bank.topo_restore(snap);
+                    }
+                    match &ctx0 {
+                        Some(snap) => probe_ladder.restore_state(snap),
+                        None => {
+                            probe_ladder.reset();
+                            for &tok in &stream.prefixes[0] {
+                                probe_ladder.step(tok);
+                            }
+                        }
+                    }
+                    let probe =
+                        FrozenProbeSlice::evaluate(&stream.facts[0], &probe_ladder, &mut bank);
                     points.push(EbbinghausPoint {
                         round: r,
                         tokens_since_visit: delay,
@@ -1487,18 +2514,27 @@ pub fn run_sdr_experiment(cfg: &SdrConfig) -> Vec<ArmSummary> {
 
     let eta_grid = if let Some(e) = cfg.eta {
         vec![e]
+    } else if let Some(g) = cfg.etas.clone() {
+        g
     } else {
         vec![0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0]
     };
 
-    let min_grid_eta = 0.01;
-    let max_grid_eta = 10.0;
+    // Taken from the grid actually swept, not from the defaults. These were
+    // hardcoded to 0.01/10.0, so every --etas run reported the warning
+    // against a grid it did not use: an interior optimum could be flagged as
+    // pinned, and -- the dangerous direction -- a genuinely pinned one could
+    // report OK.
+    let min_grid_eta = eta_grid.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_grid_eta = eta_grid.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
     let base_arms = [
         ArmKind::Ladder8,
         ArmKind::Ladder4,
         ArmKind::Ladder2,
         ArmKind::Plain,
+        ArmKind::Linear,
+        ArmKind::LinearFast,
     ];
 
     // Flatten (arm, eta) tasks for full multi-core CPU utilization
@@ -1663,6 +2699,10 @@ pub fn run_sdr_experiment(cfg: &SdrConfig) -> Vec<ArmSummary> {
     // Bracketing the low end instead -- where the transition from "off" to
     // "engaged" actually happens -- is where a smaller-than-10 optimum would
     // show up if one exists.
+    if cfg.no_ewc {
+        return summaries;
+    }
+
     let lambda_grid = if let Some(l) = cfg.ewc_lambda {
         vec![l]
     } else {
@@ -2042,6 +3082,87 @@ pub fn print_ascii_summary(cfg: &SdrConfig, summaries: &[ArmSummary]) {
     println!(
         "-----------------------------------------------------------------------------------------"
     );
+    if summaries
+        .iter()
+        .any(|s| s.trajectories.iter().any(|r| r.path_entropy_max > 0.0))
+    {
+        println!("Routing spread (entropy / max) and consistency (probe returns to training node):");
+        for s in summaries {
+            let last: Vec<_> = s
+                .trajectories
+                .iter()
+                .filter(|r| r.round == cfg.rounds)
+                .collect();
+            let h = last.iter().map(|r| r.path_entropy_bits).sum::<f64>() / last.len().max(1) as f64;
+            let m = last.first().map(|r| r.path_entropy_max).unwrap_or(0.0);
+            let c = last.iter().map(|r| r.routing_consistency).sum::<f64>()
+                / last.len().max(1) as f64;
+            println!(
+                "  {:<24} {:>6.2} / {:>5.2} bits   consistency {:>5.3}   class-switch/token {:>7.5}   sharing {:>4.2}   classes-live {:>4.1}   growth-steal {:>5.3}",
+                s.arm.short_name(),
+                h,
+                m,
+                c,
+                last.iter().map(|r| r.class_switch_rate).sum::<f64>()
+                    / last.len().max(1) as f64,
+                last.iter().map(|r| r.class_collision).sum::<f64>() / last.len().max(1) as f64,
+                last.iter().map(|r| r.classes_live).sum::<f64>() / last.len().max(1) as f64,
+                last.iter().map(|r| r.growth_steal).sum::<f64>() / last.len().max(1) as f64
+            );
+        }
+        println!(
+            "-----------------------------------------------------------------------------------------"
+        );
+    }
+    println!("Distinct targets predicted over the probe set (collapse check; {} facts probed per domain):", cfg.facts_per_domain);
+    for s in summaries {
+        let final_r: Vec<_> = s
+            .trajectories
+            .iter()
+            .filter(|r| r.round == cfg.rounds)
+            .collect();
+        let mean = final_r
+            .iter()
+            .map(|r| r.post_distinct_predictions as f64)
+            .sum::<f64>()
+            / final_r.len().max(1) as f64;
+        println!("  {:<24} {:>8.1}", s.arm.short_name(), mean);
+    }
+    println!(
+        "-----------------------------------------------------------------------------------------"
+    );
+    if cfg.retire_after > 0 {
+        let half = cfg.domains / 2;
+        println!(
+            "Retirement (domains 0..{half} stop training after round {}):",
+            cfg.retire_after
+        );
+        println!("  {:<24} {:>10} {:>10}", "", "retired", "active");
+        for s in summaries {
+            let f: Vec<_> = s
+                .trajectories
+                .iter()
+                .filter(|r| r.round == cfg.rounds)
+                .collect();
+            let m = |ret: bool| -> f64 {
+                let v: Vec<f64> = f
+                    .iter()
+                    .filter(|r| (r.domain < half) == ret)
+                    .map(|r| r.pre_revisit_acc)
+                    .collect();
+                100.0 * v.iter().sum::<f64>() / v.len().max(1) as f64
+            };
+            println!(
+                "  {:<24} {:>9.1}% {:>9.1}%",
+                s.arm.short_name(),
+                m(true),
+                m(false)
+            );
+        }
+        println!(
+            "-----------------------------------------------------------------------------------------"
+        );
+    }
     println!("Table 1: Evolution of 0-Shot Retention Accuracy over Revisit Rounds:");
     print!("{:<6} | ", "Round");
     for s in summaries {
@@ -2242,24 +3363,78 @@ mod tests {
         assert_eq!(stream.prefixes[0].len(), 16);
     }
 
+    fn probe_test_cfg() -> SdrConfig {
+        SdrConfig {
+            mode: StreamMode::ModeA,
+            domains: 2,
+            facts_per_domain: 5,
+            span_tokens: 30,
+            rounds: 2,
+            vocab: 512,
+            d_input: 16,
+            m_in: 4,
+            d_sdr: 32,
+            k_active: 4,
+            ladder_r: 2.0,
+            zipf_s: 1.0,
+            hub_ratio: 0.10,
+            eta: Some(0.1),
+            ewc_lambda: Some(1.0),
+            seed: 20260817,
+            experts: 1,
+            no_ewc: false,
+            etas: None,
+            ladder_g1: 0.1,
+            tensor_d2: 0,
+            tensor_k2: 2,
+            tensor_split: 0,
+            rotate: false,
+            rotate_gain: 1.0,
+            topo_nodes: 0,
+            topo_shortcuts: 2,
+            topo_hops: 3,
+            topo_payload: 32,
+            topo_forget: 0.0,
+            topo_expect: 0.01,
+            topo_crowd: 1.0,
+            topo_keep: 4,
+            edge_nodes: 0,
+            edge_shortcuts: 2,
+            edge_hops: 3,
+            edge_classes: 8,
+            edge_dim: 32,
+            edge_forget: 0.0,
+            edge_hash_class: false,
+            edge_class_readout: false,
+            edge_rungs: 1,
+            edge_ladder_visits: 1.0,
+            edge_init_classes: 8,
+            edge_grow_k: 3.0,
+            retire_after: 0,
+            out: PathBuf::from("results/test_sdr_probe"),
+        }
+    }
+
     #[test]
     fn frozen_probe_slice_does_not_modify_memory() {
         let stream =
             RelationalFactStream::new(StreamMode::ModeA, 2, 10, 100, 2, 1.0, 0.10, 512, 20260817);
         let mut rng = Rng::new(20260817);
         let ladder = InputContextLadder::new(16, 512, 4, 2.0, &mut rng);
-        let mut proj = RandomProjection::new(ladder.total_dim(), 64, 8, 0.01, &mut rng);
-        let mut mem = SdrMemory::new_plain(512, 64);
+        let cfg = SdrConfig {
+            d_input: 16,
+            vocab: 512,
+            m_in: 4,
+            d_sdr: 64,
+            k_active: 8,
+            experts: 1,
+            ..probe_test_cfg()
+        };
+        let mut bank = ExpertBank::new(&cfg, ArmKind::Plain, &mut rng);
 
-        let w_before = mem.read_fast_weights().as_slice().to_vec();
-        let _ = FrozenProbeSlice::evaluate(
-            &stream.facts[0],
-            &stream.prefixes[0],
-            &ladder,
-            &mut proj,
-            &mut mem,
-        );
-        let w_after = mem.read_fast_weights().as_slice().to_vec();
+        let w_before = bank.fast_weights_snapshot();
+        let _ = FrozenProbeSlice::evaluate(&stream.facts[0], &ladder, &mut bank);
+        let w_after = bank.fast_weights_snapshot();
 
         assert_eq!(
             w_before, w_after,
@@ -2286,11 +3461,41 @@ mod tests {
             eta: Some(0.1),
             ewc_lambda: Some(1.0),
             seed: 20260817,
+            experts: 1,
+            no_ewc: false,
+            etas: None,
+            ladder_g1: 0.1,
+            tensor_d2: 0,
+            tensor_k2: 2,
+            tensor_split: 0,
+            rotate: false,
+            rotate_gain: 1.0,
+            topo_nodes: 0,
+            topo_shortcuts: 2,
+            topo_hops: 3,
+            topo_payload: 32,
+            topo_forget: 0.0,
+            topo_expect: 0.01,
+            topo_crowd: 1.0,
+            topo_keep: 4,
+            edge_nodes: 0,
+            edge_shortcuts: 2,
+            edge_hops: 3,
+            edge_classes: 8,
+            edge_dim: 32,
+            edge_forget: 0.0,
+            edge_hash_class: false,
+            edge_class_readout: false,
+            edge_rungs: 1,
+            edge_ladder_g1: 0.1,
+            edge_init_classes: 8,
+            edge_grow_k: 3.0,
+            retire_after: 0,
             out: PathBuf::from("results/test_sdr_smoke"),
         };
 
         let summaries = run_sdr_experiment(&cfg);
-        assert_eq!(summaries.len(), 5); // 4 base arms + 1 EWC arm
+        assert_eq!(summaries.len(), 7); // 6 base arms + 1 EWC arm
 
         for s in &summaries {
             assert_eq!(s.round_retention_accs.len(), 2);

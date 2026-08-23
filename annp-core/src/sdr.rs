@@ -124,10 +124,57 @@ impl InputContextLadder {
         self.m_in * self.d
     }
 
+    /// Relaxation time of rung `k`, in events. Exposed so callers can label
+    /// per-rung diagnostics with the timescale each rung actually holds
+    /// rather than re-deriving it from the schedule.
+    #[inline]
+    pub fn relaxation_time(&self, k: usize) -> f64 {
+        self.ladder.relaxation_time(k)
+    }
+
     #[inline]
     pub fn embedding(&self, token: usize) -> &[f64] {
         assert!(token < self.vocab, "token index out of bounds");
         &self.embeddings[token * self.d..(token + 1) * self.d]
+    }
+
+    /// Copies out the rung state (not the embeddings, which never change),
+    /// so a domain's accumulated context can be saved and put back later.
+    ///
+    /// A probe that resets the ladder and replays a short prefix cannot
+    /// present the context the model was trained in: after 18 steps from
+    /// zero, rung 4 (tau 1024) holds 1.7% of its steady-state charge and
+    /// rung 5 (tau 4096) holds 0.4% -- and those are exactly the rungs
+    /// measured to carry the domain code. The probed trace is then
+    /// off-distribution on precisely the dimensions that identify the
+    /// domain, which penalises a k-WTA arm far more than a smooth linear
+    /// readout: the selection flips to a different set of columns, so the
+    /// memory gets read at the wrong address entirely. Saving the state at
+    /// the end of a domain's visit and restoring it at probe time asks the
+    /// question the probe means to ask -- back in this domain's context, is
+    /// the fact still there?
+    pub fn snapshot_state(&self) -> Vec<f64> {
+        let mut out = Vec::with_capacity(2 * self.m_in * self.d);
+        for k in 0..self.m_in {
+            out.extend_from_slice(self.ladder.rung(k).as_slice());
+        }
+        out.extend_from_slice(&self.concat_buf);
+        out
+    }
+
+    /// Puts back a state produced by `snapshot_state`.
+    pub fn restore_state(&mut self, snap: &[f64]) {
+        assert_eq!(
+            snap.len(),
+            2 * self.m_in * self.d,
+            "context snapshot size mismatch"
+        );
+        let d = self.d;
+        for (k, rung) in self.ladder.rungs_mut().iter_mut().enumerate() {
+            rung.as_mut_slice().copy_from_slice(&snap[k * d..(k + 1) * d]);
+        }
+        self.concat_buf
+            .copy_from_slice(&snap[self.m_in * d..2 * self.m_in * d]);
     }
 
     /// Resets the input context ladder back to zero (e.g. at sequence or domain boundary).
