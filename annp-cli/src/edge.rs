@@ -179,6 +179,14 @@ pub struct EdgeMemory {
     hash_class: bool,
     /// Traffic per (edge, class), decayed. Drives directed forgetting.
     usage: Vec<f64>,
+    /// Deferred decay factors. Directed forgetting multiplied every weight of
+    /// every slice on every observation -- O(slices * vocab * d) per step, and
+    /// the reason a single forgetting cell cost about three hours. The stored
+    /// weights are now the true weights divided by these, and a slice is
+    /// brought back to true units only when it is next touched. Exact, not an
+    /// approximation: decay is a scalar multiply and commutes with the folding.
+    readout_scale: Vec<f64>,
+    edge_scale: Vec<f64>,
     /// Timescale of the usage EMA, as a fraction per observation.
     ///
     /// This has to span a full rotation, not a structural quantity. Set from
@@ -244,6 +252,22 @@ pub struct EdgeMemory {
     /// mechanism-level diagnostics all pass regardless of the outcome.
     domain_class: std::collections::HashMap<(usize, usize), f64>,
     cur_domain: usize,
+    /// Instrumentation only -- never read by the mechanism.
+    ///
+    /// Forgetting here is intrusion: a write landing in a class that is not
+    /// the live domain's home. Because a misrouted write meets a slice that
+    /// does not know the fact, its error is near-maximal and the delta rule
+    /// makes its step near-maximal, so the wrongest writes do the most damage.
+    /// Counting intrusions therefore understates them; the magnitude share is
+    /// the honest figure, and both are recorded.
+    ///
+    /// Bucketed by observations since the domain last changed, to distinguish
+    /// intrusion concentrated at transitions (which an addressing-confidence
+    /// gate would catch) from intrusion spread through the visit (which it
+    /// would not).
+    dc_bucket: std::collections::HashMap<(usize, usize, usize), f64>,
+    dc_norm: std::collections::HashMap<(usize, usize), f64>,
+    visit_step: f64,
 }
 
 impl EdgeMemory {
@@ -308,6 +332,17 @@ impl EdgeMemory {
         lad_g1: f64,
         rng: &mut Rng,
     ) -> Self {
+        // Explicit Euler on the ladder is stable only while the fastest
+        // conductance is well under the unit capacity. Past that the surface
+        // rung oscillates and the readout is destroyed, which prints as
+        // accuracy 0.0 at every delay and therefore as forgetting +0.000 --
+        // a total collapse wearing the costume of perfect retention.
+        assert!(
+            rungs < 2 || lad_g1 < 0.5,
+            "ladder conductance g1={lad_g1} is too large for explicit Euler \
+             (need < 0.5); the readout would diverge and report itself as \
+             zero forgetting. Raise --edge-ladder-visits."
+        );
         let ring = Ring::new(nodes, shortcuts, rng);
         let mut keys = Vec::with_capacity(nodes);
         for n in 0..nodes {
@@ -364,6 +399,8 @@ impl EdgeMemory {
             growth_checked: 0.0,
             hash_class,
             usage: vec![0.0; n_edges * classes],
+            readout_scale: vec![1.0; classes.max(1)],
+            edge_scale: vec![1.0; n_edges * classes],
             usage_decay: 1.0 / cycle_observes.max(1.0),
             forget,
             path_edge: Vec::with_capacity(hops),
@@ -389,6 +426,9 @@ impl EdgeMemory {
             edge_visits: vec![0.0; n_edges],
             domain_class: std::collections::HashMap::new(),
             cur_domain: 0,
+            dc_bucket: std::collections::HashMap::new(),
+            dc_norm: std::collections::HashMap::new(),
+            visit_step: 0.0,
             ring,
         }
     }
@@ -423,6 +463,35 @@ impl EdgeMemory {
         }
         self.last_class = c;
         self.class_now = c;
+    }
+
+    /// Folds a readout slice's deferred decay back into its weights.
+    ///
+    /// Must run before anything reads or writes the slice, so that every
+    /// access outside these two helpers sees true weights and needs no
+    /// knowledge of the scaling.
+    fn materialize_readout(&mut self, c: usize) {
+        let k = self.readout_scale[c];
+        if k == 1.0 {
+            return;
+        }
+        let rb = c * self.vocab * self.d;
+        for w in &mut self.readout[rb..rb + self.vocab * self.d] {
+            *w *= k;
+        }
+        self.readout_scale[c] = 1.0;
+    }
+
+    fn materialize_edge(&mut self, s: usize) {
+        let k = self.edge_scale[s];
+        if k == 1.0 {
+            return;
+        }
+        let b = s * self.d * self.d;
+        for w in &mut self.edge_mem[b..b + self.d * self.d] {
+            *w *= k;
+        }
+        self.edge_scale[s] = 1.0;
     }
 
     /// Offset of the live readout slice.
@@ -598,6 +667,7 @@ impl EdgeMemory {
             self.edge_visits[eid] += 1.0;
 
             self.path_in[h].copy_from_slice(&self.payload);
+            self.materialize_edge(eid * self.classes + c);
             let base = (eid * self.classes + c) * self.d * self.d;
             for r in 0..self.d {
                 let row = &self.edge_mem[base + r * self.d..base + (r + 1) * self.d];
@@ -613,6 +683,10 @@ impl EdgeMemory {
             node = self.ring.edges[node][slot];
         }
 
+        if self.class_readout {
+            let c = self.class_used;
+            self.materialize_readout(c);
+        }
         let rb = self.rbase();
         for v in 0..self.vocab {
             let row = &self.readout[rb + v * self.d..rb + (v + 1) * self.d];
@@ -719,6 +793,21 @@ impl EdgeMemory {
             .domain_class
             .entry((self.cur_domain, self.class_used))
             .or_insert(0.0) += 1.0;
+        let bucket = match self.visit_step as u64 {
+            0..=99 => 0,
+            100..=499 => 1,
+            500..=1999 => 2,
+            _ => 3,
+        };
+        *self
+            .dc_bucket
+            .entry((self.cur_domain, self.class_used, bucket))
+            .or_insert(0.0) += 1.0;
+        *self
+            .dc_norm
+            .entry((self.cur_domain, self.class_used))
+            .or_insert(0.0) += wn_r.sqrt();
+        self.visit_step += 1.0;
         if !self.readout_rungs.is_empty() {
             let c = self.class_used;
             self.relax_slice(c);
@@ -739,10 +828,7 @@ impl EdgeMemory {
                     continue;
                 }
                 let keep = 1.0 - self.forget * deficit;
-                let b = s * self.d * self.d;
-                for w in &mut self.edge_mem[b..b + self.d * self.d] {
-                    *w *= keep;
-                }
+                self.edge_scale[s] *= keep;
                 // The readout is where the knowledge actually is, so decaying
                 // only the edge transform does not forget anything: driving
                 // E toward zero leaves the payload passing through unchanged
@@ -753,11 +839,7 @@ impl EdgeMemory {
                 // Same sign at every capacity tested, so it was never a
                 // capacity effect.
                 if self.class_readout {
-                    let c = s % self.classes;
-                    let rb = c * self.vocab * self.d;
-                    for w in &mut self.readout[rb..rb + self.vocab * self.d] {
-                        *w *= keep;
-                    }
+                    self.readout_scale[s % self.classes] *= keep;
                 }
             }
         }
@@ -767,6 +849,9 @@ impl EdgeMemory {
     /// Tells the memory which domain is being trained, for the class-purity
     /// diagnostic only. Nothing in the mechanism reads it.
     pub fn set_domain(&mut self, d: usize) {
+        if d != self.cur_domain {
+            self.visit_step = 0.0;
+        }
         self.cur_domain = d;
     }
 
@@ -830,6 +915,117 @@ impl EdgeMemory {
     /// Class switches per absorbed token. Should be ~0 inside a domain visit
     /// and non-zero across them; a class that never switches, or switches all
     /// the time, is not carrying the regime and the class axis is decoration.
+    /// (intrusion rate by count, intrusion share of write magnitude,
+    /// rate within each since-transition bucket).
+    ///
+    /// A domain's home class is the one it wrote to most; anything else is an
+    /// intrusion. Post-hoc, so the mechanism is never told which class is whose.
+    /// (live classes, distinct home classes, share of writes landing in a
+    /// class that is home to more than one domain).
+    ///
+    /// The intrusion metric defines a domain's home as its own modal class, so
+    /// when two domains share a home every one of their mutually destructive
+    /// writes scores as legitimate. That is the failure this measures instead:
+    /// collision, where the allocator never separated the domains at all.
+    /// Rows = domains, columns = classes, entries = share of that domain's
+    /// writes. The modal-class summary collapses this and would report one
+    /// shared home even when domains split their mass across different
+    /// classes, so the matrix is what should be read.
+    pub fn domain_class_matrix(&self, domains: usize) -> Vec<Vec<f64>> {
+        let mut m = vec![vec![0.0; self.classes]; domains];
+        for (&(d, c), &n) in &self.domain_class {
+            if d < domains && c < self.classes {
+                m[d][c] += n;
+            }
+        }
+        for row in m.iter_mut() {
+            let t: f64 = row.iter().sum();
+            if t > 0.0 {
+                for x in row.iter_mut() {
+                    *x /= t;
+                }
+            }
+        }
+        m
+    }
+
+    pub fn collision_stats(&self) -> (usize, usize, f64) {
+        let mut home: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        let mut best: std::collections::HashMap<usize, f64> =
+            std::collections::HashMap::new();
+        for (&(d, c), &n) in &self.domain_class {
+            if n > *best.get(&d).unwrap_or(&-1.0) {
+                best.insert(d, n);
+                home.insert(d, c);
+            }
+        }
+        let mut owners: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        for c in home.values() {
+            *owners.entry(*c).or_insert(0) += 1;
+        }
+        let distinct = owners.len();
+        let (mut tot, mut shared) = (0.0, 0.0);
+        for (&(_, c), &n) in &self.domain_class {
+            tot += n;
+            if owners.get(&c).copied().unwrap_or(0) > 1 {
+                shared += n;
+            }
+        }
+        (
+            self.n_active,
+            distinct,
+            if tot > 0.0 { shared / tot } else { 0.0 },
+        )
+    }
+
+    pub fn intrusion_stats(&self) -> (f64, f64, [f64; 4]) {
+        let mut home: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        let mut best: std::collections::HashMap<usize, f64> =
+            std::collections::HashMap::new();
+        for (&(d, c), &n) in &self.domain_class {
+            if n > *best.get(&d).unwrap_or(&-1.0) {
+                best.insert(d, n);
+                home.insert(d, c);
+            }
+        }
+        let (mut tot, mut bad) = (0.0, 0.0);
+        let (mut wtot, mut wbad) = (0.0, 0.0);
+        let mut bt = [0.0f64; 4];
+        let mut bb = [0.0f64; 4];
+        for (&(d, c), &n) in &self.domain_class {
+            tot += n;
+            if home.get(&d) != Some(&c) {
+                bad += n;
+            }
+        }
+        for (&(d, c), &w) in &self.dc_norm {
+            wtot += w;
+            if home.get(&d) != Some(&c) {
+                wbad += w;
+            }
+        }
+        for (&(d, c, b), &n) in &self.dc_bucket {
+            bt[b] += n;
+            if home.get(&d) != Some(&c) {
+                bb[b] += n;
+            }
+        }
+        let rate = |a: f64, b: f64| if b > 0.0 { a / b } else { 0.0 };
+        (
+            rate(bad, tot),
+            rate(wbad, wtot),
+            [
+                rate(bb[0], bt[0]),
+                rate(bb[1], bt[1]),
+                rate(bb[2], bt[2]),
+                rate(bb[3], bt[3]),
+            ],
+        )
+    }
+
     pub fn class_switch_rate(&self) -> f64 {
         if self.class_steps > 0.0 {
             self.class_switches / self.class_steps
@@ -894,6 +1090,8 @@ impl Clone for EdgeMemory {
             growth_checked: self.growth_checked,
             hash_class: self.hash_class,
             usage: self.usage.clone(),
+            readout_scale: self.readout_scale.clone(),
+            edge_scale: self.edge_scale.clone(),
             usage_decay: self.usage_decay,
             forget: self.forget,
             path_edge: self.path_edge.clone(),
@@ -919,6 +1117,9 @@ impl Clone for EdgeMemory {
             edge_visits: self.edge_visits.clone(),
             domain_class: self.domain_class.clone(),
             cur_domain: self.cur_domain,
+            dc_bucket: self.dc_bucket.clone(),
+            dc_norm: self.dc_norm.clone(),
+            visit_step: self.visit_step,
         }
     }
 }

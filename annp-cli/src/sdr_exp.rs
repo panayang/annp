@@ -1629,6 +1629,18 @@ impl ExpertBank {
         self.edge.as_ref().map(|e| e.class_collision())
     }
 
+    pub fn intrusion_stats(&self) -> Option<(f64, f64, [f64; 4])> {
+        self.edge.as_ref().map(|e| e.intrusion_stats())
+    }
+
+    pub fn collision_stats(&self) -> Option<(usize, usize, f64)> {
+        self.edge.as_ref().map(|e| e.collision_stats())
+    }
+
+    pub fn domain_class_matrix(&self, domains: usize) -> Option<Vec<Vec<f64>>> {
+        self.edge.as_ref().map(|e| e.domain_class_matrix(domains))
+    }
+
     pub fn take_write_norms(&mut self) -> Option<(f64, f64)> {
         self.edge.as_mut().map(|e| e.take_write_norms())
     }
@@ -2089,6 +2101,14 @@ pub fn run_arm_trial(
         for d in 0..cfg.domains {
             let domain_facts = &stream.facts[d];
             bank.set_domain(d);
+            // The frozen 0-shot probe needs this domain's own context, so the
+            // per-domain snapshot is restored before it. But that snapshot
+            // carries `class_now` itself, out of a slot keyed by the true
+            // domain index -- so letting it stand would hand the system its
+            // class at every visit instead of making it infer one. The natural
+            // state is kept here and put back before training, so the restore
+            // serves the measurement only, which is what it was introduced for.
+            let natural = bank.topo_snapshot();
             if let Some(snap) = &domain_nodes[d] {
                 bank.topo_restore(snap);
             }
@@ -2153,6 +2173,12 @@ pub fn run_arm_trial(
 
             round_pre_acc_sum += pre_acc;
             round_pre_loss_sum += pre_loss;
+
+            // Training resumes from where the stream actually left it, not
+            // from the probe's reinstated context.
+            if let Some(nat) = &natural {
+                bank.topo_restore(nat);
+            }
 
             // 2. Stream online learning in current domain via continuous random walk
             let domain_walk: &[RelationalFact] = if trains(cfg, r, d) {
@@ -2232,6 +2258,18 @@ pub fn run_arm_trial(
         let mean_pre_loss = round_pre_loss_sum / cfg.domains as f64;
         round_accs.push(mean_pre_acc);
         round_losses.push(mean_pre_loss);
+    }
+
+    // This path restores a per-domain snapshot at each visit, unlike the
+    // Ebbinghaus probe where context flows continuously. If domains separate
+    // here but not there, separation is being handed over by the harness
+    // rather than inferred, and "allocation" would not be the system's own.
+    if let Some(m) = bank.domain_class_matrix(cfg.domains) {
+        println!("  [{arm:?}] write share by (domain, class):");
+        for (d, row) in m.iter().enumerate() {
+            let cells: Vec<String> = row.iter().map(|x| format!("{x:5.2}")).collect();
+            println!("    domain {d}: {}", cells.join(" "));
+        }
     }
 
     (records, round_accs, round_losses)
@@ -2431,6 +2469,11 @@ pub fn ebbinghaus_probe(
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
         for d in 0..cfg.domains {
+            // Without this the edge memory's cur_domain stays 0 for the whole
+            // probe, so every per-domain diagnostic silently describes domain
+            // 0 alone. It changes no behaviour -- cur_domain is read only by
+            // instrumentation and by the growth stranding sample.
+            bank.set_domain(d);
             let walk = &stream.walks[d];
             // Evenly spaced checkpoints inside this domain's walk, plus its
             // end, at which to probe domain 0 -- but only while domain 0 is
@@ -2467,6 +2510,14 @@ pub fn ebbinghaus_probe(
                 if next_checkpoint < checkpoints.len() && i + 1 == checkpoints[next_checkpoint] {
                     next_checkpoint += 1;
                     let delay = if d == 0 { 0 } else { tokens_since_visit };
+                    // Probing domain 0 requires domain 0's context, but the
+                    // bank is shared with training, and this restore was never
+                    // undone. With four checkpoints a visit the context was
+                    // repeatedly dragged back to domain 0, so every domain
+                    // ended up writing into domain 0's class and the class
+                    // mechanism measured as completely inert. The probe must
+                    // observe the run, not steer it.
+                    let natural = bank.topo_snapshot();
                     if let Some(snap) = &nodes0 {
                         bank.topo_restore(snap);
                     }
@@ -2489,12 +2540,46 @@ pub fn ebbinghaus_probe(
                         bits_domain_specific: probe.mean_loss_domain_specific
                             * std::f64::consts::LOG2_E,
                     });
+                    if let Some(nat) = &natural {
+                        bank.topo_restore(nat);
+                    }
                 }
             }
             if d == 0 {
                 tokens_since_visit = 0;
             }
         }
+    }
+    if let Some(m) = bank.domain_class_matrix(cfg.domains) {
+        println!("  write share by (domain, class):");
+        for (d, row) in m.iter().enumerate() {
+            let cells: Vec<String> = row.iter().map(|x| format!("{:5.2}", x)).collect();
+            println!("    domain {d}: {}", cells.join(" "));
+        }
+    }
+    if let Some((live, distinct, shared)) = bank.collision_stats() {
+        println!(
+            "  classes: {live} live, {distinct} distinct home classes for {} domains; \
+             {:.1}% of writes land in a class shared by more than one domain",
+            cfg.domains,
+            100.0 * shared
+        );
+    }
+    if let Some((rate, wshare, by_bucket)) = bank.intrusion_stats() {
+        println!(
+            "  intrusion: {:.1}% of writes land outside the live domain's home \
+             class, carrying {:.1}% of the write magnitude",
+            100.0 * rate,
+            100.0 * wshare
+        );
+        println!(
+            "    by observations since the domain changed: \
+             <100 {:.1}%  100-499 {:.1}%  500-1999 {:.1}%  2000+ {:.1}%",
+            100.0 * by_bucket[0],
+            100.0 * by_bucket[1],
+            100.0 * by_bucket[2],
+            100.0 * by_bucket[3]
+        );
     }
     points
 }
@@ -3487,7 +3572,7 @@ mod tests {
             edge_hash_class: false,
             edge_class_readout: false,
             edge_rungs: 1,
-            edge_ladder_g1: 0.1,
+            edge_ladder_visits: 1.0,
             edge_init_classes: 8,
             edge_grow_k: 3.0,
             retire_after: 0,
