@@ -205,6 +205,14 @@ pub struct EdgeMemory {
     /// meets a slice that does not know the fact, so its error and hence its
     /// step are near-maximal, and the wrongest writes do the most damage.
     gate: f64,
+    /// Hard ceiling on total classes when expansion is enabled. 0 keeps the
+    /// old behaviour, in which `classes` is a budget growth may fill but
+    /// never exceed.
+    ///
+    /// With it set, capacity is allocated only when a genuinely novel regime
+    /// arrives that no existing class explains, so the parameter count is a
+    /// consequence of the stream rather than a constant chosen in advance.
+    expand_cap: usize,
     /// Addressing-blind control: caps the per-write update norm. Bounds the
     /// same damage without knowing anything about addressing, so it separates
     /// "magnitude control works" from "knowing where you are works".
@@ -280,6 +288,12 @@ pub struct EdgeMemory {
     /// would not).
     dc_bucket: std::collections::HashMap<(usize, usize, usize), f64>,
     dc_norm: std::collections::HashMap<(usize, usize), f64>,
+    /// Write magnitude attributed to each domain, for the marginal-cost curve:
+    /// what the k-th regime costs to acquire. Savings in this architecture is
+    /// not a fading trace that makes relearning cheap -- there is no decay for
+    /// a trace to fade through -- it is the k-th regime costing less than the
+    /// first because shared structure has already been paid for.
+    write_by_domain: std::collections::HashMap<usize, f64>,
     visit_step: f64,
 }
 
@@ -345,6 +359,7 @@ impl EdgeMemory {
         lad_g1: f64,
         gate: f64,
         clip: f64,
+        expand_cap: usize,
         rng: &mut Rng,
     ) -> Self {
         // Explicit Euler on the ladder is stable only while the fastest
@@ -399,6 +414,7 @@ impl EdgeMemory {
             },
             gate,
             clip,
+            expand_cap,
             margin_now: 1.0,
             lad_cap: (0..rungs).map(|k| lad_r.powi(k as i32)).collect(),
             lad_cond: (0..rungs).map(|k| lad_g1 * lad_r.powi(-(k as i32))).collect(),
@@ -446,6 +462,7 @@ impl EdgeMemory {
             cur_domain: 0,
             dc_bucket: std::collections::HashMap::new(),
             dc_norm: std::collections::HashMap::new(),
+            write_by_domain: std::collections::HashMap::new(),
             visit_step: 0.0,
             ring,
         }
@@ -482,6 +499,56 @@ impl EdgeMemory {
         }
         self.last_class = c;
         self.class_now = c;
+    }
+
+    /// Appends one class slice at run time, leaving every existing weight
+    /// byte-identical.
+    ///
+    /// This is the difference between growing into a pre-allocated ceiling --
+    /// which is all `maybe_grow` ever did -- and actually expanding. Both the
+    /// readout and, since the layout became class-major, the edge memory are
+    /// class-major, so a new class is a pure append: no existing offset moves
+    /// and nothing already learned is touched or relearned.
+    ///
+    /// The monolithic control cannot do this at all. Its capacity is the SDR
+    /// width, and widening it changes the projection every code was written
+    /// through, so expansion there means retraining from scratch.
+    ///
+    /// Non-destructive is a claim about weights, not about behaviour: a new
+    /// prototype can still capture contexts an existing class was serving.
+    /// That is what the growth-steal statistic measures, and it is why the
+    /// prototype is placed on the residual orthogonal to the existing ones.
+    pub fn expand_classes(&mut self, extra: usize) {
+        if extra == 0 {
+            return;
+        }
+        let ne = self.ring.n_edges();
+        let new_total = self.classes + extra;
+        self.edge_mem.resize(new_total * ne * self.d * self.d, 0.0);
+        self.edge_scale.resize(new_total * ne, 1.0);
+        self.usage.resize(new_total * ne, 0.0);
+        if self.class_readout {
+            self.readout.resize(new_total * self.vocab * self.d, 0.0);
+            for r in self.readout_rungs.iter_mut() {
+                r.resize(new_total * self.vocab * self.d, 0.0);
+            }
+            self.readout_scale.resize(new_total, 1.0);
+        }
+        self.proto.resize(new_total * self.d, 0.0);
+        self.classes = new_total;
+    }
+
+    /// Index of the (edge, class) slice.
+    ///
+    /// Class-major on purpose. Edge-major -- `eid * classes + c` -- puts each
+    /// edge's classes together, so raising the class count shifts the offset
+    /// of every existing entry and capacity expansion becomes a whole-array
+    /// re-layout. Class-major makes a new class a pure append, which is the
+    /// property that lets this architecture grow without disturbing, or
+    /// retraining, anything already stored.
+    #[inline]
+    fn slot(&self, eid: usize, c: usize) -> usize {
+        c * self.ring.n_edges() + eid
     }
 
     /// Folds a readout slice's deferred decay back into its weights.
@@ -560,8 +627,18 @@ impl EdgeMemory {
     /// Adds a prototype at the current context when it is far enough below
     /// the running distribution of best matches to count as a new regime.
     fn maybe_grow(&mut self, sim: f64) {
-        if self.n_active >= self.classes || self.sim_n < 64.0 {
+        if self.sim_n < 64.0 {
             return;
+        }
+        if self.n_active >= self.classes {
+            // Out of pre-allocated slots. Expanding here is what makes the
+            // capacity on-demand rather than a budget fixed up front, and by
+            // `expand_classes` it costs nothing already learned.
+            if self.expand_cap > self.classes {
+                self.expand_classes(1);
+            } else {
+                return;
+            }
         }
         let sd = self.sim_var.max(1e-12).sqrt();
         if self.sim_mean - sim <= self.grow_k * sd {
@@ -702,8 +779,9 @@ impl EdgeMemory {
             self.edge_visits[eid] += 1.0;
 
             self.path_in[h].copy_from_slice(&self.payload);
-            self.materialize_edge(eid * self.classes + c);
-            let base = (eid * self.classes + c) * self.d * self.d;
+            let sl = self.slot(eid, c);
+            self.materialize_edge(sl);
+            let base = sl * self.d * self.d;
             for r in 0..self.d {
                 let row = &self.edge_mem[base + r * self.d..base + (r + 1) * self.d];
                 let dot: f64 = row.iter().zip(&self.payload).map(|(a, b)| a * b).sum();
@@ -818,7 +896,7 @@ impl EdgeMemory {
                 *ga = o * (1.0 - t * t);
             }
 
-            let base = (eid * self.classes + c) * self.d * self.d;
+            let base = self.slot(eid, c) * self.d * self.d;
             for r in 0..self.d {
                 let ga = self.grad_a[r];
                 if ga.abs() < 1e-15 {
@@ -840,7 +918,7 @@ impl EdgeMemory {
                 *gp = acc;
             }
 
-            let slot = eid * self.classes + c;
+            let slot = self.slot(eid, c);
             for u in self.usage.iter_mut() {
                 *u *= 1.0 - self.usage_decay;
             }
@@ -870,6 +948,10 @@ impl EdgeMemory {
             let c = self.class_used;
             self.relax_slice(c);
         }
+        *self
+            .write_by_domain
+            .entry(self.cur_domain)
+            .or_insert(0.0) += wn_r.sqrt() + wn_e.sqrt();
         self.write_norm_readout += wn_r.sqrt();
         self.write_norm_edge += wn_e.sqrt();
         self.train_home
@@ -897,7 +979,7 @@ impl EdgeMemory {
                 // Same sign at every capacity tested, so it was never a
                 // capacity effect.
                 if self.class_readout {
-                    self.readout_scale[s % self.classes] *= keep;
+                    self.readout_scale[s / self.ring.n_edges()] *= keep;
                 }
             }
         }
@@ -1038,6 +1120,10 @@ impl EdgeMemory {
         )
     }
 
+    pub fn write_for_domain(&self, d: usize) -> f64 {
+        self.write_by_domain.get(&d).copied().unwrap_or(0.0)
+    }
+
     pub fn intrusion_stats(&self) -> (f64, f64, [f64; 4]) {
         let mut home: std::collections::HashMap<usize, usize> =
             std::collections::HashMap::new();
@@ -1150,6 +1236,7 @@ impl Clone for EdgeMemory {
             usage: self.usage.clone(),
             gate: self.gate,
             clip: self.clip,
+            expand_cap: self.expand_cap,
             margin_now: self.margin_now,
             readout_scale: self.readout_scale.clone(),
             edge_scale: self.edge_scale.clone(),
@@ -1180,6 +1267,7 @@ impl Clone for EdgeMemory {
             cur_domain: self.cur_domain,
             dc_bucket: self.dc_bucket.clone(),
             dc_norm: self.dc_norm.clone(),
+            write_by_domain: self.write_by_domain.clone(),
             visit_step: self.visit_step,
         }
     }
@@ -1222,7 +1310,7 @@ mod tests {
     #[test]
     fn the_same_fact_always_walks_the_same_path() {
         let mut rng = Rng::new(3);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, 0, &mut rng);
         m.forward(5, 9);
         let a = m.path_edge.clone();
         for t in 0..50 {
@@ -1239,7 +1327,7 @@ mod tests {
     #[test]
     fn different_facts_take_different_paths() {
         let mut rng = Rng::new(5);
-        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, &mut rng);
+        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, 0, &mut rng);
         let mut seen = std::collections::HashSet::new();
         for t in 0..60 {
             m.forward(t, t + 1);
@@ -1251,7 +1339,7 @@ mod tests {
     #[test]
     fn hash_class_ignores_the_stream_entirely() {
         let mut rng = Rng::new(23);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, 0, &mut rng);
         m.forward(4, 7);
         let a = m.class_used;
         for _ in 0..300 {
@@ -1264,7 +1352,7 @@ mod tests {
     #[test]
     fn the_class_follows_the_stream() {
         let mut rng = Rng::new(7);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, 0, &mut rng);
         for _ in 0..200 {
             m.absorb_token(11);
         }
@@ -1278,7 +1366,7 @@ mod tests {
     #[test]
     fn a_write_only_touches_the_edges_that_were_walked() {
         let mut rng = Rng::new(11);
-        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, 0, &mut rng);
         // Warm the readout first. From a zero readout the first write leaves
         // it rank one along the payload, so dL/dp_H comes out exactly
         // parallel to p_H and the unit-norm projection (I - p p^T) cancels it
@@ -1293,13 +1381,67 @@ mod tests {
         let walked: std::collections::HashSet<usize> = m.path_edge.iter().copied().collect();
         let before = m.edge_mem.clone();
         m.observe_fact(2, 3, 5, 0.5);
-        let slice = m.classes * m.d * m.d;
-        for e in 0..m.ring.n_edges() {
-            let changed = before[e * slice..(e + 1) * slice]
-                .iter()
-                .zip(&m.edge_mem[e * slice..(e + 1) * slice])
-                .any(|(a, b)| (a - b).abs() > 1e-12);
+        // Class-major: an edge's classes are strided by n_edges, not adjacent.
+        // The property asserted is unchanged -- only where the bytes live is.
+        let blk = m.d * m.d;
+        let ne = m.ring.n_edges();
+        for e in 0..ne {
+            let changed = (0..m.classes).any(|c| {
+                let b = (c * ne + e) * blk;
+                before[b..b + blk]
+                    .iter()
+                    .zip(&m.edge_mem[b..b + blk])
+                    .any(|(x, y)| (x - y).abs() > 1e-12)
+            });
             assert_eq!(changed, walked.contains(&e), "edge {e} changed={changed}");
         }
+    }
+
+    #[test]
+    fn expanding_capacity_leaves_every_existing_weight_untouched() {
+        let mut rng = Rng::new(9);
+        let mut m = EdgeMemory::new(
+            16, 2, 3, 4, 16, 64, 0.01, 0.0, false, true, 4, 3.0, 20000.0, 1, 2.0, 0.1, 0.0,
+            0.0, 0, &mut rng,
+        );
+        for t in 0..40 {
+            m.observe_fact(t % 12, (t + 1) % 12, (t + 2) % 12, 0.3);
+        }
+        let logits_before = {
+            m.forward(3, 4);
+            m.logits.clone()
+        };
+        let ne = m.ring.n_edges();
+        let blk = m.d * m.d;
+        let old_classes = m.classes;
+        let edge_before = m.edge_mem.clone();
+        let read_before = m.readout.clone();
+
+        m.expand_classes(4);
+
+        // Class-major means slice (c, e) keeps its offset when classes grow.
+        // Edge-major would have shifted every one of them.
+        for c in 0..old_classes {
+            for e in 0..ne {
+                let b = (c * ne + e) * blk;
+                assert_eq!(
+                    &edge_before[b..b + blk],
+                    &m.edge_mem[b..b + blk],
+                    "edge slice (class {c}, edge {e}) moved or changed"
+                );
+            }
+        }
+        assert_eq!(
+            &read_before[..],
+            &m.readout[..old_classes * m.vocab * m.d],
+            "an existing readout slice changed under expansion"
+        );
+
+        // And the behaviour it supports is identical, not merely similar.
+        m.forward(3, 4);
+        assert_eq!(
+            logits_before, m.logits,
+            "expansion perturbed the prediction it was supposed to leave alone"
+        );
     }
 }

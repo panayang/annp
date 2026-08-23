@@ -683,6 +683,19 @@ enum Command {
         /// however well the edge slices are allocated.
         #[arg(long)]
         edge_class_readout: bool,
+        /// Rounds between successive domains entering the stream (0 = all
+        /// present from round 1). Needed for the marginal-cost curve: with
+        /// every domain present there is no k-th regime to price.
+        #[arg(long, default_value_t = 0)]
+        arrival: usize,
+        /// Ceiling on total class slices when capacity is expanded on demand
+        /// (0 = fixed budget). Growth then allocates a slice only when a
+        /// genuinely novel regime arrives, and the append leaves every
+        /// existing weight untouched -- no retraining, unlike widening a
+        /// monolithic readout, which changes the projection every code was
+        /// written through.
+        #[arg(long, default_value_t = 0)]
+        edge_expand: usize,
         /// Scale each write by addressing confidence: eta * m/(m+gate), with m
         /// the top-1/top-2 prototype margin. 0 = off. Targets transition
         /// intrusion, which carries 44% of write magnitude and decays to zero
@@ -1051,6 +1064,8 @@ fn main() -> std::io::Result<()> {
             edge_forget,
             edge_hash_class,
             edge_class_readout,
+            arrival,
+            edge_expand,
             edge_gate,
             edge_clip,
             edge_rungs,
@@ -1103,6 +1118,8 @@ fn main() -> std::io::Result<()> {
                 edge_forget,
                 edge_hash_class,
                 edge_class_readout,
+                arrival,
+                edge_expand,
                 edge_gate,
                 edge_clip,
                 edge_rungs,

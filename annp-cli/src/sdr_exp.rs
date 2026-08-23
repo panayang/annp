@@ -884,6 +884,9 @@ pub struct SdrConfig {
     pub edge_forget: f64,
     pub edge_hash_class: bool,
     pub edge_class_readout: bool,
+    /// Ceiling on total class slices when capacity may be expanded at run
+    /// time. 0 = fixed budget, the old behaviour.
+    pub edge_expand: usize,
     /// Scales each write by addressing confidence. 0 disables.
     pub edge_gate: f64,
     /// Addressing-blind control: caps the per-write update norm. 0 disables.
@@ -912,6 +915,9 @@ pub struct SdrConfig {
     /// to pay: its premise is that capacity is genuinely exhausted and the
     /// knowledge being dropped is genuinely no longer wanted, and the endless
     /// cycle never presents that. 0 disables retirement.
+    /// Rounds between successive domains entering the stream. 0 = all present
+    /// from the start, the previous behaviour.
+    pub arrival: usize,
     pub retire_after: usize,
     /// Rotation gain. Angles are gamma * (a_p . z_ctx) with unit-norm a_p, so
     /// this is roughly the maximum rotation in radians. 0 reduces the arm to
@@ -1054,6 +1060,14 @@ struct TensorAddr {
     alp_x: Vec<f64>,
 }
 
+/// State displaced by `ExpertBank::topo_borrow`, owed back to the bank.
+///
+/// Dropping it silently is exactly the bug in DESIGN-EDGE.md s29, so it is
+/// `#[must_use]`: under `-D warnings` an unpaired borrow will not compile.
+#[must_use = "the displaced state must go back via topo_return before training \
+              resumes -- an unpaired restore lets the probe steer the run"]
+pub struct Displaced(Option<Vec<f64>>);
+
 #[derive(Clone)]
 pub struct ExpertBank {
     /// Non-zero for the Linear arms: every input dimension is "active", the
@@ -1118,6 +1132,7 @@ impl ExpertBank {
                 },
                 cfg.edge_gate,
                 cfg.edge_clip,
+                cfg.edge_expand,
                 rng,
             );
             return Self {
@@ -1601,7 +1616,33 @@ impl ExpertBank {
             .or_else(|| self.topo.as_ref().map(|t| t.snapshot()))
     }
 
-    pub fn topo_restore(&mut self, snap: &[f64]) {
+    /// Installs `snap` and hands back the state it displaced.
+    ///
+    /// The probe shares the bank with training, so a restore that is never
+    /// undone does not measure the run, it steers it. That went wrong twice
+    /// and in opposite directions (DESIGN-EDGE.md s29): one path handed each
+    /// domain its class back from a slot keyed by the true domain index and
+    /// inflated the headline from 17.6% to 96%; the other dragged training to
+    /// domain 0 four times a visit and left the class mechanism measuring as
+    /// completely inert.
+    ///
+    /// `Displaced` is `#[must_use]`, and this crate is gated on
+    /// `clippy -D warnings`, so forgetting to pair the restore is a build
+    /// failure rather than something to remember.
+    pub fn topo_borrow(&mut self, snap: &[f64]) -> Displaced {
+        let natural = self.topo_snapshot();
+        self.topo_restore(snap);
+        Displaced(natural)
+    }
+
+    /// Puts back what `topo_borrow` displaced. Call before training resumes.
+    pub fn topo_return(&mut self, d: Displaced) {
+        if let Some(nat) = d.0 {
+            self.topo_restore(&nat);
+        }
+    }
+
+    fn topo_restore(&mut self, snap: &[f64]) {
         if let Some(e) = self.edge.as_mut() {
             e.restore(snap);
             return;
@@ -1633,6 +1674,10 @@ impl ExpertBank {
 
     pub fn class_collision(&self) -> Option<f64> {
         self.edge.as_ref().map(|e| e.class_collision())
+    }
+
+    pub fn write_for_domain(&self, d: usize) -> f64 {
+        self.edge.as_ref().map(|e| e.write_for_domain(d)).unwrap_or(0.0)
     }
 
     pub fn intrusion_stats(&self) -> Option<(f64, f64, [f64; 4])> {
@@ -2054,6 +2099,12 @@ pub fn measure_source(cfg: &SdrConfig, stream: &RelationalFactStream) -> SourceC
 
 /// Whether domain `d` is still being trained in round `r`.
 fn trains(cfg: &SdrConfig, r: usize, d: usize) -> bool {
+    // Sequential arrival. With every domain present from round 1 there is no
+    // k-th regime to price, so the marginal-cost curve cannot be measured at
+    // all; domain d simply waits until its round.
+    if cfg.arrival > 0 && r < 1 + d * cfg.arrival {
+        return false;
+    }
     if cfg.retire_after == 0 {
         return true;
     }
@@ -2114,10 +2165,7 @@ pub fn run_arm_trial(
             // class at every visit instead of making it infer one. The natural
             // state is kept here and put back before training, so the restore
             // serves the measurement only, which is what it was introduced for.
-            let natural = bank.topo_snapshot();
-            if let Some(snap) = &domain_nodes[d] {
-                bank.topo_restore(snap);
-            }
+            let displaced = domain_nodes[d].clone().map(|snap| bank.topo_borrow(&snap));
             match &domain_ctx[d] {
                 Some(snap) => probe_ladder.restore_state(snap),
                 None => {
@@ -2179,11 +2227,18 @@ pub fn run_arm_trial(
 
             round_pre_acc_sum += pre_acc;
             round_pre_loss_sum += pre_loss;
+            // One machine-readable row per (round, domain): what this regime
+            // has cost so far and what it knows. The marginal-cost curve is
+            // built from these, so keep the format stable.
+            println!(
+                "MARGINAL arm={arm:?} round={r} domain={d} writes={:.3} acc={pre_acc:.4}",
+                bank.write_for_domain(d)
+            );
 
             // Training resumes from where the stream actually left it, not
             // from the probe's reinstated context.
-            if let Some(nat) = &natural {
-                bank.topo_restore(nat);
+            if let Some(d) = displaced {
+                bank.topo_return(d);
             }
 
             // 2. Stream online learning in current domain via continuous random walk
@@ -2535,10 +2590,7 @@ pub fn ebbinghaus_probe(
                     // ended up writing into domain 0's class and the class
                     // mechanism measured as completely inert. The probe must
                     // observe the run, not steer it.
-                    let natural = bank.topo_snapshot();
-                    if let Some(snap) = &nodes0 {
-                        bank.topo_restore(snap);
-                    }
+                    let displaced = nodes0.clone().map(|snap| bank.topo_borrow(&snap));
                     match &ctx0 {
                         Some(snap) => probe_ladder.restore_state(snap),
                         None => {
@@ -2558,8 +2610,8 @@ pub fn ebbinghaus_probe(
                         bits_domain_specific: probe.mean_loss_domain_specific
                             * std::f64::consts::LOG2_E,
                     });
-                    if let Some(nat) = &natural {
-                        bank.topo_restore(nat);
+                    if let Some(d) = displaced {
+                        bank.topo_return(d);
                     }
                 }
             }
@@ -3509,12 +3561,14 @@ mod tests {
             edge_forget: 0.0,
             edge_hash_class: false,
             edge_class_readout: false,
+            edge_expand: 0,
             edge_gate: 0.0,
             edge_clip: 0.0,
             edge_rungs: 1,
             edge_ladder_visits: 1.0,
             edge_init_classes: 8,
             edge_grow_k: 3.0,
+            arrival: 0,
             retire_after: 0,
             out: PathBuf::from("results/test_sdr_probe"),
         }
@@ -3591,12 +3645,14 @@ mod tests {
             edge_forget: 0.0,
             edge_hash_class: false,
             edge_class_readout: false,
+            edge_expand: 0,
             edge_gate: 0.0,
             edge_clip: 0.0,
             edge_rungs: 1,
             edge_ladder_visits: 1.0,
             edge_init_classes: 8,
             edge_grow_k: 3.0,
+            arrival: 0,
             retire_after: 0,
             out: PathBuf::from("results/test_sdr_smoke"),
         };
