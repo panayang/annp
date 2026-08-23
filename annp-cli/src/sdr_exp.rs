@@ -884,6 +884,10 @@ pub struct SdrConfig {
     pub edge_forget: f64,
     pub edge_hash_class: bool,
     pub edge_class_readout: bool,
+    /// Scales each write by addressing confidence. 0 disables.
+    pub edge_gate: f64,
+    /// Addressing-blind control: caps the per-write update norm. 0 disables.
+    pub edge_clip: f64,
     /// Benna-Fusi rungs behind each class readout slice; 1 disables it.
     pub edge_rungs: usize,
     /// How many domain visits the first hidden rung should average over.
@@ -1112,6 +1116,8 @@ impl ExpertBank {
                     let per_visit = (cfg.span_tokens / 3) as f64;
                     cfg.ladder_r.powi(2) / (cfg.edge_ladder_visits * per_visit)
                 },
+                cfg.edge_gate,
+                cfg.edge_clip,
                 rng,
             );
             return Self {
@@ -2264,6 +2270,18 @@ pub fn run_arm_trial(
     // Ebbinghaus probe where context flows continuously. If domains separate
     // here but not there, separation is being handed over by the harness
     // rather than inferred, and "allocation" would not be the system's own.
+    if let Some((rate, wshare, by_bucket)) = bank.intrusion_stats() {
+        println!(
+            "  [{arm:?}] intrusion {:.1}% of writes / {:.1}% of write magnitude; \
+             since switch: <100 {:.1}%  100-499 {:.1}%  500-1999 {:.1}%  2000+ {:.1}%",
+            100.0 * rate,
+            100.0 * wshare,
+            100.0 * by_bucket[0],
+            100.0 * by_bucket[1],
+            100.0 * by_bucket[2],
+            100.0 * by_bucket[3]
+        );
+    }
     if let Some(m) = bank.domain_class_matrix(cfg.domains) {
         println!("  [{arm:?}] write share by (domain, class):");
         for (d, row) in m.iter().enumerate() {
@@ -3491,6 +3509,8 @@ mod tests {
             edge_forget: 0.0,
             edge_hash_class: false,
             edge_class_readout: false,
+            edge_gate: 0.0,
+            edge_clip: 0.0,
             edge_rungs: 1,
             edge_ladder_visits: 1.0,
             edge_init_classes: 8,
@@ -3571,6 +3591,8 @@ mod tests {
             edge_forget: 0.0,
             edge_hash_class: false,
             edge_class_readout: false,
+            edge_gate: 0.0,
+            edge_clip: 0.0,
             edge_rungs: 1,
             edge_ladder_visits: 1.0,
             edge_init_classes: 8,

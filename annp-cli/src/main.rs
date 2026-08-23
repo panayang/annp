@@ -683,6 +683,17 @@ enum Command {
         /// however well the edge slices are allocated.
         #[arg(long)]
         edge_class_readout: bool,
+        /// Scale each write by addressing confidence: eta * m/(m+gate), with m
+        /// the top-1/top-2 prototype margin. 0 = off. Targets transition
+        /// intrusion, which carries 44% of write magnitude and decays to zero
+        /// by 2000 observations after a domain switch.
+        #[arg(long, default_value_t = 0.0)]
+        edge_gate: f64,
+        /// Addressing-blind control for --edge-gate: cap the per-write update
+        /// norm. Same quantity acted on, no addressing knowledge, so it tells
+        /// magnitude control apart from knowing where you are.
+        #[arg(long, default_value_t = 0.0)]
+        edge_clip: f64,
         /// Benna-Fusi rungs behind each class readout slice (1 = off). Only
         /// meaningful with --edge-class-readout: on a shared readout the deep
         /// rungs would average across domains, which is the configuration
@@ -1040,6 +1051,8 @@ fn main() -> std::io::Result<()> {
             edge_forget,
             edge_hash_class,
             edge_class_readout,
+            edge_gate,
+            edge_clip,
             edge_rungs,
             edge_ladder_visits,
             edge_init_classes,
@@ -1090,6 +1103,8 @@ fn main() -> std::io::Result<()> {
                 edge_forget,
                 edge_hash_class,
                 edge_class_readout,
+                edge_gate,
+                edge_clip,
                 edge_rungs,
                 edge_ladder_visits,
                 edge_init_classes,

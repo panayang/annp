@@ -197,6 +197,19 @@ pub struct EdgeMemory {
     /// knowledge along with dead -- active accuracy fell 47.1% -> 8.8% as the
     /// rate rose, which is not reclamation, it is demolition.
     usage_decay: f64,
+    /// Scales each write by addressing confidence: eta * margin / (margin +
+    /// gate). Zero disables it, leaving eta untouched.
+    ///
+    /// This does not try to route better. It breaks the coupling between "I do
+    /// not recognise this" and "therefore write hard" -- a misrouted write
+    /// meets a slice that does not know the fact, so its error and hence its
+    /// step are near-maximal, and the wrongest writes do the most damage.
+    gate: f64,
+    /// Addressing-blind control: caps the per-write update norm. Bounds the
+    /// same damage without knowing anything about addressing, so it separates
+    /// "magnitude control works" from "knowing where you are works".
+    clip: f64,
+    margin_now: f64,
     forget: f64,
 
     // forward trace, kept for the backward pass along the path
@@ -330,6 +343,8 @@ impl EdgeMemory {
         rungs: usize,
         lad_r: f64,
         lad_g1: f64,
+        gate: f64,
+        clip: f64,
         rng: &mut Rng,
     ) -> Self {
         // Explicit Euler on the ladder is stable only while the fastest
@@ -382,6 +397,9 @@ impl EdgeMemory {
             } else {
                 Vec::new()
             },
+            gate,
+            clip,
+            margin_now: 1.0,
             lad_cap: (0..rungs).map(|k| lad_r.powi(k as i32)).collect(),
             lad_cond: (0..rungs).map(|k| lad_g1 * lad_r.powi(-(k as i32))).collect(),
             ctx: vec![0.0; d],
@@ -443,7 +461,8 @@ impl EdgeMemory {
         for (c, x) in self.ctx.iter_mut().zip(e) {
             *c += r * (x - *c);
         }
-        let (c, sim) = self.class_and_sim();
+        let (c, sim, margin) = self.class_sim_margin();
+        self.margin_now = margin;
         self.sim_n += 1.0;
         let delta = sim - self.sim_mean;
         self.sim_mean += delta / self.sim_n.min(4096.0);
@@ -509,17 +528,33 @@ impl EdgeMemory {
     }
 
     fn class_and_sim(&self) -> (usize, f64) {
+        let (c, m, _) = self.class_sim_margin();
+        (c, m)
+    }
+
+    /// Best class, its similarity, and its margin over the runner-up.
+    ///
+    /// The margin is the addressing confidence. Intrusion is concentrated
+    /// where it is small: 98.9% of writes in the first 100 observations after
+    /// a domain switch land outside the live domain's class, falling to 0% by
+    /// 2000. A write worth 44% of the total magnitude is being aimed by a
+    /// signal that has not settled yet.
+    fn class_sim_margin(&self) -> (usize, f64, f64) {
         let mut best = 0usize;
-        let mut best_m = f64::NEG_INFINITY;
+        let (mut m1, mut m2) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
         for c in 0..self.n_active {
             let p = &self.proto[c * self.d..(c + 1) * self.d];
             let m: f64 = p.iter().zip(&self.ctx).map(|(a, b)| a * b).sum();
-            if m > best_m {
-                best_m = m;
+            if m > m1 {
+                m2 = m1;
+                m1 = m;
                 best = c;
+            } else if m > m2 {
+                m2 = m;
             }
         }
-        (best, best_m)
+        let margin = if m2.is_finite() { m1 - m2 } else { 1.0 };
+        (best, m1, margin)
     }
 
     /// Adds a prototype at the current context when it is far enough below
@@ -702,6 +737,29 @@ impl EdgeMemory {
     pub fn observe_fact(&mut self, entity: usize, relation: usize, target: usize, eta: f64) {
         self.forward(entity, relation);
         let _ = score(&self.logits, target, &mut self.probs);
+
+        // Write hard only where the address is known. Both knobs act on the
+        // same quantity -- how much this observation is allowed to change --
+        // so a gain from the gate that the clip also produces is magnitude
+        // control, not addressing awareness.
+        let mut eta = eta;
+        if self.gate > 0.0 {
+            eta *= self.margin_now.max(0.0) / (self.margin_now.max(0.0) + self.gate);
+        }
+        if self.clip > 0.0 {
+            let err: f64 = self
+                .probs
+                .iter()
+                .enumerate()
+                .map(|(v, p)| if v == target { 1.0 - p } else { *p })
+                .map(|g| g * g)
+                .sum::<f64>()
+                .sqrt();
+            let n = eta * err;
+            if n > self.clip {
+                eta *= self.clip / n;
+            }
+        }
 
         // Readout, delta rule on the final payload.
         let rb = self.rbase();
@@ -1090,6 +1148,9 @@ impl Clone for EdgeMemory {
             growth_checked: self.growth_checked,
             hash_class: self.hash_class,
             usage: self.usage.clone(),
+            gate: self.gate,
+            clip: self.clip,
+            margin_now: self.margin_now,
             readout_scale: self.readout_scale.clone(),
             edge_scale: self.edge_scale.clone(),
             usage_decay: self.usage_decay,
@@ -1161,7 +1222,7 @@ mod tests {
     #[test]
     fn the_same_fact_always_walks_the_same_path() {
         let mut rng = Rng::new(3);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, &mut rng);
         m.forward(5, 9);
         let a = m.path_edge.clone();
         for t in 0..50 {
@@ -1178,7 +1239,7 @@ mod tests {
     #[test]
     fn different_facts_take_different_paths() {
         let mut rng = Rng::new(5);
-        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, &mut rng);
+        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, &mut rng);
         let mut seen = std::collections::HashSet::new();
         for t in 0..60 {
             m.forward(t, t + 1);
@@ -1190,7 +1251,7 @@ mod tests {
     #[test]
     fn hash_class_ignores_the_stream_entirely() {
         let mut rng = Rng::new(23);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, &mut rng);
         m.forward(4, 7);
         let a = m.class_used;
         for _ in 0..300 {
@@ -1203,7 +1264,7 @@ mod tests {
     #[test]
     fn the_class_follows_the_stream() {
         let mut rng = Rng::new(7);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, &mut rng);
         for _ in 0..200 {
             m.absorb_token(11);
         }
@@ -1217,7 +1278,7 @@ mod tests {
     #[test]
     fn a_write_only_touches_the_edges_that_were_walked() {
         let mut rng = Rng::new(11);
-        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, &mut rng);
         // Warm the readout first. From a zero readout the first write leaves
         // it rank one along the payload, so dL/dp_H comes out exactly
         // parallel to p_H and the unit-norm projection (I - p p^T) cancels it
