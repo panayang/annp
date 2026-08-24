@@ -688,6 +688,12 @@ enum Command {
         /// every domain present there is no k-th regime to price.
         #[arg(long, default_value_t = 0)]
         arrival: usize,
+        /// Consecutive novel observations required before a class is
+        /// allocated (1 = the old, undebounced behaviour). A domain switch
+        /// makes similarity dip exactly as novelty does, so without this
+        /// growth fires on boundaries rather than on regimes.
+        #[arg(long, default_value_t = 1)]
+        edge_grow_hold: usize,
         /// Ceiling on total class slices when capacity is expanded on demand
         /// (0 = fixed budget). Growth then allocates a slice only when a
         /// genuinely novel regime arrives, and the append leaves every
@@ -1065,6 +1071,7 @@ fn main() -> std::io::Result<()> {
             edge_hash_class,
             edge_class_readout,
             arrival,
+            edge_grow_hold,
             edge_expand,
             edge_gate,
             edge_clip,
@@ -1119,6 +1126,7 @@ fn main() -> std::io::Result<()> {
                 edge_hash_class,
                 edge_class_readout,
                 arrival,
+                edge_grow_hold,
                 edge_expand,
                 edge_gate,
                 edge_clip,

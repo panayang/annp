@@ -887,6 +887,8 @@ pub struct SdrConfig {
     /// Ceiling on total class slices when capacity may be expanded at run
     /// time. 0 = fixed budget, the old behaviour.
     pub edge_expand: usize,
+    /// Consecutive novel observations required before allocating a class.
+    pub edge_grow_hold: usize,
     /// Scales each write by addressing confidence. 0 disables.
     pub edge_gate: f64,
     /// Addressing-blind control: caps the per-write update norm. 0 disables.
@@ -1133,6 +1135,7 @@ impl ExpertBank {
                 cfg.edge_gate,
                 cfg.edge_clip,
                 cfg.edge_expand,
+                cfg.edge_grow_hold,
                 rng,
             );
             return Self {
@@ -1674,6 +1677,10 @@ impl ExpertBank {
 
     pub fn class_collision(&self) -> Option<f64> {
         self.edge.as_ref().map(|e| e.class_collision())
+    }
+
+    pub fn growth_timing(&self) -> Option<[usize; 4]> {
+        self.edge.as_ref().map(|e| e.growth_timing())
     }
 
     pub fn write_for_domain(&self, d: usize) -> f64 {
@@ -2325,6 +2332,13 @@ pub fn run_arm_trial(
     // Ebbinghaus probe where context flows continuously. If domains separate
     // here but not there, separation is being handed over by the harness
     // rather than inferred, and "allocation" would not be the system's own.
+    if let Some(g) = bank.growth_timing() {
+        let tot: usize = g.iter().sum();
+        println!(
+            "  [{arm:?}] growth events {tot}; since switch: <100 {}  100-499 {}  500-1999 {}  2000+ {}",
+            g[0], g[1], g[2], g[3]
+        );
+    }
     if let Some((rate, wshare, by_bucket)) = bank.intrusion_stats() {
         println!(
             "  [{arm:?}] intrusion {:.1}% of writes / {:.1}% of write magnitude; \
@@ -3562,6 +3576,7 @@ mod tests {
             edge_hash_class: false,
             edge_class_readout: false,
             edge_expand: 0,
+            edge_grow_hold: 1,
             edge_gate: 0.0,
             edge_clip: 0.0,
             edge_rungs: 1,
@@ -3646,6 +3661,7 @@ mod tests {
             edge_hash_class: false,
             edge_class_readout: false,
             edge_expand: 0,
+            edge_grow_hold: 1,
             edge_gate: 0.0,
             edge_clip: 0.0,
             edge_rungs: 1,
