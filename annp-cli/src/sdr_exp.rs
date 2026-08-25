@@ -887,7 +887,7 @@ pub struct SdrConfig {
     /// Ceiling on total class slices when capacity may be expanded at run
     /// time. 0 = fixed budget, the old behaviour.
     pub edge_expand: usize,
-    /// Consecutive novel observations required before allocating a class.
+    /// Debounce length in units of a transition, not observations.
     pub edge_grow_hold: usize,
     /// Scales each write by addressing confidence. 0 disables.
     pub edge_gate: f64,
@@ -1135,7 +1135,16 @@ impl ExpertBank {
                 cfg.edge_gate,
                 cfg.edge_clip,
                 cfg.edge_expand,
-                cfg.edge_grow_hold,
+                {
+                    // Debounce length must exceed a transition, and the
+                    // transition length is measured, not chosen: intrusion
+                    // decays to zero by roughly a third of a visit. Typing a
+                    // raw count here is the units mistake of s12, committed
+                    // six times and once more in the commit that added this
+                    // flag. `edge_grow_hold` is now a MULTIPLE of that.
+                    let transition = (cfg.span_tokens / 3) as f64 * 0.25;
+                    (cfg.edge_grow_hold as f64 * transition).round() as usize
+                },
                 rng,
             );
             return Self {
