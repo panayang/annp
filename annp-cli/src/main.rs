@@ -710,6 +710,13 @@ enum Command {
         /// Privatising it too gave each new class zeros at every edge.
         #[arg(long)]
         edge_share: bool,
+        /// Add a class-common readout block to the per-class one. The
+        /// readout is where the parameters are (1.57M against the encoder's
+        /// 65K at 12 classes), so it is where "a new class inherits zeros"
+        /// mostly still bites, and the source's hub tier is currently
+        /// relearned privately by every domain.
+        #[arg(long)]
+        edge_share_readout: bool,
         /// written through.
         #[arg(long, default_value_t = 0)]
         edge_expand: usize,
@@ -1083,6 +1090,7 @@ fn main() -> std::io::Result<()> {
             edge_class_readout,
             arrival,
             edge_share,
+            edge_share_readout,
             edge_grow_hold,
             edge_expand,
             edge_gate,
@@ -1139,6 +1147,7 @@ fn main() -> std::io::Result<()> {
                 edge_class_readout,
                 arrival,
                 edge_share,
+                edge_share_readout,
                 edge_grow_hold,
                 edge_expand,
                 edge_gate,

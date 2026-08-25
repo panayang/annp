@@ -889,6 +889,8 @@ pub struct SdrConfig {
     pub edge_expand: usize,
     /// Share one edge memory across all classes; readout stays per-class.
     pub edge_share: bool,
+    /// Add a class-common readout block to the per-class one.
+    pub edge_share_readout: bool,
     /// Debounce length in units of a transition, not observations.
     pub edge_grow_hold: usize,
     /// Scales each write by addressing confidence. 0 disables.
@@ -1137,6 +1139,7 @@ impl ExpertBank {
                 cfg.edge_gate,
                 cfg.edge_clip,
                 cfg.edge_share,
+                cfg.edge_share_readout,
                 cfg.edge_expand,
                 {
                     // Debounce length must exceed a transition, and the
@@ -3589,6 +3592,7 @@ mod tests {
             edge_class_readout: false,
             edge_expand: 0,
             edge_share: false,
+            edge_share_readout: false,
             edge_grow_hold: 1,
             edge_gate: 0.0,
             edge_clip: 0.0,
@@ -3675,6 +3679,7 @@ mod tests {
             edge_class_readout: false,
             edge_expand: 0,
             edge_share: false,
+            edge_share_readout: false,
             edge_grow_hold: 1,
             edge_gate: 0.0,
             edge_clip: 0.0,

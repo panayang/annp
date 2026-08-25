@@ -214,6 +214,22 @@ pub struct EdgeMemory {
     /// consequence of the stream rather than a constant chosen in advance.
     /// One edge memory for all classes; the readout stays per-class.
     share_edge: bool,
+    /// A readout block common to every class, added to the private one.
+    ///
+    /// The encoder fix removed "a new class inherits zeros" from the smaller
+    /// half only: at 12 classes the edge memory is 65K parameters and the
+    /// readout is 1.57M, so most of what a new regime has to learn from
+    /// nothing still lives here. The source also has a shared hub tier, so
+    /// every domain currently relearns the same hub facts privately.
+    ///
+    /// It cannot be shared outright the way the encoder can -- Mode B is
+    /// defined by the same (entity, relation) mapping to different targets
+    /// per domain, so a fully shared readout could not tell domains apart.
+    /// Hence base plus private correction, with the private part able to
+    /// override. Kept full-rank on purpose: a domain has hundreds of
+    /// unrelated targets, so a rank-r correction could not address them. This
+    /// version buys transfer, not compactness.
+    readout_shared: Vec<f64>,
     expand_cap: usize,
     /// Consecutive novel observations required before a class is allocated.
     ///
@@ -376,6 +392,7 @@ impl EdgeMemory {
         gate: f64,
         clip: f64,
         share_edge: bool,
+        share_readout: bool,
         expand_cap: usize,
         grow_hold: usize,
         rng: &mut Rng,
@@ -434,6 +451,11 @@ impl EdgeMemory {
             clip,
             expand_cap,
             share_edge,
+            readout_shared: if share_readout && class_readout {
+                vec![0.0; vocab * d]
+            } else {
+                Vec::new()
+            },
             grow_hold,
             novel_run: 0,
             grow_at: [0; 4],
@@ -846,9 +868,19 @@ impl EdgeMemory {
             self.materialize_readout(c);
         }
         let rb = self.rbase();
+        let sh = !self.readout_shared.is_empty();
         for v in 0..self.vocab {
             let row = &self.readout[rb + v * self.d..rb + (v + 1) * self.d];
-            self.logits[v] = row.iter().zip(&self.payload).map(|(a, b)| a * b).sum();
+            let mut z: f64 = row.iter().zip(&self.payload).map(|(a, b)| a * b).sum();
+            if sh {
+                let base = &self.readout_shared[v * self.d..(v + 1) * self.d];
+                z += base
+                    .iter()
+                    .zip(&self.payload)
+                    .map(|(a, b)| a * b)
+                    .sum::<f64>();
+            }
+            self.logits[v] = z;
         }
     }
 
@@ -886,6 +918,7 @@ impl EdgeMemory {
 
         // Readout, delta rule on the final payload.
         let rb = self.rbase();
+        let sh_w = !self.readout_shared.is_empty();
         let mut wn_r = 0.0f64;
         for v in 0..self.vocab {
             let g = if v == target {
@@ -897,6 +930,12 @@ impl EdgeMemory {
             let row = &mut self.readout[rb + v * self.d..rb + (v + 1) * self.d];
             for (w, p) in row.iter_mut().zip(&self.payload) {
                 *w += step * p;
+            }
+            if sh_w {
+                let base = &mut self.readout_shared[v * self.d..(v + 1) * self.d];
+                for (w, p) in base.iter_mut().zip(&self.payload) {
+                    *w += step * p;
+                }
             }
             wn_r += step * step;
         }
@@ -911,6 +950,12 @@ impl EdgeMemory {
             let row = &self.readout[rb + v * self.d..rb + (v + 1) * self.d];
             for (gp, w) in self.grad_p.iter_mut().zip(row) {
                 *gp += g * w;
+            }
+            if sh_w {
+                let base = &self.readout_shared[v * self.d..(v + 1) * self.d];
+                for (gp, w) in self.grad_p.iter_mut().zip(base) {
+                    *gp += g * w;
+                }
             }
         }
 
@@ -1288,6 +1333,7 @@ impl Clone for EdgeMemory {
             clip: self.clip,
             expand_cap: self.expand_cap,
             share_edge: self.share_edge,
+            readout_shared: self.readout_shared.clone(),
             grow_hold: self.grow_hold,
             novel_run: self.novel_run,
             grow_at: self.grow_at,
@@ -1364,7 +1410,7 @@ mod tests {
     #[test]
     fn the_same_fact_always_walks_the_same_path() {
         let mut rng = Rng::new(3);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, 0, 1, &mut rng);
         m.forward(5, 9);
         let a = m.path_edge.clone();
         for t in 0..50 {
@@ -1381,7 +1427,7 @@ mod tests {
     #[test]
     fn different_facts_take_different_paths() {
         let mut rng = Rng::new(5);
-        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, 0, 1, &mut rng);
         let mut seen = std::collections::HashSet::new();
         for t in 0..60 {
             m.forward(t, t + 1);
@@ -1393,7 +1439,7 @@ mod tests {
     #[test]
     fn hash_class_ignores_the_stream_entirely() {
         let mut rng = Rng::new(23);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, 0, 1, &mut rng);
         m.forward(4, 7);
         let a = m.class_used;
         for _ in 0..300 {
@@ -1406,7 +1452,7 @@ mod tests {
     #[test]
     fn the_class_follows_the_stream() {
         let mut rng = Rng::new(7);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, 0, 1, &mut rng);
         for _ in 0..200 {
             m.absorb_token(11);
         }
@@ -1420,7 +1466,7 @@ mod tests {
     #[test]
     fn a_write_only_touches_the_edges_that_were_walked() {
         let mut rng = Rng::new(11);
-        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, 0, 1, &mut rng);
         // Warm the readout first. From a zero readout the first write leaves
         // it rank one along the payload, so dL/dp_H comes out exactly
         // parallel to p_H and the unit-norm projection (I - p p^T) cancels it
@@ -1456,7 +1502,7 @@ mod tests {
         let mut rng = Rng::new(9);
         let mut m = EdgeMemory::new(
             16, 2, 3, 4, 16, 64, 0.01, 0.0, false, true, 4, 3.0, 20000.0, 1, 2.0, 0.1, 0.0,
-            0.0, false, 0, 1, &mut rng,
+            0.0, false, false, 0, 1, &mut rng,
         );
         for t in 0..40 {
             m.observe_fact(t % 12, (t + 1) % 12, (t + 2) % 12, 0.3);
