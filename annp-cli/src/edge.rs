@@ -214,6 +214,11 @@ pub struct EdgeMemory {
     /// consequence of the stream rather than a constant chosen in advance.
     /// One edge memory for all classes; the readout stays per-class.
     share_edge: bool,
+    /// Choose the write's class by which head scores the observed target
+    /// best, instead of by the context prior.
+    posterior_route: bool,
+    posterior_moves: f64,
+    posterior_seen: f64,
     /// A readout block common to every class, added to the private one.
     ///
     /// The encoder fix removed "a new class inherits zeros" from the smaller
@@ -393,6 +398,7 @@ impl EdgeMemory {
         clip: f64,
         share_edge: bool,
         share_readout: bool,
+        posterior_route: bool,
         expand_cap: usize,
         grow_hold: usize,
         rng: &mut Rng,
@@ -451,6 +457,9 @@ impl EdgeMemory {
             clip,
             expand_cap,
             share_edge,
+            posterior_route,
+            posterior_moves: 0.0,
+            posterior_seen: 0.0,
             readout_shared: if share_readout && class_readout {
                 vec![0.0; vocab * d]
             } else {
@@ -891,6 +900,55 @@ impl EdgeMemory {
 
     pub fn observe_fact(&mut self, entity: usize, relation: usize, target: usize, eta: f64) {
         self.forward(entity, relation);
+
+        // Route the write by posterior, not prior.
+        //
+        // The class comes from a slow context EMA, which is least reliable
+        // exactly at a domain switch -- that is the whole of the 43-44% of
+        // write magnitude that lands outside the live domain's class, and
+        // attenuating those writes does not help (gate -0.076, clip -0.775),
+        // because the problem is where they go, not how hard they hit. But by
+        // write time the target is known and unambiguous, so the head that
+        // scores it best is the one it belongs to.
+        //
+        // Prediction still uses the prior: reading may not consult the label.
+        // Only the destination of a write is chosen this way, which is the
+        // same information the delta rule already uses for its gradient.
+        //
+        // A shared encoder makes this nearly free: the payload does not depend
+        // on the class, so scoring every head is C dot products against one
+        // payload rather than C walks of the ring.
+        if self.posterior_route && self.class_readout && self.n_active > 1 {
+            let mut best = self.class_used;
+            let mut best_z = f64::NEG_INFINITY;
+            let sh = !self.readout_shared.is_empty();
+            for c in 0..self.n_active {
+                let rb = c * self.vocab * self.d;
+                let row = &self.readout[rb + target * self.d..rb + (target + 1) * self.d];
+                let mut z: f64 = row.iter().zip(&self.payload).map(|(a, b)| a * b).sum();
+                z *= self.readout_scale[c];
+                if sh {
+                    let base = &self.readout_shared[target * self.d..(target + 1) * self.d];
+                    z += base.iter().zip(&self.payload).map(|(a, b)| a * b).sum::<f64>();
+                }
+                if z > best_z {
+                    best_z = z;
+                    best = c;
+                }
+            }
+            if best != self.class_used {
+                self.class_used = best;
+                self.posterior_moves += 1.0;
+                if !self.share_edge {
+                    // The edge slice is class-indexed, so a re-routed write has
+                    // to be re-walked; with a shared encoder it does not.
+                    self.forward(entity, relation);
+                    self.class_used = best;
+                }
+            }
+            self.posterior_seen += 1.0;
+        }
+
         let _ = score(&self.logits, target, &mut self.probs);
 
         // Write hard only where the address is known. Both knobs act on the
@@ -1210,6 +1268,15 @@ impl EdgeMemory {
         )
     }
 
+    /// Share of writes the posterior sent somewhere the prior would not have.
+    pub fn posterior_move_rate(&self) -> f64 {
+        if self.posterior_seen > 0.0 {
+            self.posterior_moves / self.posterior_seen
+        } else {
+            0.0
+        }
+    }
+
     /// Growth events by observations since the domain last changed.
     pub fn growth_timing(&self) -> [usize; 4] {
         self.grow_at
@@ -1334,6 +1401,9 @@ impl Clone for EdgeMemory {
             expand_cap: self.expand_cap,
             share_edge: self.share_edge,
             readout_shared: self.readout_shared.clone(),
+            posterior_route: self.posterior_route,
+            posterior_moves: self.posterior_moves,
+            posterior_seen: self.posterior_seen,
             grow_hold: self.grow_hold,
             novel_run: self.novel_run,
             grow_at: self.grow_at,
@@ -1410,7 +1480,7 @@ mod tests {
     #[test]
     fn the_same_fact_always_walks_the_same_path() {
         let mut rng = Rng::new(3);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 1, &mut rng);
         m.forward(5, 9);
         let a = m.path_edge.clone();
         for t in 0..50 {
@@ -1427,7 +1497,7 @@ mod tests {
     #[test]
     fn different_facts_take_different_paths() {
         let mut rng = Rng::new(5);
-        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 1, &mut rng);
         let mut seen = std::collections::HashSet::new();
         for t in 0..60 {
             m.forward(t, t + 1);
@@ -1439,7 +1509,7 @@ mod tests {
     #[test]
     fn hash_class_ignores_the_stream_entirely() {
         let mut rng = Rng::new(23);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 1, &mut rng);
         m.forward(4, 7);
         let a = m.class_used;
         for _ in 0..300 {
@@ -1452,7 +1522,7 @@ mod tests {
     #[test]
     fn the_class_follows_the_stream() {
         let mut rng = Rng::new(7);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 1, &mut rng);
         for _ in 0..200 {
             m.absorb_token(11);
         }
@@ -1466,7 +1536,7 @@ mod tests {
     #[test]
     fn a_write_only_touches_the_edges_that_were_walked() {
         let mut rng = Rng::new(11);
-        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 1, &mut rng);
         // Warm the readout first. From a zero readout the first write leaves
         // it rank one along the payload, so dL/dp_H comes out exactly
         // parallel to p_H and the unit-norm projection (I - p p^T) cancels it
@@ -1502,7 +1572,7 @@ mod tests {
         let mut rng = Rng::new(9);
         let mut m = EdgeMemory::new(
             16, 2, 3, 4, 16, 64, 0.01, 0.0, false, true, 4, 3.0, 20000.0, 1, 2.0, 0.1, 0.0,
-            0.0, false, false, 0, 1, &mut rng,
+            0.0, false, false, false, 0, 1, &mut rng,
         );
         for t in 0..40 {
             m.observe_fact(t % 12, (t + 1) % 12, (t + 2) % 12, 0.3);

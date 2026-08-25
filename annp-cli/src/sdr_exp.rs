@@ -891,6 +891,8 @@ pub struct SdrConfig {
     pub edge_share: bool,
     /// Add a class-common readout block to the per-class one.
     pub edge_share_readout: bool,
+    /// Route each write by which head scores the observed target best.
+    pub edge_posterior: bool,
     /// Debounce length in units of a transition, not observations.
     pub edge_grow_hold: usize,
     /// Scales each write by addressing confidence. 0 disables.
@@ -1140,6 +1142,7 @@ impl ExpertBank {
                 cfg.edge_clip,
                 cfg.edge_share,
                 cfg.edge_share_readout,
+                cfg.edge_posterior,
                 cfg.edge_expand,
                 {
                     // Debounce length must exceed a transition, and the
@@ -1692,6 +1695,10 @@ impl ExpertBank {
 
     pub fn class_collision(&self) -> Option<f64> {
         self.edge.as_ref().map(|e| e.class_collision())
+    }
+
+    pub fn posterior_move_rate(&self) -> Option<f64> {
+        self.edge.as_ref().map(|e| e.posterior_move_rate())
     }
 
     pub fn growth_timing(&self) -> Option<[usize; 4]> {
@@ -2347,6 +2354,12 @@ pub fn run_arm_trial(
     // Ebbinghaus probe where context flows continuously. If domains separate
     // here but not there, separation is being handed over by the harness
     // rather than inferred, and "allocation" would not be the system's own.
+    if let Some(r) = bank.posterior_move_rate().filter(|r| *r > 0.0) {
+        println!(
+            "  [{arm:?}] posterior re-routed {:.1}% of writes away from the prior",
+            100.0 * r
+        );
+    }
     if let Some(g) = bank.growth_timing() {
         let tot: usize = g.iter().sum();
         println!(
@@ -3593,6 +3606,7 @@ mod tests {
             edge_expand: 0,
             edge_share: false,
             edge_share_readout: false,
+            edge_posterior: false,
             edge_grow_hold: 1,
             edge_gate: 0.0,
             edge_clip: 0.0,
@@ -3680,6 +3694,7 @@ mod tests {
             edge_expand: 0,
             edge_share: false,
             edge_share_readout: false,
+            edge_posterior: false,
             edge_grow_hold: 1,
             edge_gate: 0.0,
             edge_clip: 0.0,

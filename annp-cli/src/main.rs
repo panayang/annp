@@ -717,6 +717,13 @@ enum Command {
         /// relearned privately by every domain.
         #[arg(long)]
         edge_share_readout: bool,
+        /// Choose each write's class by which head scores the observed
+        /// target best, rather than by the context prior. Prediction still
+        /// uses the prior -- reading may not consult the label. Targets
+        /// intrusion, which is 43-44% of write magnitude and which
+        /// attenuating writes did not fix.
+        #[arg(long)]
+        edge_posterior: bool,
         /// written through.
         #[arg(long, default_value_t = 0)]
         edge_expand: usize,
@@ -1091,6 +1098,7 @@ fn main() -> std::io::Result<()> {
             arrival,
             edge_share,
             edge_share_readout,
+            edge_posterior,
             edge_grow_hold,
             edge_expand,
             edge_gate,
@@ -1148,6 +1156,7 @@ fn main() -> std::io::Result<()> {
                 arrival,
                 edge_share,
                 edge_share_readout,
+                edge_posterior,
                 edge_grow_hold,
                 edge_expand,
                 edge_gate,
