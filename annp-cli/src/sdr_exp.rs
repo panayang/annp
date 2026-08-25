@@ -887,6 +887,8 @@ pub struct SdrConfig {
     /// Ceiling on total class slices when capacity may be expanded at run
     /// time. 0 = fixed budget, the old behaviour.
     pub edge_expand: usize,
+    /// Share one edge memory across all classes; readout stays per-class.
+    pub edge_share: bool,
     /// Debounce length in units of a transition, not observations.
     pub edge_grow_hold: usize,
     /// Scales each write by addressing confidence. 0 disables.
@@ -1134,6 +1136,7 @@ impl ExpertBank {
                 },
                 cfg.edge_gate,
                 cfg.edge_clip,
+                cfg.edge_share,
                 cfg.edge_expand,
                 {
                     // Debounce length must exceed a transition, and the
@@ -3585,6 +3588,7 @@ mod tests {
             edge_hash_class: false,
             edge_class_readout: false,
             edge_expand: 0,
+            edge_share: false,
             edge_grow_hold: 1,
             edge_gate: 0.0,
             edge_clip: 0.0,
@@ -3670,6 +3674,7 @@ mod tests {
             edge_hash_class: false,
             edge_class_readout: false,
             edge_expand: 0,
+            edge_share: false,
             edge_grow_hold: 1,
             edge_gate: 0.0,
             edge_clip: 0.0,

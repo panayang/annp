@@ -703,6 +703,13 @@ enum Command {
         /// genuinely novel regime arrives, and the append leaves every
         /// existing weight untouched -- no retraining, unlike widening a
         /// monolithic readout, which changes the projection every code was
+        /// Share one edge memory across all classes, keeping the readout
+        /// per-class. A payload is built from entity and relation, which are
+        /// byte-identical across Mode B's domains, so the transform is common
+        /// to every domain and only the target mapping is domain-specific.
+        /// Privatising it too gave each new class zeros at every edge.
+        #[arg(long)]
+        edge_share: bool,
         /// written through.
         #[arg(long, default_value_t = 0)]
         edge_expand: usize,
@@ -1075,6 +1082,7 @@ fn main() -> std::io::Result<()> {
             edge_hash_class,
             edge_class_readout,
             arrival,
+            edge_share,
             edge_grow_hold,
             edge_expand,
             edge_gate,
@@ -1130,6 +1138,7 @@ fn main() -> std::io::Result<()> {
                 edge_hash_class,
                 edge_class_readout,
                 arrival,
+                edge_share,
                 edge_grow_hold,
                 edge_expand,
                 edge_gate,

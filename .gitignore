@@ -1,2 +1,7 @@
 /target
 **/target
+
+# editor artefacts
+\#*\#
+.\#*
+*.markdown-preview.html
