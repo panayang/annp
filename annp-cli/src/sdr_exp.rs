@@ -1812,6 +1812,10 @@ impl ExpertBank {
         self.edge.as_ref().map(|e| e.readout_occupancy())
     }
 
+    pub fn context_ratio(&self) -> Option<f64> {
+        self.edge.as_ref().map(|e| e.context_ratio())
+    }
+
     pub fn growth_timing(&self) -> Option<[usize; 4]> {
         self.edge.as_ref().map(|e| e.growth_timing())
     }
@@ -2505,6 +2509,9 @@ pub fn run_arm_trial(
             "  [{arm:?}] posterior re-routed {:.1}% of writes away from the prior",
             100.0 * r
         );
+    }
+    if let Some(r) = bank.context_ratio().filter(|r| *r > 0.0) {
+        println!("  [{arm:?}] injected context is {r:.2}x the content magnitude");
     }
     if let Some(g) = bank.growth_timing() {
         let tot: usize = g.iter().sum();

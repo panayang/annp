@@ -290,6 +290,8 @@ pub struct EdgeMemory {
     ctx_proj: Vec<f64>,
     ctx_proj_rows: usize,
     pending_ctx: Vec<f64>,
+    ctx_ratio_sum: f64,
+    ctx_ratio_n: f64,
     /// Growth events bucketed by observations since the domain last changed.
     /// Spread out means growth tracks regimes; piled into the first bucket
     /// means it tracks boundaries.
@@ -528,6 +530,8 @@ impl EdgeMemory {
             },
             ctx_proj_rows: 512,
             pending_ctx: Vec::new(),
+            ctx_ratio_sum: 0.0,
+            ctx_ratio_n: 0.0,
             grow_at: [0; 4],
             margin_now: 1.0,
             lad_cap: (0..rungs).map(|k| lad_r.powi(k as i32)).collect(),
@@ -586,44 +590,13 @@ impl EdgeMemory {
     /// signal enters: in Mode B the targets are the only tokens that differ
     /// between domains, so absorbing them is what lets the class tell them
     /// apart at all.
-    /// Adds a projection of the multi-timescale input trace to the payload.
-    ///
-    /// The slow context is a single EMA, so a cue survives (1-rate)^gap: at
-    /// rate 0.01 that is 0.85 after sixteen tokens and 0.08 after 256, and
-    /// accuracy measured 6.97% -> 2.80% across exactly that range. Nothing in
-    /// the architecture holds anything longer, because a payload is built from
-    /// the current fact alone.
-    ///
-    /// The trace is a cascade of EMAs at tau = r^(2k), so its slow rungs hold
-    /// a cue far past the point where a single rate has lost it. Injected
-    /// AFTER route_payload is taken, so routing stays a pure content hash and
-    /// a fact still lands where it was trained -- putting context into the
-    /// address would make the same fact land on different edges depending on
-    /// when it appeared, which is the property the whole memory rests on.
-    ///
-    /// The projection is fixed random, like every other addressing structure
-    /// here; nothing about it is learned.
-    /// Stashes the trace for the next forward pass. Prediction and writing
-    /// both use it, so reading and learning stay on the same representation.
+    /// Stashes the trace for the next forward pass, so prediction and writing
+    /// address memory the same way.
     pub fn set_pending_context(&mut self, trace: &[f64]) {
         if self.ctx_gain != 0.0 {
             self.pending_ctx.clear();
             self.pending_ctx.extend_from_slice(trace);
         }
-    }
-
-    fn add_context(&mut self, trace: &[f64]) {
-        if self.ctx_gain == 0.0 || trace.is_empty() {
-            return;
-        }
-        for i in 0..self.d {
-            let mut acc = 0.0;
-            for (j, t) in trace.iter().enumerate() {
-                acc += self.ctx_proj[(j % self.ctx_proj_rows) * self.d + i] * t;
-            }
-            self.payload[i] += self.ctx_gain * acc;
-        }
-        normalize(&mut self.payload);
     }
 
     /// Clears the slow context so a probe can rebuild it from what it shows.
@@ -929,10 +902,36 @@ impl EdgeMemory {
         }
         normalize(&mut self.payload);
         self.route_payload.copy_from_slice(&self.payload);
+        // Context goes into the ADDRESS, not into the content.
+        //
+        // With `addr = hash(content)` alone the memory is an ideal content-
+        // addressed lookup table, and for exactly that reason it cannot
+        // associate: the same fact reaches the same slice under every history,
+        // so history cannot influence what comes back. Protecting that
+        // invariant -- which earlier versions did, injecting only after this
+        // copy -- protects the property that makes it a lookup table.
+        //
+        // Each rung is projected separately and concatenated rather than mixed
+        // into one blob: two histories differing at ANY timescale must give
+        // different keys. Addressing needs to DISCRIMINATE, not to
+        // reconstruct, which is why a smoothed summary is adequate here though
+        // it could never serve as an associative store.
+        //
+        // The payload itself is left alone, so the transform and readout still
+        // operate on content.
         if self.ctx_gain != 0.0 && !self.pending_ctx.is_empty() {
-            let t = std::mem::take(&mut self.pending_ctx);
-            self.add_context(&t);
-            self.pending_ctx = t;
+            let m = self.pending_ctx.len();
+            let per = self.d.max(1);
+            for i in 0..self.d {
+                let mut acc = 0.0;
+                for (j, t) in self.pending_ctx.iter().enumerate() {
+                    // rung index j/per keeps the scales on separate rows
+                    let row = ((j / per) * 7 + j % per) % self.ctx_proj_rows;
+                    acc += self.ctx_proj[row * self.d + i] * t;
+                }
+                self.route_payload[i] += self.ctx_gain * acc / (m as f64).sqrt();
+            }
+            normalize(&mut self.route_payload);
         }
 
         self.path_edge.clear();
@@ -1471,6 +1470,11 @@ impl EdgeMemory {
         (nz, self.n_active * self.vocab, self.n_active)
     }
 
+    /// Mean |injected context| / |content| in the payload.
+    pub fn context_ratio(&self) -> f64 {
+        if self.ctx_ratio_n > 0.0 { self.ctx_ratio_sum / self.ctx_ratio_n } else { 0.0 }
+    }
+
     /// Growth events by observations since the domain last changed.
     pub fn growth_timing(&self) -> [usize; 4] {
         self.grow_at
@@ -1607,6 +1611,8 @@ impl Clone for EdgeMemory {
             ctx_proj: self.ctx_proj.clone(),
             ctx_proj_rows: self.ctx_proj_rows,
             pending_ctx: self.pending_ctx.clone(),
+            ctx_ratio_sum: self.ctx_ratio_sum,
+            ctx_ratio_n: self.ctx_ratio_n,
             novel_run: self.novel_run,
             grow_at: self.grow_at,
             margin_now: self.margin_now,
