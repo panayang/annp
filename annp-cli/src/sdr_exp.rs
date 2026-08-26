@@ -92,6 +92,17 @@ impl RelationalFactStream {
         target_overlap: f64,
     ) -> Self {
         assert!(domains > 0, "domains must be positive");
+        assert!(
+            (0.0..=1.0).contains(&target_overlap),
+            "target_overlap must be in [0, 1], got {target_overlap}"
+        );
+        assert!(
+            target_overlap == 0.0 || matches!(mode, StreamMode::ModeB),
+            "--target-overlap only affects Mode B, whose targets are otherwise \
+             disjoint by construction. Mode A already shares its hub targets \
+             (union/domains falls 97 -> 51 over twelve domains), so passing it \
+             here would silently do nothing."
+        );
         assert!(facts_per_domain >= 3, "facts_per_domain must be >= 3");
         assert!(span_tokens >= 3, "span_tokens must be >= 3");
         assert!(rounds > 0, "rounds must be positive");

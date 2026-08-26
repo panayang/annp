@@ -229,6 +229,22 @@ pub struct EdgeMemory {
     /// unaffected because forward still scores every row.
     neg_samples: usize,
     write_step: u64,
+    /// How many distinct classes have emitted each target.
+    ///
+    /// Decides where a row lives. The first version added the shared block to
+    /// the private one and updated BOTH with the same gradient, which is
+    /// double storage rather than sharing: a target used by twelve domains was
+    /// held thirteen times, capacity went up rather than down, and the only
+    /// visible effect was a scale change the softmax mostly absorbed -- which
+    /// is why the benefit measured as approximately zero however much genuine
+    /// overlap the source had.
+    ///
+    /// Sharing has to mean stored once. A target seen by more than one class
+    /// is written to the shared block only; one seen by a single class stays
+    /// in that class's own block. Reads still sum the two, one of which is
+    /// zero. Capacity then follows the UNION of targets rather than the sum
+    /// over classes.
+    target_class_count: Vec<u16>,
     /// Targets each class has actually emitted, in first-seen order.
     ///
     /// Negatives drawn uniformly from the whole vocabulary do not make the
@@ -486,6 +502,7 @@ impl EdgeMemory {
             neg_samples,
             write_step: 0,
             seen_targets: vec![Vec::new(); classes.max(1)],
+            target_class_count: vec![0; vocab],
             posterior_moves: 0.0,
             posterior_seen: 0.0,
             readout_shared: if share_readout && class_readout {
@@ -1016,6 +1033,7 @@ impl EdgeMemory {
             let c = self.class_used;
             if c < self.seen_targets.len() && !self.seen_targets[c].contains(&target) {
                 self.seen_targets[c].push(target);
+                self.target_class_count[target] = self.target_class_count[target].saturating_add(1);
             }
             touched.push(target);
             let pool = if c < self.seen_targets.len() {
@@ -1037,10 +1055,19 @@ impl EdgeMemory {
                 }
             }
         }
+        // Iterate an index range in the dense case rather than materialising
+        // one: collecting 0..vocab allocated a 4096-element Vec on every
+        // single write.
+        // Dense walks 0..vocab, sampled walks the touched list; neither
+        // materialises an index vector, which the first version did on every
+        // write.
         let dense = self.neg_samples == 0;
-        let dense_rows: Vec<usize> = if dense { (0..self.vocab).collect() } else { Vec::new() };
-        let rows: &[usize] = if dense { &dense_rows } else { &touched };
-        for &v in rows {
+        let iter: Box<dyn Iterator<Item = usize>> = if dense {
+            Box::new(0..self.vocab)
+        } else {
+            Box::new(touched.clone().into_iter())
+        };
+        for v in iter {
 
             let g = if v == target {
                 1.0 - self.probs[v]
@@ -1048,16 +1075,22 @@ impl EdgeMemory {
                 -self.probs[v]
             };
             let step = eta * g;
-            let row = &mut self.readout[rb + v * self.d..rb + (v + 1) * self.d];
-            for (w, p) in row.iter_mut().zip(&self.payload) {
-                *w += step * p;
-            }
-            if sh_w {
+            // Exactly one block owns this row.
+            let to_shared = sh_w && self.target_class_count[v] > 1;
+            if to_shared {
                 let base = &mut self.readout_shared[v * self.d..(v + 1) * self.d];
                 for (w, p) in base.iter_mut().zip(&self.payload) {
                     *w += step * p;
                 }
+            } else {
+                let row = &mut self.readout[rb + v * self.d..rb + (v + 1) * self.d];
+                for (w, p) in row.iter_mut().zip(&self.payload) {
+                    *w += step * p;
+                }
             }
+            // Only the touched rows contribute, so write magnitude is NOT
+            // comparable between the dense and sampled paths. Any cost
+            // analysis has to stay within one of them.
             wn_r += step * step;
         }
 
@@ -1494,6 +1527,7 @@ impl Clone for EdgeMemory {
             neg_samples: self.neg_samples,
             write_step: self.write_step,
             seen_targets: self.seen_targets.clone(),
+            target_class_count: self.target_class_count.clone(),
             posterior_moves: self.posterior_moves,
             posterior_seen: self.posterior_seen,
             grow_hold: self.grow_hold,
