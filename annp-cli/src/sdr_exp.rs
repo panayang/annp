@@ -89,6 +89,7 @@ impl RelationalFactStream {
         hub_ratio: f64,
         vocab: usize,
         seed: u64,
+        target_overlap: f64,
     ) -> Self {
         assert!(domains > 0, "domains must be positive");
         assert!(facts_per_domain >= 3, "facts_per_domain must be >= 3");
@@ -115,6 +116,7 @@ impl RelationalFactStream {
                 hub_ratio,
                 vocab,
                 seed,
+                target_overlap,
             ),
         }
     }
@@ -361,12 +363,15 @@ impl RelationalFactStream {
         hub_ratio: f64,
         vocab: usize,
         seed: u64,
+        target_overlap: f64,
     ) -> Self {
         let shared_entities_count = facts_per_domain.max(32);
         let shared_rel_count = 4;
         let rel_base = shared_entities_count;
         let targets_base = rel_base + shared_rel_count;
-        let total_required = targets_base + domains * shared_entities_count;
+        // One shared pool ahead of the per-domain blocks.
+        let private_base = targets_base + shared_entities_count;
+        let total_required = private_base + domains * shared_entities_count;
 
         assert!(
             vocab >= total_required,
@@ -410,10 +415,28 @@ impl RelationalFactStream {
                 };
 
                 let rel = rel_base + (e % shared_rel_count);
-                // Domain-specific target mapping (100% collision on [entity, rel] across domains)
-                let target = targets_base
-                    + d * shared_entities_count
-                    + ((e * 7 + 13 + d * 31) % shared_entities_count);
+                // Targets were disjoint across domains by construction -- the
+                // `d * count` term gave every domain its own block -- so the
+                // union of targets grew exactly linearly (measured: 150 new
+                // per domain, zero overlap at 24 domains). Nothing at the
+                // target level could ever be amortised, which is why savings
+                // could not appear regardless of the architecture.
+                //
+                // `target_overlap` is the fraction of facts whose target is
+                // drawn from a pool common to every domain, so the same
+                // (entity, relation) means the same thing everywhere. It
+                // interpolates between the adversarial corner (0: domains
+                // share surface form and nothing else) and redundancy (1).
+                // Real streams sit inside that range; the benchmark sat at the
+                // endpoint.
+                let shared_target = ((e * 17 + 5) % 1000) < (target_overlap * 1000.0) as usize;
+                let target = if shared_target {
+                    targets_base + ((e * 7 + 13) % shared_entities_count)
+                } else {
+                    private_base
+                        + d * shared_entities_count
+                        + ((e * 7 + 13 + d * 31) % shared_entities_count)
+                };
 
                 let fact = RelationalFact {
                     domain: d,
@@ -847,6 +870,8 @@ pub struct SdrConfig {
     pub experts: usize,
     /// Skip the EWC sweep entirely. It is two thirds of the wall clock and
     /// contributes nothing to a content-vs-context question.
+    /// Fraction of facts whose target is common to every domain.
+    pub target_overlap: f64,
     pub no_ewc: bool,
     /// Explicit eta grid, for cutting the seven-point default down when the
     /// useful range is already known from a previous sweep.
@@ -893,6 +918,8 @@ pub struct SdrConfig {
     pub edge_share_readout: bool,
     /// Route each write by which head scores the observed target best.
     pub edge_posterior: bool,
+    /// Negatives sampled per write; 0 keeps the dense delta rule.
+    pub edge_neg_samples: usize,
     /// Debounce length in units of a transition, not observations.
     pub edge_grow_hold: usize,
     /// Scales each write by addressing confidence. 0 disables.
@@ -1143,6 +1170,7 @@ impl ExpertBank {
                 cfg.edge_share,
                 cfg.edge_share_readout,
                 cfg.edge_posterior,
+                cfg.edge_neg_samples,
                 cfg.edge_expand,
                 {
                     // Debounce length must exceed a transition, and the
@@ -1699,6 +1727,10 @@ impl ExpertBank {
 
     pub fn posterior_move_rate(&self) -> Option<f64> {
         self.edge.as_ref().map(|e| e.posterior_move_rate())
+    }
+
+    pub fn readout_occupancy(&self) -> Option<(usize, usize, usize)> {
+        self.edge.as_ref().map(|e| e.readout_occupancy())
     }
 
     pub fn growth_timing(&self) -> Option<[usize; 4]> {
@@ -2354,6 +2386,16 @@ pub fn run_arm_trial(
     // Ebbinghaus probe where context flows continuously. If domains separate
     // here but not there, separation is being handed over by the harness
     // rather than inferred, and "allocation" would not be the system's own.
+    if let Some((nz, alloc, live)) = bank.readout_occupancy().filter(|(_, a, _)| *a > 0) {
+        {
+            println!(
+                "  [{arm:?}] readout rows occupied {nz}/{alloc} ({:.1}%) across {live} live classes; \
+                 {:.0} rows per class",
+                100.0 * nz as f64 / alloc as f64,
+                nz as f64 / live.max(1) as f64
+            );
+        }
+    }
     if let Some(r) = bank.posterior_move_rate().filter(|r| *r > 0.0) {
         println!(
             "  [{arm:?}] posterior re-routed {:.1}% of writes away from the prior",
@@ -2397,6 +2439,32 @@ type TrialResult = (ArmKind, f64, Vec<TrajectoryRecord>, Vec<f64>, Vec<f64>);
 type EwcTrialResult = (f64, f64, Vec<TrajectoryRecord>, Vec<f64>, Vec<f64>);
 
 /// Runs the complete SDR benchmark suite across all 5 arms.
+/// Distinct targets per domain and cumulative across domains.
+///
+/// Decides whether sparse per-domain allocation can grow sublinearly. A
+/// readout row is only useful to a domain for targets that domain actually
+/// produces; at 400 facts against a 4096 vocabulary, 90% of each private block
+/// is for tokens the domain never emits. Whether allocating only the used rows
+/// buys sublinear growth depends on how fast the UNION of targets grows --
+/// Zipf-distributed targets should give Heaps' law, k^alpha with alpha < 1.
+pub fn print_target_growth(stream: &RelationalFactStream) {
+    use std::collections::HashSet;
+    let mut union: HashSet<usize> = HashSet::new();
+    println!("  target-set growth (decides whether sparse allocation is sublinear):");
+    println!("    domains  own targets  cumulative union  union/domains");
+    for (k, facts) in stream.facts.iter().enumerate() {
+        let own: HashSet<usize> = facts.iter().map(|f| f.target).collect();
+        union.extend(own.iter().copied());
+        println!(
+            "    {:>7}  {:>11}  {:>16}  {:>13.1}",
+            k + 1,
+            own.len(),
+            union.len(),
+            union.len() as f64 / (k + 1) as f64
+        );
+    }
+}
+
 pub fn print_source_checks(c: &SourceChecks) {
     println!();
     println!("SOURCE CHECKS  (properties of the stream and projection, arm-independent)");
@@ -2707,6 +2775,7 @@ pub fn run_sdr_experiment(cfg: &SdrConfig) -> Vec<ArmSummary> {
         cfg.hub_ratio,
         cfg.vocab,
         cfg.seed,
+        cfg.target_overlap,
     );
 
     let eta_grid = if let Some(e) = cfg.eta {
@@ -3542,7 +3611,7 @@ mod tests {
     #[test]
     fn zipf_graph_stream_generation_mode_a() {
         let stream =
-            RelationalFactStream::new(StreamMode::ModeA, 4, 20, 200, 3, 1.0, 0.10, 512, 20260817);
+            RelationalFactStream::new(StreamMode::ModeA, 4, 20, 200, 3, 1.0, 0.10, 512, 20260817, 0.0);
         assert_eq!(stream.facts.len(), 4);
         assert_eq!(stream.facts[0].len(), 20);
         assert_eq!(stream.walks.len(), 4);
@@ -3552,7 +3621,7 @@ mod tests {
     #[test]
     fn zipf_graph_stream_generation_mode_b() {
         let stream =
-            RelationalFactStream::new(StreamMode::ModeB, 4, 32, 200, 3, 1.0, 0.20, 512, 20260817);
+            RelationalFactStream::new(StreamMode::ModeB, 4, 32, 200, 3, 1.0, 0.20, 512, 20260817, 0.0);
         assert_eq!(stream.facts.len(), 4);
         assert_eq!(stream.facts[0].len(), 32);
         assert_eq!(stream.walks.len(), 4);
@@ -3579,6 +3648,7 @@ mod tests {
             ewc_lambda: Some(1.0),
             seed: 20260817,
             experts: 1,
+            target_overlap: 0.0,
             no_ewc: false,
             etas: None,
             ladder_g1: 0.1,
@@ -3607,6 +3677,7 @@ mod tests {
             edge_share: false,
             edge_share_readout: false,
             edge_posterior: false,
+            edge_neg_samples: 0,
             edge_grow_hold: 1,
             edge_gate: 0.0,
             edge_clip: 0.0,
@@ -3623,7 +3694,7 @@ mod tests {
     #[test]
     fn frozen_probe_slice_does_not_modify_memory() {
         let stream =
-            RelationalFactStream::new(StreamMode::ModeA, 2, 10, 100, 2, 1.0, 0.10, 512, 20260817);
+            RelationalFactStream::new(StreamMode::ModeA, 2, 10, 100, 2, 1.0, 0.10, 512, 20260817, 0.0);
         let mut rng = Rng::new(20260817);
         let ladder = InputContextLadder::new(16, 512, 4, 2.0, &mut rng);
         let cfg = SdrConfig {
@@ -3667,6 +3738,7 @@ mod tests {
             ewc_lambda: Some(1.0),
             seed: 20260817,
             experts: 1,
+            target_overlap: 0.0,
             no_ewc: false,
             etas: None,
             ladder_g1: 0.1,
@@ -3695,6 +3767,7 @@ mod tests {
             edge_share: false,
             edge_share_readout: false,
             edge_posterior: false,
+            edge_neg_samples: 0,
             edge_grow_hold: 1,
             edge_gate: 0.0,
             edge_clip: 0.0,

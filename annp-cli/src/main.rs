@@ -590,6 +590,12 @@ enum Command {
         experts: usize,
         /// Skip the EWC sweep. It is most of the wall clock and answers no
         /// question about how content and context should be addressed.
+        /// Fraction of facts whose target is shared by every domain (0 = the
+        /// original construction, in which each domain owns a disjoint target
+        /// block and the union grows exactly linearly, so nothing at the
+        /// target level can ever be amortised).
+        #[arg(long, default_value_t = 0.0)]
+        target_overlap: f64,
         #[arg(long)]
         no_ewc: bool,
         /// Comma-separated eta grid, replacing the seven-point default.
@@ -724,6 +730,13 @@ enum Command {
         /// attenuating writes did not fix.
         #[arg(long)]
         edge_posterior: bool,
+        /// Negatives sampled per write (0 = dense delta rule over the whole
+        /// vocabulary). The dense rule fills a domain's private readout even
+        /// though it can only need rows for targets it emits -- 3.7% of the
+        /// block at 150 facts and a 4096 vocabulary. Sampling keeps the rest
+        /// exactly zero, so capacity scales with content, not vocabulary.
+        #[arg(long, default_value_t = 0)]
+        edge_neg_samples: usize,
         /// written through.
         #[arg(long, default_value_t = 0)]
         edge_expand: usize,
@@ -1052,6 +1065,7 @@ fn main() -> std::io::Result<()> {
             topology::run(&cfg, &out)
         }
         Command::Sdr {
+            target_overlap,
             domains,
             facts_per_domain,
             span_tokens,
@@ -1099,6 +1113,7 @@ fn main() -> std::io::Result<()> {
             edge_share,
             edge_share_readout,
             edge_posterior,
+            edge_neg_samples,
             edge_grow_hold,
             edge_expand,
             edge_gate,
@@ -1129,6 +1144,7 @@ fn main() -> std::io::Result<()> {
                 ewc_lambda,
                 seed,
                 experts,
+                target_overlap,
                 no_ewc,
                 etas,
                 ladder_g1,
@@ -1157,6 +1173,7 @@ fn main() -> std::io::Result<()> {
                 edge_share,
                 edge_share_readout,
                 edge_posterior,
+                edge_neg_samples,
                 edge_grow_hold,
                 edge_expand,
                 edge_gate,
@@ -1182,9 +1199,11 @@ fn main() -> std::io::Result<()> {
                 cfg.hub_ratio,
                 cfg.vocab,
                 cfg.seed,
+                cfg.target_overlap,
             );
             let checks = sdr_exp::measure_source(&cfg, &stream_for_checks);
             sdr_exp::print_source_checks(&checks);
+            sdr_exp::print_target_growth(&stream_for_checks);
             if source_only {
                 return Ok(());
             }

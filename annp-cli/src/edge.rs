@@ -214,6 +214,30 @@ pub struct EdgeMemory {
     /// consequence of the stream rather than a constant chosen in advance.
     /// One edge memory for all classes; the readout stays per-class.
     share_edge: bool,
+    /// Rows updated per write besides the target: 0 keeps the dense rule.
+    ///
+    /// The delta rule touches every one of the vocab rows on every write, so a
+    /// domain's private readout ends up dense even though it can only ever
+    /// need rows for targets it actually emits -- at 150 facts against a 4096
+    /// vocabulary that is 3.7% signal and 96.3% accumulated negative gradient.
+    /// Allocating per emitted target instead makes a domain's capacity scale
+    /// with its content rather than with the vocabulary size.
+    ///
+    /// The probs used here still come from the full softmax, so this is a
+    /// sampled update of the exact gradient rather than a sampled-softmax
+    /// objective. Biased, and cheaper to reason about; evaluation is
+    /// unaffected because forward still scores every row.
+    neg_samples: usize,
+    write_step: u64,
+    /// Targets each class has actually emitted, in first-seen order.
+    ///
+    /// Negatives drawn uniformly from the whole vocabulary do not make the
+    /// block sparse -- they only slow the filling, and measured occupancy
+    /// stayed at 91%. Drawing them from the targets this class has seen keeps
+    /// its rows a subset of its own content, which is the only version of
+    /// "capacity follows content" that is actually true. It is also the better
+    /// objective: a regime only needs to separate targets that occur in it.
+    seen_targets: Vec<Vec<usize>>,
     /// Choose the write's class by which head scores the observed target
     /// best, instead of by the context prior.
     posterior_route: bool,
@@ -399,6 +423,7 @@ impl EdgeMemory {
         share_edge: bool,
         share_readout: bool,
         posterior_route: bool,
+        neg_samples: usize,
         expand_cap: usize,
         grow_hold: usize,
         rng: &mut Rng,
@@ -458,6 +483,9 @@ impl EdgeMemory {
             expand_cap,
             share_edge,
             posterior_route,
+            neg_samples,
+            write_step: 0,
+            seen_targets: vec![Vec::new(); classes.max(1)],
             posterior_moves: 0.0,
             posterior_seen: 0.0,
             readout_shared: if share_readout && class_readout {
@@ -588,6 +616,7 @@ impl EdgeMemory {
             self.readout_scale.resize(new_total, 1.0);
         }
         self.proto.resize(new_total * self.d, 0.0);
+        self.seen_targets.resize(new_total, Vec::new());
         self.classes = new_total;
     }
 
@@ -978,7 +1007,41 @@ impl EdgeMemory {
         let rb = self.rbase();
         let sh_w = !self.readout_shared.is_empty();
         let mut wn_r = 0.0f64;
-        for v in 0..self.vocab {
+        // Which rows this write is allowed to touch. Dense when neg_samples is
+        // 0; otherwise the target plus a deterministic sample of negatives, so
+        // untouched rows stay exactly zero and the block stays sparse.
+        self.write_step = self.write_step.wrapping_add(1);
+        let mut touched: Vec<usize> = Vec::new();
+        if self.neg_samples > 0 {
+            let c = self.class_used;
+            if c < self.seen_targets.len() && !self.seen_targets[c].contains(&target) {
+                self.seen_targets[c].push(target);
+            }
+            touched.push(target);
+            let pool = if c < self.seen_targets.len() {
+                self.seen_targets[c].len()
+            } else {
+                0
+            };
+            if pool > 1 {
+                let mut h = self
+                    .write_step
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                for _ in 0..self.neg_samples {
+                    h = h.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let v = self.seen_targets[c][(h >> 33) as usize % pool];
+                    if v != target {
+                        touched.push(v);
+                    }
+                }
+            }
+        }
+        let dense = self.neg_samples == 0;
+        let dense_rows: Vec<usize> = if dense { (0..self.vocab).collect() } else { Vec::new() };
+        let rows: &[usize] = if dense { &dense_rows } else { &touched };
+        for &v in rows {
+
             let g = if v == target {
                 1.0 - self.probs[v]
             } else {
@@ -1277,6 +1340,32 @@ impl EdgeMemory {
         }
     }
 
+    /// (non-zero readout rows, rows if allocation were dense, live classes).
+    ///
+    /// The claim that answers "you are just adding parameters per task" is
+    /// that capacity follows content, not task count. Under the dense delta
+    /// rule every row of every class block is touched on every write, so the
+    /// occupied count equals the allocated count and the claim is false by
+    /// construction. With sampled negatives a row stays exactly zero unless
+    /// something put mass there, so this counts what is actually carrying
+    /// information rather than what was reserved.
+    pub fn readout_occupancy(&self) -> (usize, usize, usize) {
+        if !self.class_readout {
+            return (0, 0, self.n_active);
+        }
+        let mut nz = 0usize;
+        for c in 0..self.n_active {
+            let rb = c * self.vocab * self.d;
+            for v in 0..self.vocab {
+                let row = &self.readout[rb + v * self.d..rb + (v + 1) * self.d];
+                if row.iter().any(|w| w.abs() > 1e-12) {
+                    nz += 1;
+                }
+            }
+        }
+        (nz, self.n_active * self.vocab, self.n_active)
+    }
+
     /// Growth events by observations since the domain last changed.
     pub fn growth_timing(&self) -> [usize; 4] {
         self.grow_at
@@ -1402,6 +1491,9 @@ impl Clone for EdgeMemory {
             share_edge: self.share_edge,
             readout_shared: self.readout_shared.clone(),
             posterior_route: self.posterior_route,
+            neg_samples: self.neg_samples,
+            write_step: self.write_step,
+            seen_targets: self.seen_targets.clone(),
             posterior_moves: self.posterior_moves,
             posterior_seen: self.posterior_seen,
             grow_hold: self.grow_hold,
@@ -1480,7 +1572,7 @@ mod tests {
     #[test]
     fn the_same_fact_always_walks_the_same_path() {
         let mut rng = Rng::new(3);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, &mut rng);
         m.forward(5, 9);
         let a = m.path_edge.clone();
         for t in 0..50 {
@@ -1497,7 +1589,7 @@ mod tests {
     #[test]
     fn different_facts_take_different_paths() {
         let mut rng = Rng::new(5);
-        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, &mut rng);
         let mut seen = std::collections::HashSet::new();
         for t in 0..60 {
             m.forward(t, t + 1);
@@ -1509,7 +1601,7 @@ mod tests {
     #[test]
     fn hash_class_ignores_the_stream_entirely() {
         let mut rng = Rng::new(23);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, &mut rng);
         m.forward(4, 7);
         let a = m.class_used;
         for _ in 0..300 {
@@ -1522,7 +1614,7 @@ mod tests {
     #[test]
     fn the_class_follows_the_stream() {
         let mut rng = Rng::new(7);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, &mut rng);
         for _ in 0..200 {
             m.absorb_token(11);
         }
@@ -1536,7 +1628,7 @@ mod tests {
     #[test]
     fn a_write_only_touches_the_edges_that_were_walked() {
         let mut rng = Rng::new(11);
-        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, &mut rng);
         // Warm the readout first. From a zero readout the first write leaves
         // it rank one along the payload, so dL/dp_H comes out exactly
         // parallel to p_H and the unit-norm projection (I - p p^T) cancels it
@@ -1572,7 +1664,7 @@ mod tests {
         let mut rng = Rng::new(9);
         let mut m = EdgeMemory::new(
             16, 2, 3, 4, 16, 64, 0.01, 0.0, false, true, 4, 3.0, 20000.0, 1, 2.0, 0.1, 0.0,
-            0.0, false, false, false, 0, 1, &mut rng,
+            0.0, false, false, false, 0, 0, 1, &mut rng,
         );
         for t in 0..40 {
             m.observe_fact(t % 12, (t + 1) % 12, (t + 2) % 12, 0.3);
