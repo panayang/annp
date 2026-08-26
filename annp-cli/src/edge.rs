@@ -286,6 +286,10 @@ pub struct EdgeMemory {
     /// novel; a transition does not.
     grow_hold: usize,
     novel_run: usize,
+    ctx_gain: f64,
+    ctx_proj: Vec<f64>,
+    ctx_proj_rows: usize,
+    pending_ctx: Vec<f64>,
     /// Growth events bucketed by observations since the domain last changed.
     /// Spread out means growth tracks regimes; piled into the first bucket
     /// means it tracks boundaries.
@@ -442,6 +446,7 @@ impl EdgeMemory {
         neg_samples: usize,
         expand_cap: usize,
         grow_hold: usize,
+        ctx_gain: f64,
         rng: &mut Rng,
     ) -> Self {
         // Explicit Euler on the ladder is stable only while the fastest
@@ -512,6 +517,17 @@ impl EdgeMemory {
             },
             grow_hold,
             novel_run: 0,
+            ctx_gain,
+            ctx_proj: {
+                let rows = 512;
+                let mut v = vec![0.0; rows * d];
+                for r in 0..rows {
+                    rng.fill_unit_vector(&mut v[r * d..(r + 1) * d]);
+                }
+                v
+            },
+            ctx_proj_rows: 512,
+            pending_ctx: Vec::new(),
             grow_at: [0; 4],
             margin_now: 1.0,
             lad_cap: (0..rungs).map(|k| lad_r.powi(k as i32)).collect(),
@@ -570,6 +586,57 @@ impl EdgeMemory {
     /// signal enters: in Mode B the targets are the only tokens that differ
     /// between domains, so absorbing them is what lets the class tell them
     /// apart at all.
+    /// Adds a projection of the multi-timescale input trace to the payload.
+    ///
+    /// The slow context is a single EMA, so a cue survives (1-rate)^gap: at
+    /// rate 0.01 that is 0.85 after sixteen tokens and 0.08 after 256, and
+    /// accuracy measured 6.97% -> 2.80% across exactly that range. Nothing in
+    /// the architecture holds anything longer, because a payload is built from
+    /// the current fact alone.
+    ///
+    /// The trace is a cascade of EMAs at tau = r^(2k), so its slow rungs hold
+    /// a cue far past the point where a single rate has lost it. Injected
+    /// AFTER route_payload is taken, so routing stays a pure content hash and
+    /// a fact still lands where it was trained -- putting context into the
+    /// address would make the same fact land on different edges depending on
+    /// when it appeared, which is the property the whole memory rests on.
+    ///
+    /// The projection is fixed random, like every other addressing structure
+    /// here; nothing about it is learned.
+    /// Stashes the trace for the next forward pass. Prediction and writing
+    /// both use it, so reading and learning stay on the same representation.
+    pub fn set_pending_context(&mut self, trace: &[f64]) {
+        if self.ctx_gain != 0.0 {
+            self.pending_ctx.clear();
+            self.pending_ctx.extend_from_slice(trace);
+        }
+    }
+
+    fn add_context(&mut self, trace: &[f64]) {
+        if self.ctx_gain == 0.0 || trace.is_empty() {
+            return;
+        }
+        for i in 0..self.d {
+            let mut acc = 0.0;
+            for (j, t) in trace.iter().enumerate() {
+                acc += self.ctx_proj[(j % self.ctx_proj_rows) * self.d + i] * t;
+            }
+            self.payload[i] += self.ctx_gain * acc;
+        }
+        normalize(&mut self.payload);
+    }
+
+    /// Clears the slow context so a probe can rebuild it from what it shows.
+    ///
+    /// Without this the probe restores ctx from a snapshot keyed by the true
+    /// domain, which hands the model the regime identity it is supposed to
+    /// infer -- the long-range test measured nothing because of it.
+    pub fn reset_ctx(&mut self) {
+        for c in self.ctx.iter_mut() {
+            *c = 0.0;
+        }
+    }
+
     pub fn absorb_token(&mut self, token: usize) {
         let r = self.ctx_rate;
         let e = &self.emb[token * self.d..(token + 1) * self.d];
@@ -862,6 +929,11 @@ impl EdgeMemory {
         }
         normalize(&mut self.payload);
         self.route_payload.copy_from_slice(&self.payload);
+        if self.ctx_gain != 0.0 && !self.pending_ctx.is_empty() {
+            let t = std::mem::take(&mut self.pending_ctx);
+            self.add_context(&t);
+            self.pending_ctx = t;
+        }
 
         self.path_edge.clear();
         let mut node = 0usize;
@@ -1531,6 +1603,10 @@ impl Clone for EdgeMemory {
             posterior_moves: self.posterior_moves,
             posterior_seen: self.posterior_seen,
             grow_hold: self.grow_hold,
+            ctx_gain: self.ctx_gain,
+            ctx_proj: self.ctx_proj.clone(),
+            ctx_proj_rows: self.ctx_proj_rows,
+            pending_ctx: self.pending_ctx.clone(),
             novel_run: self.novel_run,
             grow_at: self.grow_at,
             margin_now: self.margin_now,
@@ -1606,7 +1682,7 @@ mod tests {
     #[test]
     fn the_same_fact_always_walks_the_same_path() {
         let mut rng = Rng::new(3);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, 0.0, &mut rng);
         m.forward(5, 9);
         let a = m.path_edge.clone();
         for t in 0..50 {
@@ -1623,7 +1699,7 @@ mod tests {
     #[test]
     fn different_facts_take_different_paths() {
         let mut rng = Rng::new(5);
-        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, 0.0, &mut rng);
         let mut seen = std::collections::HashSet::new();
         for t in 0..60 {
             m.forward(t, t + 1);
@@ -1635,7 +1711,7 @@ mod tests {
     #[test]
     fn hash_class_ignores_the_stream_entirely() {
         let mut rng = Rng::new(23);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, 0.0, &mut rng);
         m.forward(4, 7);
         let a = m.class_used;
         for _ in 0..300 {
@@ -1648,7 +1724,7 @@ mod tests {
     #[test]
     fn the_class_follows_the_stream() {
         let mut rng = Rng::new(7);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, 0.0, &mut rng);
         for _ in 0..200 {
             m.absorb_token(11);
         }
@@ -1662,7 +1738,7 @@ mod tests {
     #[test]
     fn a_write_only_touches_the_edges_that_were_walked() {
         let mut rng = Rng::new(11);
-        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, 0.0, &mut rng);
         // Warm the readout first. From a zero readout the first write leaves
         // it rank one along the payload, so dL/dp_H comes out exactly
         // parallel to p_H and the unit-norm projection (I - p p^T) cancels it
@@ -1698,7 +1774,7 @@ mod tests {
         let mut rng = Rng::new(9);
         let mut m = EdgeMemory::new(
             16, 2, 3, 4, 16, 64, 0.01, 0.0, false, true, 4, 3.0, 20000.0, 1, 2.0, 0.1, 0.0,
-            0.0, false, false, false, 0, 0, 1, &mut rng,
+            0.0, false, false, false, 0, 0, 1, 0.0, &mut rng,
         );
         for t in 0..40 {
             m.observe_fact(t % 12, (t + 1) % 12, (t + 2) % 12, 0.3);

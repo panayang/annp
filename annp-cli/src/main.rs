@@ -596,6 +596,12 @@ enum Command {
         /// target level can ever be amortised).
         #[arg(long, default_value_t = 0.0)]
         target_overlap: f64,
+        /// Tokens between cue and query in the probe episode (0 = the old
+        /// protocol). With a gap the probe builds its context from what it
+        /// shows the model rather than restoring a snapshot keyed by the true
+        /// domain, so only something that carried the cue can answer.
+        #[arg(long, default_value_t = 0)]
+        long_range_gap: usize,
         #[arg(long)]
         no_ewc: bool,
         /// Comma-separated eta grid, replacing the seven-point default.
@@ -704,6 +710,14 @@ enum Command {
         /// about a third of a visit), not a number to pick.
         #[arg(long, default_value_t = 0)]
         edge_grow_hold: usize,
+        /// Gain on the multi-timescale input trace added to the payload
+        /// (0 = off). The slow context is a single EMA, so a cue survives
+        /// (1-rate)^gap and accuracy fell 6.97% -> 2.80% between gap 16 and
+        /// 256. The trace is a cascade at tau = r^(2k), whose slow rungs hold
+        /// a cue past where one rate has lost it. Injected after the routing
+        /// payload is taken, so a fact still lands where it was trained.
+        #[arg(long, default_value_t = 0.0)]
+        edge_ctx_gain: f64,
         /// Ceiling on total class slices when capacity is expanded on demand
         /// (0 = fixed budget). Growth then allocates a slice only when a
         /// genuinely novel regime arrives, and the append leaves every
@@ -1066,6 +1080,7 @@ fn main() -> std::io::Result<()> {
         }
         Command::Sdr {
             target_overlap,
+            long_range_gap,
             domains,
             facts_per_domain,
             span_tokens,
@@ -1115,6 +1130,7 @@ fn main() -> std::io::Result<()> {
             edge_posterior,
             edge_neg_samples,
             edge_grow_hold,
+            edge_ctx_gain,
             edge_expand,
             edge_gate,
             edge_clip,
@@ -1145,6 +1161,7 @@ fn main() -> std::io::Result<()> {
                 seed,
                 experts,
                 target_overlap,
+                long_range_gap,
                 no_ewc,
                 etas,
                 ladder_g1,
@@ -1175,6 +1192,7 @@ fn main() -> std::io::Result<()> {
                 edge_posterior,
                 edge_neg_samples,
                 edge_grow_hold,
+                edge_ctx_gain,
                 edge_expand,
                 edge_gate,
                 edge_clip,

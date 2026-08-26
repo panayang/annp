@@ -73,6 +73,16 @@ pub struct RelationalFactStream {
     pub facts: Vec<Vec<RelationalFact>>, // [domain][probe_facts]
     pub walks: Vec<Vec<RelationalFact>>, // [domain][walk_steps]
     pub prefixes: Vec<Vec<usize>>,       // [domain][prefix_tokens]
+    /// One token per domain, emitted at the start of that domain's walk.
+    ///
+    /// The benchmark has never required long-range association: a target is
+    /// fully determined by the current (entity, relation), so nothing has to
+    /// be carried across the stream and the architecture has never been
+    /// penalised for carrying nothing. The cue makes regime identity available
+    /// ONLY as a token seen at the start of the visit, so a probe that shows
+    /// cue, then a gap, then the query, can only be answered by something that
+    /// held the cue across the gap.
+    pub cues: Vec<usize>,
 }
 
 impl RelationalFactStream {
@@ -196,6 +206,8 @@ impl RelationalFactStream {
         let mut facts = Vec::with_capacity(domains);
         let mut walks = Vec::with_capacity(domains);
         let mut prefixes = Vec::with_capacity(domains);
+        // Cue ids live above every token either mode allocates.
+        let cues: Vec<usize> = (0..domains).map(|d| vocab - 1 - d).collect();
 
         for d in 0..domains {
             let spec_start = hub_count + d * domain_entity_count;
@@ -361,6 +373,7 @@ impl RelationalFactStream {
             facts,
             walks,
             prefixes,
+            cues,
         }
     }
 
@@ -402,6 +415,7 @@ impl RelationalFactStream {
         let mut facts = Vec::with_capacity(domains);
         let mut walks = Vec::with_capacity(domains);
         let mut prefixes = Vec::with_capacity(domains);
+        let cues: Vec<usize> = (0..domains).map(|d| vocab - 1 - d).collect();
 
         // Was hardcoded to 0.20 regardless of what was passed in, so
         // --hub-ratio was a no-op for Mode B: both benches run before this fix
@@ -508,6 +522,7 @@ impl RelationalFactStream {
             facts,
             walks,
             prefixes,
+            cues,
         }
     }
 }
@@ -572,6 +587,26 @@ impl FrozenProbeSlice {
         ctx: &InputContextLadder,
         bank: &mut ExpertBank,
     ) -> ProbeResult {
+        Self::evaluate_with_episode(facts, ctx, bank, None, 0)
+    }
+
+    /// Scores `facts`, optionally rebuilding the context from a presented
+    /// episode instead of a restored per-domain snapshot.
+    ///
+    /// The snapshot is keyed by the true domain index, so any arm that reads
+    /// the input trace would be handed its regime identity at evaluation time
+    /// -- the same shape of leak as s29.1, which only stayed harmless because
+    /// the edge arm ignored the trace. With an episode the context comes from
+    /// what the model was shown: cue, then `gap` filler tokens, then the
+    /// query. Nothing but something that carried the cue across the gap can
+    /// answer, and no task id is involved anywhere.
+    pub fn evaluate_with_episode(
+        facts: &[RelationalFact],
+        ctx: &InputContextLadder,
+        bank: &mut ExpertBank,
+        cue: Option<usize>,
+        gap: usize,
+    ) -> ProbeResult {
         let mut predicted: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut correct = 0;
         let mut correct_hub = 0;
@@ -585,7 +620,20 @@ impl FrozenProbeSlice {
         let mut domain_specific_loss = 0.0;
         let mut domain_specific_count = 0usize;
         let mut online_ladder = ctx.clone();
-        let snap = ctx.snapshot_state();
+        // With an episode the probe builds its own context and the incoming
+        // snapshot is deliberately unused.
+        let snap = if let Some(c) = cue {
+            let mut ep = ctx.clone();
+            ep.reset();
+            ep.step(c);
+            for i in 0..gap {
+                // Fillers must carry no regime information of their own.
+                ep.step(i % 8);
+            }
+            ep.snapshot_state()
+        } else {
+            ctx.snapshot_state()
+        };
 
         for fact in facts {
             online_ladder.restore_state(&snap);
@@ -883,6 +931,9 @@ pub struct SdrConfig {
     /// contributes nothing to a content-vs-context question.
     /// Fraction of facts whose target is common to every domain.
     pub target_overlap: f64,
+    /// Tokens between the cue and the query in the probe episode. 0 keeps the
+    /// old protocol, in which context is restored from a per-domain snapshot.
+    pub long_range_gap: usize,
     pub no_ewc: bool,
     /// Explicit eta grid, for cutting the seven-point default down when the
     /// useful range is already known from a previous sweep.
@@ -923,6 +974,8 @@ pub struct SdrConfig {
     /// Ceiling on total class slices when capacity may be expanded at run
     /// time. 0 = fixed budget, the old behaviour.
     pub edge_expand: usize,
+    /// Gain on the multi-timescale trace added to the payload. 0 = off.
+    pub edge_ctx_gain: f64,
     /// Share one edge memory across all classes; readout stays per-class.
     pub edge_share: bool,
     /// Add a class-common readout block to the per-class one.
@@ -1193,6 +1246,7 @@ impl ExpertBank {
                     let transition = (cfg.span_tokens / 3) as f64 * 0.25;
                     (cfg.edge_grow_hold as f64 * transition).round() as usize
                 },
+                cfg.edge_ctx_gain,
                 rng,
             );
             return Self {
@@ -1625,6 +1679,7 @@ impl ExpertBank {
         target: usize,
     ) -> (f64, bool) {
         if let Some(e) = self.edge.as_mut() {
+            e.set_pending_context(trace);
             return e.predict_fact(entity, relation, target);
         }
         if let Some(t) = self.topo.as_mut() {
@@ -1722,6 +1777,19 @@ impl ExpertBank {
     /// Class switches per token. Near zero inside a visit and non-zero across
     /// them is what a working class axis looks like; never switching, or
     /// switching constantly, means it is decoration.
+    pub fn reset_stream_ctx(&mut self) {
+        if let Some(e) = self.edge.as_mut() {
+            e.reset_ctx();
+        }
+    }
+
+    /// Feeds a raw stream token to whichever memory is active.
+    pub fn absorb_stream_token(&mut self, token: usize) {
+        if let Some(e) = self.edge.as_mut() {
+            e.absorb_token(token);
+        }
+    }
+
     pub fn set_domain(&mut self, d: usize) {
         if let Some(e) = self.edge.as_mut() {
             e.set_domain(d);
@@ -1785,6 +1853,7 @@ impl ExpertBank {
             return;
         }
         if let Some(e) = self.edge.as_mut() {
+            e.set_pending_context(trace);
             e.observe_fact(entity, relation, target, eta);
             // The target is a stream token too, and in Mode B it is the only
             // one that differs by domain -- absorbing it is what lets the
@@ -2281,7 +2350,24 @@ pub fn run_arm_trial(
                     few.spec_tail,
                 )
             } else {
-                let p = FrozenProbeSlice::evaluate(domain_facts, &probe_ladder, &mut bank);
+                if cfg.long_range_gap > 0 {
+                    // The edge memory's class comes from its own slow context,
+                    // not from the input ladder, so rebuilding only the ladder
+                    // left the restored -- and therefore oracle -- class in
+                    // place. Rebuild both from the presented episode.
+                    bank.reset_stream_ctx();
+                    bank.absorb_stream_token(stream.cues[d]);
+                    for i in 0..cfg.long_range_gap {
+                        bank.absorb_stream_token(i % 8);
+                    }
+                }
+                let p = FrozenProbeSlice::evaluate_with_episode(
+                    domain_facts,
+                    &probe_ladder,
+                    &mut bank,
+                    if cfg.long_range_gap > 0 { Some(stream.cues[d]) } else { None },
+                    cfg.long_range_gap,
+                );
                 let zero_spec = [p.accuracy; 6];
                 (
                     p.accuracy,
@@ -2311,6 +2397,13 @@ pub fn run_arm_trial(
             // from the probe's reinstated context.
             if let Some(d) = displaced {
                 bank.topo_return(d);
+            }
+
+            // The cue opens the visit, so the association between it and this
+            // regime is available to anything that integrates the stream.
+            if cfg.long_range_gap > 0 && trains(cfg, r, d) {
+                online_ladder.step(stream.cues[d]);
+                bank.absorb_stream_token(stream.cues[d]);
             }
 
             // 2. Stream online learning in current domain via continuous random walk
@@ -3660,6 +3753,7 @@ mod tests {
             seed: 20260817,
             experts: 1,
             target_overlap: 0.0,
+            long_range_gap: 0,
             no_ewc: false,
             etas: None,
             ladder_g1: 0.1,
@@ -3685,6 +3779,7 @@ mod tests {
             edge_hash_class: false,
             edge_class_readout: false,
             edge_expand: 0,
+            edge_ctx_gain: 0.0,
             edge_share: false,
             edge_share_readout: false,
             edge_posterior: false,
@@ -3750,6 +3845,7 @@ mod tests {
             seed: 20260817,
             experts: 1,
             target_overlap: 0.0,
+            long_range_gap: 0,
             no_ewc: false,
             etas: None,
             ladder_g1: 0.1,
@@ -3775,6 +3871,7 @@ mod tests {
             edge_hash_class: false,
             edge_class_readout: false,
             edge_expand: 0,
+            edge_ctx_gain: 0.0,
             edge_share: false,
             edge_share_readout: false,
             edge_posterior: false,
