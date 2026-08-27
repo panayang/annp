@@ -286,6 +286,7 @@ pub struct EdgeMemory {
     /// novel; a transition does not.
     grow_hold: usize,
     novel_run: usize,
+    grow_orthogonalise: bool,
     /// Per-class similarity statistics.
     ///
     /// Novelty was measured against a GLOBAL running mean and variance, which
@@ -465,6 +466,7 @@ impl EdgeMemory {
         neg_samples: usize,
         expand_cap: usize,
         grow_hold: usize,
+        grow_orthogonalise: bool,
         ctx_gain: f64,
         rng: &mut Rng,
     ) -> Self {
@@ -536,6 +538,7 @@ impl EdgeMemory {
             },
             grow_hold,
             novel_run: 0,
+            grow_orthogonalise,
             class_sim_mean: vec![0.0; classes.max(1)],
             class_sim_var: vec![0.0; classes.max(1)],
             class_sim_n: vec![0.0; classes.max(1)],
@@ -656,7 +659,7 @@ impl EdgeMemory {
         }
         self.ctx_history.push_back(v.clone());
         self.domain_ctx_sample.insert(self.cur_domain, v);
-        self.maybe_grow(sim);
+        self.maybe_grow();
         let c = if self.n_active > c { self.class_of() } else { c };
         self.class_steps += 1.0;
         if self.last_class != usize::MAX && self.last_class != c {
@@ -806,7 +809,7 @@ impl EdgeMemory {
 
     /// Adds a prototype at the current context when it is far enough below
     /// the running distribution of best matches to count as a new regime.
-    fn maybe_grow(&mut self, sim: f64) {
+    fn maybe_grow(&mut self) {
         if self.sim_n < 64.0 {
             return;
         }
@@ -821,18 +824,29 @@ impl EdgeMemory {
             }
         }
         let c = self.class_of();
-        let (m, v, n) = if c < self.class_sim_n.len() {
-            (self.class_sim_mean[c], self.class_sim_var[c], self.class_sim_n[c])
-        } else {
-            (self.sim_mean, self.sim_var, self.sim_n)
-        };
-        // A class needs its own history before it can judge a member unusual.
-        if n < 64.0 {
+        if c >= self.class_sim_n.len() || self.class_sim_n[c] < 64.0 {
             self.novel_run = 0;
             return;
         }
-        let sd = v.max(1e-12).sqrt();
-        if m - sim <= self.grow_k * sd {
+        // Split a class that is doing too many jobs, rather than react to an
+        // unusual observation.
+        //
+        // Outlier tests are self-defeating here, in two ways that both showed
+        // up in measurement. Against a global running distribution they fail
+        // once there are many regimes, because the distribution becomes the
+        // mixture and nothing is unusual relative to it -- 8, 32, 64 and 128
+        // domains all collapsed to one class. Against the class's own
+        // distribution they fail too: the more regimes a class absorbs the
+        // larger its variance, so the threshold grow_k*sd rises exactly when
+        // splitting becomes more necessary, and with a single starting class
+        // the per-class statistics ARE the global ones.
+        //
+        // Dispersion is the signal instead. A class serving one regime has
+        // tightly clustered similarities; one stretched across several is
+        // spread out, and that does not depend on how many classes exist.
+        let sd = self.class_sim_var[c].max(1e-12).sqrt();
+        let dispersion = sd / self.class_sim_mean[c].abs().max(1e-6);
+        if dispersion <= self.grow_k {
             self.novel_run = 0;
             return;
         }
@@ -885,14 +899,29 @@ impl EdgeMemory {
         let n = self.n_active;
         let mut v = self.ctx.clone();
         normalize(&mut v);
-        for c in 0..n {
-            let p: Vec<f64> = self.proto[c * self.d..(c + 1) * self.d].to_vec();
-            let dot: f64 = p.iter().zip(&v).map(|(a, b)| a * b).sum();
-            for (x, pc) in v.iter_mut().zip(&p) {
-                *x -= dot * pc;
+        // Placed AT the data, not on the residual orthogonal to existing
+        // prototypes.
+        //
+        // Orthogonalising was introduced because growth-steal measured 1.000 --
+        // every existing regime moved to the new prototype. But that statistic
+        // sampled contexts dominated by the very domain that triggered the
+        // growth, which is supposed to move, and it was corrected afterwards;
+        // the placement rule that answered it was never revisited. In high
+        // dimension the orthogonal residual is nearly orthogonal to the data as
+        // well, so the new prototype wins the argmax for nothing: measured, 28
+        // classes were allocated and all 16 regimes still routed to one.
+        //
+        // A prototype has to sit where the data it should serve actually is.
+        if self.grow_orthogonalise {
+            for c in 0..n {
+                let p: Vec<f64> = self.proto[c * self.d..(c + 1) * self.d].to_vec();
+                let dot: f64 = p.iter().zip(&v).map(|(a, b)| a * b).sum();
+                for (x, pc) in v.iter_mut().zip(&p) {
+                    *x -= dot * pc;
+                }
             }
+            normalize(&mut v);
         }
-        normalize(&mut v);
         self.proto[n * self.d..(n + 1) * self.d].copy_from_slice(&v);
         self.n_active += 1;
         self.growth_events += 1.0;
@@ -1696,6 +1725,7 @@ impl Clone for EdgeMemory {
             posterior_moves: self.posterior_moves,
             posterior_seen: self.posterior_seen,
             grow_hold: self.grow_hold,
+            grow_orthogonalise: self.grow_orthogonalise,
             class_sim_mean: self.class_sim_mean.clone(),
             class_sim_var: self.class_sim_var.clone(),
             class_sim_n: self.class_sim_n.clone(),
@@ -1780,7 +1810,7 @@ mod tests {
     #[test]
     fn the_same_fact_always_walks_the_same_path() {
         let mut rng = Rng::new(3);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, 0.0, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, true, 0.0, &mut rng);
         m.forward(5, 9);
         let a = m.path_edge.clone();
         for t in 0..50 {
@@ -1797,7 +1827,7 @@ mod tests {
     #[test]
     fn different_facts_take_different_paths() {
         let mut rng = Rng::new(5);
-        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, 0.0, &mut rng);
+        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, true, 0.0, &mut rng);
         let mut seen = std::collections::HashSet::new();
         for t in 0..60 {
             m.forward(t, t + 1);
@@ -1809,7 +1839,7 @@ mod tests {
     #[test]
     fn hash_class_ignores_the_stream_entirely() {
         let mut rng = Rng::new(23);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, 0.0, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, true, 0.0, &mut rng);
         m.forward(4, 7);
         let a = m.class_used;
         for _ in 0..300 {
@@ -1822,7 +1852,7 @@ mod tests {
     #[test]
     fn the_class_follows_the_stream() {
         let mut rng = Rng::new(7);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, 0.0, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, true, 0.0, &mut rng);
         for _ in 0..200 {
             m.absorb_token(11);
         }
@@ -1836,7 +1866,7 @@ mod tests {
     #[test]
     fn a_write_only_touches_the_edges_that_were_walked() {
         let mut rng = Rng::new(11);
-        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, 0.0, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, true, 0.0, &mut rng);
         // Warm the readout first. From a zero readout the first write leaves
         // it rank one along the payload, so dL/dp_H comes out exactly
         // parallel to p_H and the unit-norm projection (I - p p^T) cancels it
@@ -1872,7 +1902,7 @@ mod tests {
         let mut rng = Rng::new(9);
         let mut m = EdgeMemory::new(
             16, 2, 3, 4, 16, 64, 0.01, 0.0, false, true, 4, 3.0, 20000.0, 1, 2.0, 0.1, 0.0,
-            0.0, false, false, false, 0, 0, 1, 0.0, &mut rng,
+            0.0, false, false, false, 0, 0, 1, true, 0.0, &mut rng,
         );
         for t in 0..40 {
             m.observe_fact(t % 12, (t + 1) % 12, (t + 2) % 12, 0.3);

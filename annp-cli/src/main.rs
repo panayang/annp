@@ -732,6 +732,13 @@ enum Command {
         /// payload is taken, so a fact still lands where it was trained.
         #[arg(long, default_value_t = 0.0)]
         edge_ctx_gain: f64,
+        /// Orthogonalise a new prototype against the existing ones (default
+        /// on, which is what has been running). In high dimension that
+        /// residual is nearly orthogonal to the data too, so the prototype
+        /// wins nothing: 28 classes were allocated and all 16 regimes still
+        /// routed to one.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        edge_grow_orth: bool,
         /// Ceiling on total class slices when capacity is expanded on demand
         /// (0 = fixed budget). Growth then allocates a slice only when a
         /// genuinely novel regime arrives, and the append leaves every
@@ -1147,6 +1154,7 @@ fn main() -> std::io::Result<()> {
             edge_neg_samples,
             edge_grow_hold,
             edge_ctx_gain,
+            edge_grow_orth,
             edge_expand,
             edge_gate,
             edge_clip,
@@ -1211,6 +1219,7 @@ fn main() -> std::io::Result<()> {
                 edge_neg_samples,
                 edge_grow_hold,
                 edge_ctx_gain,
+                edge_grow_orth,
                 edge_expand,
                 edge_gate,
                 edge_clip,
