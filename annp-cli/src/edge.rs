@@ -1475,6 +1475,42 @@ impl EdgeMemory {
         if self.ctx_ratio_n > 0.0 { self.ctx_ratio_sum / self.ctx_ratio_n } else { 0.0 }
     }
 
+    /// (memory parameters read per token, total memory parameters).
+    ///
+    /// The axis a content-addressed memory should win on structurally, rather
+    /// than on accuracy where it merely competes: a token touches the edges on
+    /// its own path and one class slice, never the whole store, and the cost
+    /// does not grow with sequence length because nothing here is indexed by
+    /// position. Reported as counts so the ratio can be checked by hand
+    /// against the architecture rather than trusted.
+    pub fn activation(&self) -> (usize, usize) {
+        let edge_read = self.hops * self.d * self.d;
+        // logits score every row of the live class slice
+        let readout_read = self.vocab * self.d;
+        let edge_total = if self.share_edge {
+            self.ring.n_edges() * self.d * self.d
+        } else {
+            self.ring.n_edges() * self.classes * self.d * self.d
+        };
+        let readout_total = if self.class_readout {
+            self.classes * self.vocab * self.d
+        } else {
+            self.vocab * self.d
+        } + self.readout_shared.len();
+        (edge_read + readout_read, edge_total + readout_total)
+    }
+
+    /// Writes per edge, to tell "this mechanism is worse" apart from "each
+    /// edge saw a fraction of the data because paths were spread thinner".
+    pub fn edge_write_spread(&self) -> (f64, f64) {
+        let v: Vec<f64> = self.edge_visits.iter().copied().filter(|x| *x > 0.0).collect();
+        if v.is_empty() {
+            return (0.0, 0.0);
+        }
+        let m = v.iter().sum::<f64>() / v.len() as f64;
+        (m, v.len() as f64)
+    }
+
     /// Growth events by observations since the domain last changed.
     pub fn growth_timing(&self) -> [usize; 4] {
         self.grow_at

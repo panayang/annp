@@ -1816,6 +1816,14 @@ impl ExpertBank {
         self.edge.as_ref().map(|e| e.context_ratio())
     }
 
+    pub fn activation(&self) -> Option<(usize, usize)> {
+        self.edge.as_ref().map(|e| e.activation())
+    }
+
+    pub fn edge_write_spread(&self) -> Option<(f64, f64)> {
+        self.edge.as_ref().map(|e| e.edge_write_spread())
+    }
+
     pub fn growth_timing(&self) -> Option<[usize; 4]> {
         self.edge.as_ref().map(|e| e.growth_timing())
     }
@@ -2509,6 +2517,15 @@ pub fn run_arm_trial(
             "  [{arm:?}] posterior re-routed {:.1}% of writes away from the prior",
             100.0 * r
         );
+    }
+    if let Some((read, total)) = bank.activation() {
+        println!(
+            "  [{arm:?}] activation {read}/{total} memory params per token ({:.3}%)",
+            100.0 * read as f64 / total.max(1) as f64
+        );
+    }
+    if let Some((mean_w, live)) = bank.edge_write_spread() {
+        println!("  [{arm:?}] edge traffic: {live:.0} edges used, {mean_w:.0} writes each");
     }
     if let Some(r) = bank.context_ratio().filter(|r| *r > 0.0) {
         println!("  [{arm:?}] injected context is {r:.2}x the content magnitude");
