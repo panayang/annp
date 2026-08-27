@@ -100,6 +100,7 @@ impl RelationalFactStream {
         vocab: usize,
         seed: u64,
         target_overlap: f64,
+        target_zipf: bool,
     ) -> Self {
         assert!(domains > 0, "domains must be positive");
         assert!(
@@ -127,6 +128,7 @@ impl RelationalFactStream {
                 hub_ratio,
                 vocab,
                 seed,
+                target_zipf,
             ),
             StreamMode::ModeB => Self::new_mode_b(
                 domains,
@@ -152,6 +154,7 @@ impl RelationalFactStream {
         hub_ratio: f64,
         vocab: usize,
         seed: u64,
+        target_zipf: bool,
     ) -> Self {
         let total_entities = (domains * facts_per_domain).max(128);
         // Clamp bounds match section 2.1's stated range so a caller's value is
@@ -178,6 +181,10 @@ impl RelationalFactStream {
         let entity_weights: Vec<f64> = (0..total_entities)
             .map(|i| 1.0 / ((i + 1) as f64).powf(zipf_s))
             .collect();
+        let all_leaf_entities: Vec<usize> = (hub_count..total_entities).collect();
+        let all_leaf_weights: Vec<f64> =
+            all_leaf_entities.iter().map(|&e| entity_weights[e]).collect();
+        let sum_all_leaf_w: f64 = all_leaf_weights.iter().sum();
 
         // 1. Construct Global Hub Edges (Tier 0: Hub -> Hub): Shared identically across all domains
         let hub_entities: Vec<usize> = (0..hub_count).collect();
@@ -238,19 +245,38 @@ impl RelationalFactStream {
             }
 
             // 3. Construct Tail Edges (Tier 2: Leaf -> Leaf)
+            //
+            // Tail targets were drawn from this domain's OWN leaves, so every
+            // domain contributed a fixed quota of entirely fresh targets and
+            // the union grew strictly linearly -- about 46 new per domain,
+            // measured. Capacity that follows content then cannot grow
+            // sublinearly whatever the mechanism does, and an earlier reading
+            // of union/domains falling 97 -> 51 as "sublinear" was wrong: a
+            // falling average with a constant increment is exactly linear.
+            //
+            // Real corpora are Zipf, so distinct types follow Heaps' law and
+            // the new-type rate DECAYS. Drawing tail targets from the global
+            // pool by Zipf weight restores that. This makes the source more
+            // realistic rather than more permissive, which is the only reason
+            // it is legitimate to change it.
+            let (pool, pool_w, pool_sum): (&[usize], &[f64], f64) = if target_zipf {
+                (&all_leaf_entities, &all_leaf_weights, sum_all_leaf_w)
+            } else {
+                (&domain_leaf_entities, &d_leaf_weights, sum_leaf_w)
+            };
             let mut tail_edges = Vec::new();
             for (leaf_idx, &u) in domain_leaf_entities.iter().enumerate() {
-                let mut pick_val = rng.next_f64() * sum_leaf_w;
-                let mut chosen_v = domain_leaf_entities[0];
-                for (&v, &w) in domain_leaf_entities.iter().zip(&d_leaf_weights) {
+                let mut pick_val = rng.next_f64() * pool_sum;
+                let mut chosen_v = pool[0];
+                for (&v, &w) in pool.iter().zip(pool_w) {
                     if pick_val <= w {
                         chosen_v = v;
                         break;
                     }
                     pick_val -= w;
                 }
-                if chosen_v == u && domain_leaf_entities.len() > 1 {
-                    chosen_v = domain_leaf_entities[(leaf_idx + 1) % domain_leaf_entities.len()];
+                if chosen_v == u && pool.len() > 1 {
+                    chosen_v = pool[(leaf_idx + 1) % pool.len()];
                 }
                 tail_edges.push((u, domain_r_tail, chosen_v, 2)); // Tier 2
             }
@@ -931,9 +957,14 @@ pub struct SdrConfig {
     /// contributes nothing to a content-vs-context question.
     /// Fraction of facts whose target is common to every domain.
     pub target_overlap: f64,
+    /// Draw Mode A tail targets from the global Zipf pool, so distinct types
+    /// follow Heaps' law as in real corpora rather than a fixed fresh quota.
+    pub target_zipf: bool,
     /// Tokens between the cue and the query in the probe episode. 0 keeps the
     /// old protocol, in which context is restored from a per-domain snapshot.
     pub long_range_gap: usize,
+    /// Cycle the probe gap over several horizons within one run.
+    pub long_range_mix: bool,
     pub no_ewc: bool,
     /// Explicit eta grid, for cutting the seven-point default down when the
     /// useful range is already known from a previous sweep.
@@ -2362,14 +2393,25 @@ pub fn run_arm_trial(
                     few.spec_tail,
                 )
             } else {
-                if cfg.long_range_gap > 0 {
+                // One fixed gap is best served by whichever single time constant
+                // matches it, so multi-scale context can show no advantage
+                // under it -- the evaluation decides the outcome, not the
+                // mechanism. Mixing horizons within a run is fairer and closer
+                // to a real stream.
+                let gap_now = if cfg.long_range_mix {
+                    const MIX: [usize; 4] = [1, 16, 64, 256];
+                    MIX[(r + d) % MIX.len()]
+                } else {
+                    cfg.long_range_gap
+                };
+                if gap_now > 0 {
                     // The edge memory's class comes from its own slow context,
                     // not from the input ladder, so rebuilding only the ladder
                     // left the restored -- and therefore oracle -- class in
                     // place. Rebuild both from the presented episode.
                     bank.reset_stream_ctx();
                     bank.absorb_stream_token(stream.cues[d]);
-                    for i in 0..cfg.long_range_gap {
+                    for i in 0..gap_now {
                         bank.absorb_stream_token(i % 8);
                     }
                 }
@@ -2377,8 +2419,8 @@ pub fn run_arm_trial(
                     domain_facts,
                     &probe_ladder,
                     &mut bank,
-                    if cfg.long_range_gap > 0 { Some(stream.cues[d]) } else { None },
-                    cfg.long_range_gap,
+                    if gap_now > 0 { Some(stream.cues[d]) } else { None },
+                    gap_now,
                 );
                 let zero_spec = [p.accuracy; 6];
                 (
@@ -2904,6 +2946,7 @@ pub fn run_sdr_experiment(cfg: &SdrConfig) -> Vec<ArmSummary> {
         cfg.vocab,
         cfg.seed,
         cfg.target_overlap,
+        cfg.target_zipf,
     );
 
     let eta_grid = if let Some(e) = cfg.eta {
@@ -3739,7 +3782,7 @@ mod tests {
     #[test]
     fn zipf_graph_stream_generation_mode_a() {
         let stream =
-            RelationalFactStream::new(StreamMode::ModeA, 4, 20, 200, 3, 1.0, 0.10, 512, 20260817, 0.0);
+            RelationalFactStream::new(StreamMode::ModeA, 4, 20, 200, 3, 1.0, 0.10, 512, 20260817, 0.0, false);
         assert_eq!(stream.facts.len(), 4);
         assert_eq!(stream.facts[0].len(), 20);
         assert_eq!(stream.walks.len(), 4);
@@ -3749,7 +3792,7 @@ mod tests {
     #[test]
     fn zipf_graph_stream_generation_mode_b() {
         let stream =
-            RelationalFactStream::new(StreamMode::ModeB, 4, 32, 200, 3, 1.0, 0.20, 512, 20260817, 0.0);
+            RelationalFactStream::new(StreamMode::ModeB, 4, 32, 200, 3, 1.0, 0.20, 512, 20260817, 0.0, false);
         assert_eq!(stream.facts.len(), 4);
         assert_eq!(stream.facts[0].len(), 32);
         assert_eq!(stream.walks.len(), 4);
@@ -3777,7 +3820,9 @@ mod tests {
             seed: 20260817,
             experts: 1,
             target_overlap: 0.0,
+            target_zipf: false,
             long_range_gap: 0,
+            long_range_mix: false,
             no_ewc: false,
             etas: None,
             ladder_g1: 0.1,
@@ -3824,7 +3869,7 @@ mod tests {
     #[test]
     fn frozen_probe_slice_does_not_modify_memory() {
         let stream =
-            RelationalFactStream::new(StreamMode::ModeA, 2, 10, 100, 2, 1.0, 0.10, 512, 20260817, 0.0);
+            RelationalFactStream::new(StreamMode::ModeA, 2, 10, 100, 2, 1.0, 0.10, 512, 20260817, 0.0, false);
         let mut rng = Rng::new(20260817);
         let ladder = InputContextLadder::new(16, 512, 4, 2.0, &mut rng);
         let cfg = SdrConfig {
@@ -3869,7 +3914,9 @@ mod tests {
             seed: 20260817,
             experts: 1,
             target_overlap: 0.0,
+            target_zipf: false,
             long_range_gap: 0,
+            long_range_mix: false,
             no_ewc: false,
             etas: None,
             ladder_g1: 0.1,

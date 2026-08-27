@@ -286,6 +286,23 @@ pub struct EdgeMemory {
     /// novel; a transition does not.
     grow_hold: usize,
     novel_run: usize,
+    /// Per-class similarity statistics.
+    ///
+    /// Novelty was measured against a GLOBAL running mean and variance, which
+    /// fails by construction once there are many regimes: the running
+    /// distribution becomes the mixture of all of them, so every regime is
+    /// typical of it and nothing looks novel. Measured: 8, 32, 64 and 128
+    /// domains all collapsed into a single home class, while 12 domains still
+    /// separated into 7-8. The criterion degrades with the number of regimes,
+    /// which is the opposite of what a continual learner needs.
+    ///
+    /// Relative to the assigned class instead -- "how badly does my own class
+    /// explain me" -- the test is scale-invariant: a new regime landing in an
+    /// old class is explained poorly by that class no matter how many other
+    /// classes exist.
+    class_sim_mean: Vec<f64>,
+    class_sim_var: Vec<f64>,
+    class_sim_n: Vec<f64>,
     ctx_gain: f64,
     ctx_proj: Vec<f64>,
     ctx_proj_rows: usize,
@@ -519,6 +536,9 @@ impl EdgeMemory {
             },
             grow_hold,
             novel_run: 0,
+            class_sim_mean: vec![0.0; classes.max(1)],
+            class_sim_var: vec![0.0; classes.max(1)],
+            class_sim_n: vec![0.0; classes.max(1)],
             ctx_gain,
             ctx_proj: {
                 let rows = 512;
@@ -618,6 +638,13 @@ impl EdgeMemory {
         }
         let (c, sim, margin) = self.class_sim_margin();
         self.margin_now = margin;
+        if c < self.class_sim_n.len() {
+            self.class_sim_n[c] += 1.0;
+            let w = self.class_sim_n[c].min(4096.0);
+            let dc = sim - self.class_sim_mean[c];
+            self.class_sim_mean[c] += dc / w;
+            self.class_sim_var[c] += (dc * (sim - self.class_sim_mean[c]) - self.class_sim_var[c]) / w;
+        }
         self.sim_n += 1.0;
         let delta = sim - self.sim_mean;
         self.sim_mean += delta / self.sim_n.min(4096.0);
@@ -674,6 +701,9 @@ impl EdgeMemory {
         }
         self.proto.resize(new_total * self.d, 0.0);
         self.seen_targets.resize(new_total, Vec::new());
+        self.class_sim_mean.resize(new_total, 0.0);
+        self.class_sim_var.resize(new_total, 0.0);
+        self.class_sim_n.resize(new_total, 0.0);
         self.classes = new_total;
     }
 
@@ -790,8 +820,19 @@ impl EdgeMemory {
                 return;
             }
         }
-        let sd = self.sim_var.max(1e-12).sqrt();
-        if self.sim_mean - sim <= self.grow_k * sd {
+        let c = self.class_of();
+        let (m, v, n) = if c < self.class_sim_n.len() {
+            (self.class_sim_mean[c], self.class_sim_var[c], self.class_sim_n[c])
+        } else {
+            (self.sim_mean, self.sim_var, self.sim_n)
+        };
+        // A class needs its own history before it can judge a member unusual.
+        if n < 64.0 {
+            self.novel_run = 0;
+            return;
+        }
+        let sd = v.max(1e-12).sqrt();
+        if m - sim <= self.grow_k * sd {
             self.novel_run = 0;
             return;
         }
@@ -922,14 +963,26 @@ impl EdgeMemory {
         if self.ctx_gain != 0.0 && !self.pending_ctx.is_empty() {
             let m = self.pending_ctx.len();
             let per = self.d.max(1);
-            for i in 0..self.d {
+            let before: f64 = self.route_payload.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let mut add = vec![0.0; self.d];
+            for (i, a) in add.iter_mut().enumerate() {
                 let mut acc = 0.0;
                 for (j, t) in self.pending_ctx.iter().enumerate() {
                     // rung index j/per keeps the scales on separate rows
                     let row = ((j / per) * 7 + j % per) % self.ctx_proj_rows;
                     acc += self.ctx_proj[row * self.d + i] * t;
                 }
-                self.route_payload[i] += self.ctx_gain * acc / (m as f64).sqrt();
+                *a = self.ctx_gain * acc / (m as f64).sqrt();
+            }
+            // Whether context is a real component of the address or a rounding
+            // error decides if the comparison means anything. The previous
+            // version measured this on the payload path, which no longer
+            // exists, so three runs reported no ratio at all.
+            let addn: f64 = add.iter().map(|x| x * x).sum::<f64>().sqrt();
+            self.ctx_ratio_sum += addn / before.max(1e-12);
+            self.ctx_ratio_n += 1.0;
+            for (p, a) in self.route_payload.iter_mut().zip(&add) {
+                *p += a;
             }
             normalize(&mut self.route_payload);
         }
@@ -1643,6 +1696,9 @@ impl Clone for EdgeMemory {
             posterior_moves: self.posterior_moves,
             posterior_seen: self.posterior_seen,
             grow_hold: self.grow_hold,
+            class_sim_mean: self.class_sim_mean.clone(),
+            class_sim_var: self.class_sim_var.clone(),
+            class_sim_n: self.class_sim_n.clone(),
             ctx_gain: self.ctx_gain,
             ctx_proj: self.ctx_proj.clone(),
             ctx_proj_rows: self.ctx_proj_rows,

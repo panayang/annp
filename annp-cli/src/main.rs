@@ -596,12 +596,26 @@ enum Command {
         /// target level can ever be amortised).
         #[arg(long, default_value_t = 0.0)]
         target_overlap: f64,
+        /// Draw Mode A tail targets from the global pool by Zipf weight
+        /// instead of the domain's private leaves. Private leaves gave every
+        /// domain a fixed quota of fresh targets, so the union grew strictly
+        /// linearly and capacity that follows content could not do otherwise.
+        /// Real corpora are Zipf, hence Heaps' law and a decaying new-type
+        /// rate, so this makes the source more realistic, not more permissive.
+        #[arg(long)]
+        target_zipf: bool,
         /// Tokens between cue and query in the probe episode (0 = the old
         /// protocol). With a gap the probe builds its context from what it
         /// shows the model rather than restoring a snapshot keyed by the true
         /// domain, so only something that carried the cue can answer.
         #[arg(long, default_value_t = 0)]
         long_range_gap: usize,
+        /// Cycle the probe gap over 1/16/64/256 within a run instead of
+        /// fixing one. A single gap is best served by whichever single time
+        /// constant matches it, so multi-scale context cannot show an
+        /// advantage under it -- the evaluation decides the outcome.
+        #[arg(long)]
+        long_range_mix: bool,
         #[arg(long)]
         no_ewc: bool,
         /// Comma-separated eta grid, replacing the seven-point default.
@@ -1080,7 +1094,9 @@ fn main() -> std::io::Result<()> {
         }
         Command::Sdr {
             target_overlap,
+            target_zipf,
             long_range_gap,
+            long_range_mix,
             domains,
             facts_per_domain,
             span_tokens,
@@ -1161,7 +1177,9 @@ fn main() -> std::io::Result<()> {
                 seed,
                 experts,
                 target_overlap,
+                target_zipf,
                 long_range_gap,
+                long_range_mix,
                 no_ewc,
                 etas,
                 ladder_g1,
@@ -1218,6 +1236,7 @@ fn main() -> std::io::Result<()> {
                 cfg.vocab,
                 cfg.seed,
                 cfg.target_overlap,
+                cfg.target_zipf,
             );
             let checks = sdr_exp::measure_source(&cfg, &stream_for_checks);
             sdr_exp::print_source_checks(&checks);
