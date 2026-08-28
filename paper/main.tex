@@ -1,0 +1,519 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\usepackage{natbib}
+\bibliographystyle{plainnat}
+
+\title{Content-Addressed Continual Memory with On-Demand Capacity}
+
+\author{%
+  Xinyu Yang\\
+  \texttt{guangjianyang@gmail.com}
+}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We study a continual-learning memory in which storage is addressed by content,
+capacity is allocated on demand from the stream without task identifiers, and
+new capacity is appended without perturbing anything already stored. On a
+relational stream whose regimes are distinguishable from their inputs, the
+mechanism retains $49.5\%$ of probed facts zero-shot where a parameter-matched
+monolithic model retains $15.0\%$. Sharing the payload transform across regimes
+while keeping per-regime readouts adds $16.4$ points over a fully private
+variant (six seeds, $p<0.001$). Allocating readout rows only for targets a
+regime actually emits reduces occupied capacity by $7.6\times$ at no cost in
+accuracy, and appending capacity leaves existing weights byte-identical and
+existing predictions bit-identical.
+
+We report the negative results at equal length. The architecture carries
+nothing between facts beyond a single-timescale context summary, and we
+quantify the resulting loss of association across a gap. Multi-hop routing,
+which could in principle purchase combinatorial addressing from linear memory,
+does not: it occupies the same capacity for $25$ points less accuracy. Retention
+declines as regimes accumulate, and we show by measurement that the decline is
+neither capacity starvation, nor worsening misrouting, nor failing separation,
+but retrieval difficulty growing sub-proportionally with what is stored.
+\end{abstract}
+
+\section{Introduction}
+
+A learner that must absorb an unbounded stream with bounded parameters has to
+discard something. Regularisation methods such as elastic weight consolidation
+\citep{kirkpatrick2017overcoming} give up plasticity, protecting old weights at
+the cost of new learning. Methods that simply keep training give up the past.
+A third option is to \emph{allocate}: give distinct regimes distinct storage, so
+that degradation is uniform rather than selective. Dynamically expanding
+architectures \citep{rusu2016progressive,yoon2018lifelong} take this route and
+are routinely criticised for adding parameters per task without demonstrating
+that the addition is proportionate to new content rather than to task count.
+
+This paper examines an allocation mechanism built around three commitments.
+Addressing is by content through a fixed random hash, so a fact reaches the same
+storage under every history. Regime identity is inferred online from the stream,
+so no task identifier, task boundary, or replay buffer is required. Capacity is
+appended rather than resized, so adding storage provably does not disturb what
+is already there.
+
+We report what these commitments buy and what they cost. They buy a large
+advantage where regimes are distinguishable, a capacity footprint that follows
+emitted content rather than vocabulary size, and a per-token cost independent of
+sequence length. They cost the ability to associate items across a gap, which
+content-only addressing forbids by construction, and they leave retention
+declining as regimes accumulate.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+  \item An allocation mechanism whose two addressing factors --- content to a
+  memory slice, inferred regime to a readout --- are separately measurable, with
+  no task supervision at any point (\S\ref{sec:method}).
+  \item Evidence that sharing the payload transform while privatising the
+  readout is the correct split for a stream whose regimes share surface form and
+  differ in targets, confirmed from both directions (\S\ref{sec:sharing}).
+  \item A capacity result: sampling negatives from a regime's own emitted
+  targets makes occupancy follow content, $7.6\times$ smaller at equal accuracy
+  (\S\ref{sec:capacity}).
+  \item A non-destructiveness property, verified exactly rather than
+  statistically: appending capacity leaves stored weights and predictions
+  unchanged bit for bit (\S\ref{sec:expansion}).
+  \item Negative results with their explanations excluded by measurement rather
+  than argument: multi-hop addressing, cross-gap association, and the source of
+  degradation at scale (\S\ref{sec:negative}).
+\end{enumerate}
+
+\section{Related work}
+
+\paragraph{Continual learning.}
+Catastrophic interference in distributed representations
+\citep{mccloskey1989catastrophic,french1999catastrophic} motivates three broad
+families \citep{parisi2019continual,delange2021continual}: regularisation
+\citep{kirkpatrick2017overcoming}, rehearsal, and architectural expansion
+\citep{rusu2016progressive,yoon2018lifelong}. Our mechanism is architectural,
+but differs from prior expansion methods in that it requires no task boundary to
+decide when to expand; the decision is made from the dispersion of an inferred
+regime's own statistics. Task-free continual learning
+\citep{aljundi2019task} shares this aim.
+
+\paragraph{Conditional computation.}
+Structurally the mechanism is a single-layer, top-1 sparsely-gated mixture of
+experts \citep{shazeer2017outrageously,fedus2022switch} whose router is a fixed
+random hash rather than a learned gate, and whose expert count grows. We treat
+the unlearned router as a limitation to be reported rather than a feature: it
+forgoes load balancing and learned specialisation, and it is precisely what
+prevents context from influencing retrieval (\S\ref{sec:longrange}).
+
+\paragraph{Addressable and distributed memory.}
+Content-addressed storage with sparse codes follows sparse distributed memory
+\citep{kanerva1988sparse} and hyperdimensional computing
+\citep{kanerva2009hyperdimensional}. Recoverable association of \emph{pairs},
+which a smoothed context summary cannot provide, is available through
+holographic reduced representations \citep{plate1995holographic} or fast-weight
+outer products \citep{ba2016using,schlag2021linear}; we identify this as the
+missing ingredient rather than claim it.
+
+\paragraph{Consolidation across timescales.}
+Cascades of variables at multiple timescales
+\citep{fusi2005cascade,benna2016computational} target the capacity--lifetime
+tradeoff of bounded synapses. We tested such a cascade in two roles, as weight
+consolidation and as input context, and report both outcomes.
+
+\paragraph{Attention and its costs.}
+Self-attention \citep{vaswani2017attention} pays $O(N)$ per token in context
+access and degrades on material in the middle of long contexts
+\citep{liu2024lost}. A content-addressed memory pays a cost independent of $N$;
+we quantify the crossover in \S\ref{sec:cost}.
+
+\paragraph{Vocabulary growth.}
+That distinct types grow sublinearly in a Zipf-distributed stream is Heaps' law
+\citep{heaps1978information}; we use it to ask whether allocated capacity tracks
+content, and report that in our generator it does not, for reasons traced to the
+generator itself (\S\ref{sec:scale}).
+
+\section{Method}
+\label{sec:method}
+
+A fact is a pair $(e,r)$ with target $t$. Token embeddings are fixed random unit
+vectors and are never learned. The payload is
+\begin{equation}
+  p_0 \;=\; \mathrm{normalise}\big(\mathrm{emb}[e] + \mathrm{emb}[r]\big).
+\end{equation}
+
+\subsection{Two addressing factors}
+
+\paragraph{Content to edge.}
+Nodes of a small-world ring hold fixed random keys $k_{n,s}$. The walk selects
+$s^\ast=\arg\max_s \langle k_{n,s}, p_0\rangle$ for $H$ hops. Nothing in this
+path is learned, so a fact reaches the same edge under every history and routing
+consistency is $1.000$ by construction.
+
+\paragraph{Regime to readout.}
+A slow exponential average $c$ of stream tokens is matched against prototypes,
+$\gamma = \arg\max_j \langle \pi_j, c\rangle$, selecting a readout slice. No task
+identifier is used anywhere; the mechanism is never told which regime is live.
+
+\subsection{Memory}
+
+The edge transform is shared across regimes and applied residually,
+\begin{equation}
+  p \;\leftarrow\; \mathrm{normalise}\big(p + \tanh(E_{\text{edge}}\, p)\big),
+\end{equation}
+while the readout $R_\gamma$ is private per regime and produces logits
+$R_\gamma\, p_H$. The split follows the generative structure rather than
+preference: a payload is built from entity and relation, which are common across
+regimes, whereas targets are exactly what regimes disagree about. Section
+\ref{sec:sharing} confirms this from both directions.
+
+\subsection{Learning}
+
+Training is online, single-pass and prequential: predict, take the loss, then
+write. There is no replay buffer, no task boundary and no second pass. The
+readout takes a delta-rule step on the target row together with negatives
+sampled from targets that regime has already emitted; gradients propagate back
+along the walked path into the shared transform. Routers receive no gradient.
+
+\subsection{Allocation}
+\label{sec:allocation}
+
+A class is split when the dispersion of its own similarity distribution,
+$\sigma_\gamma/|\mu_\gamma|$, exceeds a threshold, and the new prototype is
+placed at the current context. Dispersion is used rather than an outlier test
+because outlier tests fail in two ways we measured: against a global running
+distribution they fail once regimes are numerous, since the distribution becomes
+their mixture; against a class's own distribution they fail because a class
+absorbing more regimes raises its own variance, so the threshold rises exactly
+when splitting becomes necessary. Allocation appends, leaving existing slices at
+their offsets and values.
+
+\section{Experimental setup}
+
+The source is a multi-domain relational graph walked continuously, with facts
+stratified by visit frequency into hub, mid and tail tiers under a Zipf
+distribution. Two modes are used. In \textbf{Mode A} each regime owns its
+entities, so regime identity is present in the input. In \textbf{Mode B}
+entities and relations are byte-identical across regimes and only targets
+differ, which removes the routing signal and, by construction, any shared target
+to amortise; we use it as an adversarial bound rather than as the main setting.
+
+Evaluation is zero-shot retention of probed facts under a frozen memory, with
+the probe restoring the context it needs and returning the state it displaced.
+All figures in this paper are extracted by a single parser that anchors on the
+results table header and reads the column by name.
+
+\section{Results}
+
+\subsection{Where regimes are distinguishable}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lc}
+\toprule
+Mode A, eight regimes & zero-shot retention \\
+\midrule
+This work & $\mathbf{49.53\%}$ \\
+Monolithic, parameter-matched & $15.00\%$ \\
+Linear, no sparse coding & $15.30\%$ \\
+\bottomrule
+\end{tabular}
+\caption{The monolithic control performs at the level of a linear baseline,
+confirming the task is not solvable by predicting frequent targets.}
+\end{table}
+
+\subsection{Sharing the transform, privatising the readout}
+\label{sec:sharing}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Mode B, twelve regimes, six seeds & zero-shot & paired difference \\
+\midrule
+Shared transform, private readouts & $\mathbf{29.42\%}$ & $+16.43$pp, 6/6, $p<0.001$ \\
+Fully private & $12.98\%$ & --- \\
+Monolithic & $21.28\%$ & $+8.13$pp, 5/6, $p=0.119$ \\
+\bottomrule
+\end{tabular}
+\caption{Sharing the transform is established against the private
+architecture. The advantage over the monolithic control is not.}
+\end{table}
+
+Sharing the \emph{readout} as well costs $27.50$ points. A common readout block
+is updated on every write and therefore accumulates every regime's target
+mapping, while Mode B is defined by the same $(e,r)$ pointing at different
+targets per regime; it averages contradictions. The asymmetry of
+\S\ref{sec:method} is thus confirmed from both sides, one by making the change
+and the other by testing its opposite.
+
+\subsection{Capacity follows content}
+\label{sec:capacity}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\toprule
+ & occupied rows & rows per class & accuracy \\
+\midrule
+Dense delta rule & $45056/45056$ ($100\%$) & $4096$ & $32.6\%$ \\
+Sampled from emitted targets & $5918/45056$ ($\mathbf{13.1\%}$) & $\mathbf{538}$ & $33.8\%$ \\
+\bottomrule
+\end{tabular}
+\caption{A $7.6\times$ reduction in occupied capacity at no cost in accuracy.}
+\end{table}
+
+\subsection{Expansion does not disturb what is stored}
+\label{sec:expansion}
+
+Appending a class slice leaves every existing weight byte-identical and
+\texttt{forward} bit-identical, asserted as a test rather than measured
+statistically. A monolithic model cannot offer this: its capacity is the
+sparse-coding width, and widening it changes the projection through which every
+stored code was written.
+
+\subsection{Cost per token is independent of context length}
+\label{sec:cost}
+
+Context access costs $H d^2$ per token regardless of sequence length, against
+$Nd$ for attention; the crossover is at $N=d$ and the ratio is $128\times$ at
+$N=4096$. Against ourselves: overall activation is $6.178\%$ of memory
+parameters, of which the edge memory contributes $1024$ and the remainder is the
+readout scoring all $V$ rows. Sparsity currently holds for the expert part only.
+
+\section{What the architecture does not do}
+\label{sec:negative}
+
+\subsection{Association across a gap}
+\label{sec:longrange}
+
+Nothing is carried between facts beyond a single-timescale context, so a cue
+survives $(1-\rho)^{\text{gap}}$.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ccc}
+\toprule
+gap & cue remaining & accuracy \\
+\midrule
+$1$ & $0.990$ & $10.10\%$ \\
+$16$ & $0.851$ & $10.33\%$ \\
+$64$ & $0.526$ & $8.40\%$ \\
+$256$ & $0.076$ & $6.83\%$ \\
+\bottomrule
+\end{tabular}
+\caption{Paired degradation $+3.27$pp, 5/6 seeds, $p=0.013$. The location of
+the cliff was predicted from the context rate before the run.}
+\end{table}
+
+Exact association under constant memory is information-theoretically
+unavailable, so the design question is what a lossy code should retain. A
+multi-scale average answers \emph{which regime} and cannot answer \emph{which
+item}. Placing context into the address recovers roughly a tenth of the gap and
+costs lookup accuracy, consistent with content-only addressing being what
+forbids association in the first place.
+
+\subsection{Multi-hop addressing}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ccc}
+\toprule
+hops & zero-shot & occupied rows \\
+\midrule
+$1$ & $\mathbf{55.15\%}$ & $750$ \\
+$2$ & $46.00\%$ & $737$ \\
+$3$ & $29.63\%$ & $750$ \\
+\bottomrule
+\end{tabular}
+\caption{Identical occupancy, monotonically worse retention. The
+under-training explanation is excluded: writes per edge \emph{rise} with hops,
+from $3246$ to $9222$, because each fact touches more edges.}
+\end{table}
+
+\subsection{Retention declines as regimes accumulate}
+\label{sec:scale}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{ccccc}
+\toprule
+regimes & zero-shot & occupied & rows/regime & home classes per regime \\
+\midrule
+$8$ & $49.53\%$ & $530$ & $66$ & $0.75$ \\
+$16$ & $43.07\%$ & $1142$ & $71$ & $0.64$ \\
+$32$ & $37.65\%$ & $2412$ & $75$ & $0.70$ \\
+$64$ & $34.80\%$ & $5198$ & $81$ & $0.78$ \\
+\bottomrule
+\end{tabular}
+\caption{Monolithic baselines beyond eight regimes are in progress.}
+\end{table}
+
+Three explanations are excluded by the data. Capacity is supplied linearly, so
+this is not starvation. Misrouted write magnitude is $57.0$, $54.7$, $51.0$,
+$55.0$ per cent --- flat --- so it is not worsening interference. Home classes
+per regime is flat, so separation does not degrade. What remains is retrieval:
+confusable stored targets grow $9.8\times$ while accuracy falls to $0.70\times$,
+and distinct predictions rise from $47$ to $57$ rather than collapsing.
+
+\section{Limitations}
+
+Results are on a synthetic relational source; no natural-language corpus is
+evaluated. The monolithic baseline is established at eight regimes and is
+pending at larger scales. Cost comparisons between the dense and sampled write
+paths are not commensurable, because write magnitude accumulates over a
+different number of rows in each. The private and shared arms differ in
+parameter count, which strengthens the accuracy comparison but confounds
+comparisons of cost. Savings, in the sense of a later regime costing less to
+acquire, is observed in all arms including the control and is therefore not yet
+attributable to the mechanism.
+
+\section{Conclusion}
+
+Content addressing with on-demand allocation buys a large advantage where
+regimes are distinguishable, a capacity footprint that follows emitted content,
+and a per-token cost independent of context length, while provably not
+disturbing what is already stored. The same commitment that makes storage
+stable --- addressing by content alone --- is what prevents association across a
+gap, and the cost of that trade is measured here rather than asserted.
+
+\appendix
+
+\section{Measurements invalidated during this study}
+
+Six measurements were invalidated after collection and re-run. Three were
+probe-side leaks in which a per-domain snapshot keyed by ground truth handed the
+mechanism the regime identity it was meant to infer. One was the allocation
+criterion of \S\ref{sec:allocation} in an earlier form, which compared novelty
+against a global running distribution and collapsed every regime into a single
+class at scale, voiding the savings, capacity and multi-hop measurements taken
+under it. One was a parser that scanned past the results table into a table with
+the same column count and reported $54.2\%$ as $100.00\%$.
+
+Each was caught by a contradiction between statistics rather than by reading
+code: a count that disagreed with another count, a diagnostic that printed
+nothing, an accuracy that could not coexist with its own exposure figures. The
+instruments that survived --- write locality by time since regime change,
+occupancy against emitted content, allocation timing against regime boundaries
+--- are reported alongside the results because they are what made the failures
+visible.
+
+\begin{thebibliography}{99}
+
+\bibitem[Aljundi et al.(2019)]{aljundi2019task}
+R.~Aljundi, K.~Kelchtermans, and T.~Tuytelaars.
+\newblock Task-free continual learning.
+\newblock In \emph{CVPR}, 2019.
+
+\bibitem[Ba et al.(2016)]{ba2016using}
+J.~Ba, G.~Hinton, V.~Mnih, J.~Z. Leibo, and C.~Ionescu.
+\newblock Using fast weights to attend to the recent past.
+\newblock In \emph{NeurIPS}, 2016.
+
+\bibitem[Benna and Fusi(2016)]{benna2016computational}
+M.~K. Benna and S.~Fusi.
+\newblock Computational principles of synaptic memory consolidation.
+\newblock \emph{Nature Neuroscience}, 2016.
+
+\bibitem[De Lange et al.(2021)]{delange2021continual}
+M.~De~Lange, R.~Aljundi, M.~Masana, S.~Parisot, X.~Jia, A.~Leonardis,
+  G.~Slabaugh, and T.~Tuytelaars.
+\newblock A continual learning survey: Defying forgetting in classification
+  tasks.
+\newblock \emph{IEEE TPAMI}, 2021.
+
+\bibitem[Fedus et al.(2022)]{fedus2022switch}
+W.~Fedus, B.~Zoph, and N.~Shazeer.
+\newblock Switch transformers: Scaling to trillion parameter models with simple
+  and efficient sparsity.
+\newblock \emph{JMLR}, 2022.
+
+\bibitem[French(1999)]{french1999catastrophic}
+R.~M. French.
+\newblock Catastrophic forgetting in connectionist networks.
+\newblock \emph{Trends in Cognitive Sciences}, 1999.
+
+\bibitem[Fusi et al.(2005)]{fusi2005cascade}
+S.~Fusi, P.~J. Drew, and L.~F. Abbott.
+\newblock Cascade models of synaptically stored memories.
+\newblock \emph{Neuron}, 2005.
+
+\bibitem[Heaps(1978)]{heaps1978information}
+H.~S. Heaps.
+\newblock \emph{Information Retrieval: Computational and Theoretical Aspects}.
+\newblock Academic Press, 1978.
+
+\bibitem[Kanerva(1988)]{kanerva1988sparse}
+P.~Kanerva.
+\newblock \emph{Sparse Distributed Memory}.
+\newblock MIT Press, 1988.
+
+\bibitem[Kanerva(2009)]{kanerva2009hyperdimensional}
+P.~Kanerva.
+\newblock Hyperdimensional computing: An introduction to computing in
+  distributed representation with high-dimensional random vectors.
+\newblock \emph{Cognitive Computation}, 2009.
+
+\bibitem[Kirkpatrick et al.(2017)]{kirkpatrick2017overcoming}
+J.~Kirkpatrick, R.~Pascanu, N.~Rabinowitz, J.~Veness, G.~Desjardins, A.~A. Rusu,
+  K.~Milan, J.~Quan, T.~Ramalho, A.~Grabska-Barwinska, et~al.
+\newblock Overcoming catastrophic forgetting in neural networks.
+\newblock \emph{PNAS}, 2017.
+
+\bibitem[Liu et al.(2024)]{liu2024lost}
+N.~F. Liu, K.~Lin, J.~Hewitt, A.~Paranjape, M.~Bevilacqua, F.~Petroni, and
+  P.~Liang.
+\newblock Lost in the middle: How language models use long contexts.
+\newblock \emph{TACL}, 2024.
+
+\bibitem[McCloskey and Cohen(1989)]{mccloskey1989catastrophic}
+M.~McCloskey and N.~J. Cohen.
+\newblock Catastrophic interference in connectionist networks: The sequential
+  learning problem.
+\newblock \emph{Psychology of Learning and Motivation}, 1989.
+
+\bibitem[Parisi et al.(2019)]{parisi2019continual}
+G.~I. Parisi, R.~Kemker, J.~L. Part, C.~Kanan, and S.~Wermter.
+\newblock Continual lifelong learning with neural networks: A review.
+\newblock \emph{Neural Networks}, 2019.
+
+\bibitem[Plate(1995)]{plate1995holographic}
+T.~A. Plate.
+\newblock Holographic reduced representations.
+\newblock \emph{IEEE Transactions on Neural Networks}, 1995.
+
+\bibitem[Rusu et al.(2016)]{rusu2016progressive}
+A.~A. Rusu, N.~C. Rabinowitz, G.~Desjardins, H.~Soyer, J.~Kirkpatrick,
+  K.~Kavukcuoglu, R.~Pascanu, and R.~Hadsell.
+\newblock Progressive neural networks.
+\newblock \emph{arXiv:1606.04671}, 2016.
+
+\bibitem[Schlag et al.(2021)]{schlag2021linear}
+I.~Schlag, K.~Irie, and J.~Schmidhuber.
+\newblock Linear transformers are secretly fast weight programmers.
+\newblock In \emph{ICML}, 2021.
+
+\bibitem[Shazeer et al.(2017)]{shazeer2017outrageously}
+N.~Shazeer, A.~Mirhoseini, K.~Maziarz, A.~Davis, Q.~Le, G.~Hinton, and J.~Dean.
+\newblock Outrageously large neural networks: The sparsely-gated
+  mixture-of-experts layer.
+\newblock In \emph{ICLR}, 2017.
+
+\bibitem[Vaswani et al.(2017)]{vaswani2017attention}
+A.~Vaswani, N.~Shazeer, N.~Parmar, J.~Uszkoreit, L.~Jones, A.~N. Gomez,
+  L.~Kaiser, and I.~Polosukhin.
+\newblock Attention is all you need.
+\newblock In \emph{NeurIPS}, 2017.
+
+\bibitem[Yoon et al.(2018)]{yoon2018lifelong}
+J.~Yoon, E.~Yang, J.~Lee, and S.~J. Hwang.
+\newblock Lifelong learning with dynamically expandable networks.
+\newblock In \emph{ICLR}, 2018.
+
+\end{thebibliography}
+
+\end{document}
