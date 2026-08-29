@@ -511,10 +511,61 @@ Allocation does not solve interference so much as convert it. Where a shared
 representation loses old material as new material overwrites it
 \citep{mccloskey1989catastrophic}, storage that is separated by regime removes
 that channel and substitutes another: retrieval among a growing inventory. The
-substitution appears to be favourable in our measurements --- confusable stored
-targets grow $9.8\times$ while retention falls to $0.70\times$, and the
-distinct predictions made rise rather than collapse --- but it is a
-substitution, not a removal, and the cost reappears as scale.
+exchange rate looks favourable in our measurements --- confusable stored targets
+grow $9.8\times$ while retention falls to $0.70\times$, and the distinct
+predictions made rise rather than collapse --- but it is a substitution, not a
+removal, and the cost reappears as scale.
+
+The stronger reason to prefer it is not the rate but the shape of the two
+failures. Interference in a shared representation
+is destructive and open-ended: material that is overwritten is gone, and the
+only remedies are more capacity or less learning. Retrieval difficulty is
+non-destructive and sub-proportional: the material is still stored, merely
+harder to find, and a tenfold larger inventory cost us thirty per cent of
+retention. More importantly the two differ in what can be done about them.
+Interference is answered only by spending parameters; retrieval difficulty is
+answered by addressing better, which is a design axis rather than a budget.
+
+That said, an exponent of roughly $0.16$ compounds, and a mechanism whose
+retention decays with everything it has ever learned would not scale. Several
+remedies follow directly from the diagnosis, and we list them in order of how
+directly they attack the measured quantity, which is the number of candidates a
+retrieval must discriminate among.
+
+\begin{enumerate}
+  \item \emph{Bound the scored set.} Inference currently scores all $V$ rows of
+  the live slice while a class holds $39$--$41$ occupied rows. Scoring only
+  occupied rows makes the candidate count follow content directly, which is the
+  quantity in the exponent (\S\ref{sec:variants}).
+  \item \emph{Shard the memory.} A coarse router over several independent
+  memories, each with its own allocator, keeps any one inventory bounded while
+  total capacity grows with the number of shards --- a mixture of experts whose
+  experts are memories rather than layers
+  \citep{shazeer2017outrageously,fedus2022switch}. Growth then adds shards
+  rather than enlarging a single candidate set, so the exponent becomes a
+  property of shard size instead of a property of everything ever learned. The
+  cost is a second routing decision that can be wrong, and the open question is
+  whether material that belongs to two shards must be duplicated.
+  \item \emph{Address hierarchically.} Within a shard, a coarse code selecting a
+  slice and a fine code over that slice's own targets makes discrimination
+  logarithmic in the inventory rather than linear, at the cost of a coarse-level
+  error being unrecoverable at the fine level (\S\ref{sec:variants}).
+  \item \emph{Grow the code with the inventory.} Discriminating $N$ items needs
+  a code whose capacity keeps pace; letting $d$ grow like $\log N$ would hold
+  the exponent at the price of memory per row and of the byte-identical
+  expansion property, since widening the code changes existing rows.
+  \item \emph{Merge redundant slices.} If allocation over-splits, inventory
+  reflects duplicates rather than distinct content. Consolidating slices whose
+  similarity profiles coincide would keep the inventory a measure of what is
+  actually distinct.
+  \item \emph{Sample negatives adversarially.} Discrimination is currently
+  trained against negatives drawn from a regime's own emitted targets. Drawing
+  them from the current nearest confusables instead spends the code where
+  collisions actually occur.
+\end{enumerate}
+
+The first two are the ones we would try first, and the second is the one that
+changes the asymptote rather than the constant.
 
 \paragraph{Lost in the middle.}
 Attention degrades on material by its position in the context
@@ -534,37 +585,101 @@ $0.32$ to $0.92$, so at present the honest statement is about reachability, not
 position. Whether the frontier is extended or merely shifted requires a regime
 where both operate, which we did not construct.
 
-\subsection{Where such a memory might be useful}
+\subsection{What this is not for, and what it might be for}
 
-The properties that survived suggest applications rather than benchmarks.
+A statically trained model, evaluated as a static tool, remains the accuracy
+ceiling. It is trained to convergence over a fixed corpus with many passes; a
+single-pass online memory will not match it on a benchmark drawn from that same
+corpus, and we do not suggest otherwise. For answering ordinary questions from
+knowledge fixed at training time, the static model is the right instrument and
+this one is not.
+
+The case for a mechanism like ours is different in kind: acceptable accuracy
+combined with the ability to keep working. We would also note that accuracy on
+a fixed source is a narrow proxy. It measures what a model knows at the moment
+it was frozen, not what it can absorb afterwards, not what it costs to keep
+running, and not what happens after weeks of operation --- none of which a
+static benchmark is constructed to reveal. The properties measured here point
+at settings where those are the binding constraints.
+
+\emph{Sessions measured in weeks.} Per-token cost does not grow with context
+and there is no cache to retain, so an agent can run for as long as the task
+lasts rather than as long as a window allows. What it absorbed on the first day
+is stored rather than scrolled out.
+
+\emph{Embodied and IoT settings.} A robot or sensor node meets regimes that
+were not enumerated in advance and receives them once, in order, without
+labels. Allocation from the stream and single-pass writing match that shape;
+retraining cycles do not.
+
+\emph{Edge and green deployment.} Context access is $Hd^2$ per token
+independently of history, and a write touches one slice and a handful of rows.
+The cost profile is close to flat in the length of the deployment, which is the
+quantity that dominates energy over a long-running installation.
 
 \emph{Absorbing new domains after deployment.} Capacity appends without
-disturbing what is stored, allocation needs no task label, and learning is
-single-pass, so a deployed model can take on a new domain without a retraining
-cycle. The exactness of the non-destructiveness matters here more than its
-size: one can state that adding capacity did not change existing behaviour,
-rather than measure that it changed little.
+disturbing what is stored, so a fielded model can take on a new domain without
+a retraining cycle. The exactness matters more than the magnitude: one can
+state that adding capacity did not change existing behaviour, rather than
+measure that it changed little.
 
-\emph{Targeted deletion.} A regime occupies identifiable slices, so removing
-one is a local operation rather than a retraining problem. This follows from
-the same structure as non-destructive expansion and would be the natural test
-of it; we have not run it, and note only that a monolithic model offers no
-comparable handle.
-
-\emph{Auditable provenance.} Every write's destination is determined by a
-content hash and an inferred regime, both inspectable, so it is possible to say
-which slice serves which material. A learned router offers no equivalent
-account of itself.
+\emph{Targeted deletion, and interpretability more broadly.} A regime occupies
+identifiable slices, so removing one is a local operation rather than a
+retraining problem --- the natural test of the same structure that makes
+expansion non-destructive, and one we have not run. The same property supports
+weaker but broader questions: which slice serves this material, what did this
+write change, what would removing this regime cost. A learned router gives no
+comparable account of itself, and a dense model gives none at all. We think
+this is the more interesting direction of the two, since deletion is one query
+among many that an addressable, inspectable store can answer.
 
 \emph{Long-tail material.} Capacity follows emitted content rather than
 vocabulary size, so rare items occupy their own rows instead of being averaged
-into frequent ones --- which is also why we advise against subword
-tokenisation below.
+into frequent neighbours.
 
-We have tested none of these as applications. They are stated as the uses the
-measured properties would support, not as results.
+\subsection{Fabrication}
+
+We did not measure hallucination and make no claim about rates. But three
+structural properties bear on it and are worth stating, since each is a
+consequence of the architecture rather than of tuning.
+
+Training and inference are not separate modes: the same forward path writes and
+reads, and what a query returns is what some slice holds. There is no
+generation stage distinct from retrieval in which content can be composed that
+was never stored.
+
+Regimes occupy separate readout slices, so an answer is produced from the slice
+the context selected. Blending material across domains --- one plausible route
+to a confident wrong answer --- is limited by the same separation that limits
+interference, rather than by a penalty term.
+
+Sparse occupancy makes absence representable. A class holds tens of occupied
+rows out of tens of thousands, so ``nothing here scores well'' is a state the
+mechanism can be in, which a dense readout normalised over the full vocabulary
+cannot easily express. Whether this translates into calibrated abstention is
+untested and would be the obvious experiment.
+
+\subsection{On whether growing capacity is disqualifying}
+
+Expansion invites the objection that a method which adds parameters has not
+solved anything. We think the objection is right about unbounded growth and
+wrong as a general principle, and the biological case is instructive on the
+distinction. A brain does not hold its knowledge in a fixed parameter vector:
+connectivity is combinatorial, signalling is graded rather than discrete, and
+the number of distinguishable synaptic states is correspondingly large. A
+system with that much effective capacity can afford to allocate in proportion
+to content, because content is small relative to what it can hold.
+
+Digital parameters are finite and discrete, so the same strategy is only
+tenable if per-shard inventory is bounded --- which is the argument for
+sharding above, and the reason we regard unbounded growth in a single memory as
+a defect to be fixed rather than a property to be defended. What the biological
+case does suggest is that allocation proportional to content is not
+disqualifying in itself. What must be bounded is not the total, but the number
+of things any single retrieval has to discriminate among.
 
 \section{Architectural variants worth trying}
+\label{sec:variants}
 
 Each variant below targets a specific measurement in this paper rather than a
 general intuition.
