@@ -776,19 +776,21 @@ survives $(1-\rho)^{\text{gap}}$.
 \toprule
 gap & cue remaining & accuracy \\
 \midrule
-$1$ & $0.990$ & $10.10\%$ \\
-$16$ & $0.851$ & $10.33\%$ \\
-$64$ & $0.526$ & $8.40\%$ \\
-$256$ & $0.076$ & $6.83\%$ \\
+$1$ & $0.990$ & $13.23\%$ \\
+$16$ & $0.851$ & $13.97\%$ \\
+$64$ & $0.526$ & $13.50\%$ \\
+$256$ & $0.076$ & $10.87\%$ \\
 \bottomrule
 \end{tabular}
-\caption{Cue remaining is $(1-\rho)^{\text{gap}}$ at the context rate used.
-Paired degradation from gap $1$ to gap $256$ is $+3.27$pp, 5/6 seeds,
-$t(5)=3.81$, $p=0.013$. The location of the cliff was predicted from the
-context rate before the run. Seeds 1--3 and 4--6 were run on different machines
-at the same configuration and differ substantially in level ($5.1$--$9.0$
-against $9.4$--$15.9$ at gap $1$), which is why the comparison is paired within
-seed and the column means should not be read as a level.}
+\caption{Three seeds. Cue remaining is $(1-\rho)^{\text{gap}}$ at the context
+rate used, and its collapse between gap $64$ and gap $256$ was predicted from
+that rate before the run. Paired degradation from gap $1$ to gap $256$ is
+$+2.37$pp, $2/3$ seeds, $t(2)=1.55$, $p\approx0.26$: on this source and at this
+seed count we did not establish the degradation, only its direction. An earlier
+batch of three seeds gave $+3.27$pp, $5/6$, $p=0.013$ when pooled with these,
+but it ran before the evaluation was changed to charge a model for carrying
+nothing, and the two batches differ by a factor of two in level, so we report
+the post-change batch alone rather than the pooled six.}
 \end{table}
 
 Exact association under constant memory is information-theoretically
@@ -805,12 +807,21 @@ therefore show no advantage under this protocol by construction, because the
 comparison is decided by the evaluation rather than by the code.
 
 Under a mixed-gap protocol that cycles horizons within a run, the sign of the
-effect changes: putting the multi-scale trace into the address is worth
-$+0.67$pp on average against not doing so, where under a single fixed gap the
-same setting bought $+0.40$pp at the long end while costing $0.47$pp at the
-short one. Three seeds and two of three in the favourable direction is far too
-little to establish anything, but it is consistent with the protocol rather than
-the code having decided the earlier comparison. We regard both protocols as
+effect changes: the strongest context gain we tried is worth $+0.67$pp on
+average against no context in the address ($44.47\%\to45.13\%$, two seeds of
+three in the favourable direction), where under a single fixed gap the same
+setting bought $+0.40$pp at the long end while costing $0.47$pp at the short
+one. We report this as a sign change and nothing more, and three facts about it
+should be read alongside. The response is not monotone in the amount of
+context --- the intermediate gain gave $43.00\%$, below the no-context arm ---
+which is consistent either with a genuine non-monotonicity or with the
+differences being noise. The spread across seeds, $37.0$ to $52.4$ per cent, is
+an order of magnitude larger than the effect. And three seeds cannot establish
+a difference of this size in either direction. What the sign change is
+consistent with is the protocol rather than the code having decided the earlier
+comparison; separating those two would need the gain swept more finely, more
+seeds at each setting, and a source whose dependency horizons are not fixed by
+construction. We regard both protocols as
 preliminary: a gap constructed in a synthetic stream fixes what has to be
 carried and for how long, and cannot show what a real dependency structure
 demands. Establishing this needs evaluation on natural language at scale, which
@@ -948,9 +959,12 @@ the argmax must discriminate among --- grows $9.8\times$ while accuracy falls
 to $0.70\times$, and distinct predictions rise from $47$ to $57$ rather than
 collapsing.
 
-These exclusions constrain the explanation without establishing it, and the
-monolithic baselines beyond sixteen regimes are still running. We state the
-retrieval account as the surviving candidate rather than as the finding.
+These exclusions constrain the explanation without establishing it. We state
+the retrieval account as the surviving candidate rather than as the finding,
+and note what would settle it: the account predicts that bounding the scored
+set to a class's occupied rows, or partitioning the inventory so that no single
+candidate set grows without limit, should move the exponent, while adding
+capacity should not. Both are cheap to run and neither has been run.
 
 
 
