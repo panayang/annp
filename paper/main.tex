@@ -13,7 +13,8 @@
 
 \author{%
   Xinyu Yang\\
-  \texttt{pana.yang@hotmail.com}
+  \texttt{pana.yang@hotmail.com}\\
+  ORCID: \href{https://orcid.org/0009-0007-2600-0948}{0009-0007-2600-0948}
 }
 
 \date{\today}
@@ -26,22 +27,27 @@ We study a continual-learning memory in which storage is addressed by content,
 capacity is allocated on demand from the stream without task identifiers, and
 new capacity is appended without perturbing anything already stored. On a
 relational stream whose regimes are distinguishable from their inputs, the
-mechanism retains $49.5\%$ of probed facts zero-shot where a parameter-matched
-monolithic model retains $15.0\%$. Sharing the payload transform across regimes
-while keeping per-regime readouts adds $16.4$ points over a fully private
-variant (six seeds, $p<0.001$). Allocating readout rows only for targets a
-regime actually emits reduces occupied capacity by $7.6\times$ at no cost in
-accuracy, and appending capacity leaves existing weights byte-identical and
-existing predictions bit-identical.
+mechanism retains $49.5\%$ of probed facts zero-shot against $15.1\%$ for a
+monolithic sparse-coded control of the same width, which is itself at the level
+of a linear baseline; the advantage narrows from $34$ to $25$ points between
+eight and thirty-two regimes without closing. Sharing the payload transform
+across regimes while keeping per-regime readouts adds $16.4$ points over a
+fully private variant (six seeds, $p<0.001$). Allocating readout rows only for
+targets a regime actually emits reduces occupied capacity by $7.6\times$ at no
+cost in accuracy, and appending capacity leaves existing weights byte-identical
+and existing predictions bit-identical.
 
-We report the negative results at equal length. The architecture carries
-nothing between facts beyond a single-timescale context summary, and we
-quantify the resulting loss of association across a gap. Multi-hop routing,
-which could in principle purchase combinatorial addressing from linear memory,
-does not: it occupies the same capacity for $25$ points less accuracy. Retention
-declines as regimes accumulate, and we show by measurement that the decline is
-neither capacity starvation, nor worsening misrouting, nor failing separation,
-but retrieval difficulty growing sub-proportionally with what is stored.
+We give equal space to what the mechanism does not do, and hold those readings
+open rather than assert them. It carries nothing between facts beyond a
+single-timescale context, and retention falls as a cue is separated from its
+query; multi-hop routing occupies the same capacity for less accuracy, and
+letting the address compose as well as the value costs more still; retention
+declines as regimes accumulate, with capacity starvation, worsening misrouting
+and failing separation each excluded by measurement, leaving retrieval
+difficulty as the surviving account. We report these as measurements whose
+interpretation is unsettled because, in the course of this study, six
+measurements that read as findings turned out to have been produced by the
+measurement rather than the mechanism.
 \end{abstract}
 
 \section{Introduction}
@@ -60,8 +66,8 @@ This paper examines an allocation mechanism built around three commitments.
 Addressing is by content through a fixed random hash, so a fact reaches the same
 storage under every history. Regime identity is inferred online from the stream,
 so no task identifier, task boundary, or replay buffer is required. Capacity is
-appended rather than resized, so adding storage provably does not disturb what
-is already there.
+appended rather than resized, so adding storage leaves what is already there
+untouched, which we check exactly rather than statistically.
 
 We report what these commitments buy and what they cost. They buy a large
 advantage where regimes are distinguishable, a capacity footprint that follows
@@ -76,7 +82,7 @@ declining as regimes accumulate.
   memory slice, inferred regime to a readout --- are separately measurable, with
   no task supervision at any point (\S\ref{sec:method}).
   \item Evidence that sharing the payload transform while privatising the
-  readout is the correct split for a stream whose regimes share surface form and
+  readout is the effective split for a stream whose regimes share surface form and
   differ in targets, confirmed from both directions (\S\ref{sec:sharing}).
   \item A capacity result: sampling negatives from a regime's own emitted
   targets makes occupancy follow content, $7.6\times$ smaller at equal accuracy
@@ -501,8 +507,10 @@ of edges a fact visits is settled before the walk begins.
 
 We implemented the obvious remedy, copying the transformed payload into the
 routing key after each hop so that hop $h+1$ selects from hop $h$'s output, and
-it makes matters worse: $51.43\%$ to $41.03\%$ at two hops and $35.10\%$ to
-$22.83\%$ at three, widening rather than closing the gap to a single hop. The
+it makes matters worse. Within its own configuration, which uses a larger ring
+than the multi-hop table above and is therefore not directly comparable to it,
+accuracy falls from $51.43\%$ to $41.03\%$ at two hops and from $35.10\%$ to
+$22.83\%$ at three, so the gap to a single hop widens rather than closes. The
 reason is visible in the same run. Routing consistency, which the fixed key
 guarantees at $1.000$, falls to $0.910$; a fact's path now depends on weights
 that move, so nine per cent of probed facts no longer reach where training left
@@ -531,21 +539,38 @@ correspondence the capacity argument relies on.
 \section{Limitations}
 
 Results are on a synthetic relational source; no natural-language corpus is
-evaluated. The monolithic baseline is established at eight regimes and is
-pending at larger scales. Cost comparisons between the dense and sampled write
-paths are not commensurable, because write magnitude accumulates over a
-different number of rows in each. The private and shared arms differ in
-parameter count, which strengthens the accuracy comparison but confounds
-comparisons of cost. Whether acquiring a regime becomes cheaper as regimes accumulate is not
-settled here: our measurement staggers arrival, and arrival order alone can
-produce the effect (Appendix~\ref{app:arrival}).
+evaluated, and a stream we constructed fixes what has to be learned and what
+can be shared, which is precisely what a real corpus would decide for us.
+
+The monolithic control is established at eight, sixteen and thirty-two regimes,
+with one seed at thirty-two and none at sixty-four. It is not parameter-matched
+in either direction: at eight regimes it holds $16.8$M readout weights against
+$11.6$M allocated by our mechanism, of which about $17$K are occupied. The
+comparison is therefore between two models of comparable width rather than of
+equal size, and the occupancy figures should be read as describing our
+mechanism rather than as a like-for-like efficiency claim.
+
+Cost comparisons between the dense and sampled write paths are not
+commensurable, because write magnitude accumulates over a different number of
+rows in each. The private and shared arms likewise differ in parameter count,
+which strengthens the accuracy comparison between them but confounds any
+comparison of their costs.
+
+Sample sizes are small throughout: six seeds for the sharing result, three for
+most others, one for the largest control. Several effects in this study
+weakened or reversed between three seeds and six, so single-digit seed counts
+should be read accordingly.
+
+Whether acquiring a regime becomes cheaper as regimes accumulate is not settled
+here: our measurement staggers arrival, and arrival order alone can produce the
+effect (Appendix~\ref{app:arrival}).
 
 \section{Conclusion}
 
 Content addressing with on-demand allocation buys a large advantage where
 regimes are distinguishable, a capacity footprint that follows emitted content,
-and a per-token cost independent of context length, while provably not
-disturbing what is already stored. The same commitment that makes storage
+and a per-token cost independent of context length, without disturbing what is
+already stored. The same commitment that makes storage
 stable --- addressing by content alone --- is what prevents association across a
 gap, and the cost of that trade is measured here rather than asserted.
 
