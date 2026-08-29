@@ -287,6 +287,20 @@ pub struct EdgeMemory {
     grow_hold: usize,
     novel_run: usize,
     grow_orthogonalise: bool,
+    /// Select each hop's edge from the previous hop's output instead of from
+    /// the original content.
+    ///
+    /// Depth here is in the transform and not in the routing: hop h+1 already
+    /// transforms hop h's output, but every hop picks its edge with the same
+    /// fixed copy of p_0, so the sequence of edges a fact visits is settled by
+    /// its original content and nothing the intervening transforms produced
+    /// can change it. Each hop is another transform of the same retrieved
+    /// content rather than a step to somewhere the previous step chose, which
+    /// is a plausible reason paths cost accuracy without buying anything.
+    ///
+    /// Turning this on gives up the guarantee that a fact always lands where
+    /// it was trained, since its path now depends on weights that move.
+    route_compose: bool,
     /// Per-class similarity statistics.
     ///
     /// Novelty was measured against a GLOBAL running mean and variance, which
@@ -467,6 +481,7 @@ impl EdgeMemory {
         expand_cap: usize,
         grow_hold: usize,
         grow_orthogonalise: bool,
+        route_compose: bool,
         ctx_gain: f64,
         rng: &mut Rng,
     ) -> Self {
@@ -539,6 +554,7 @@ impl EdgeMemory {
             grow_hold,
             novel_run: 0,
             grow_orthogonalise,
+            route_compose,
             class_sim_mean: vec![0.0; classes.max(1)],
             class_sim_var: vec![0.0; classes.max(1)],
             class_sim_n: vec![0.0; classes.max(1)],
@@ -1068,6 +1084,9 @@ impl EdgeMemory {
             self.path_norm[h] = self.payload.iter().map(|v| v * v).sum::<f64>().sqrt();
             normalize(&mut self.payload);
 
+            if self.route_compose {
+                self.route_payload.copy_from_slice(&self.payload);
+            }
             node = self.ring.edges[node][slot];
         }
 
@@ -1726,6 +1745,7 @@ impl Clone for EdgeMemory {
             posterior_seen: self.posterior_seen,
             grow_hold: self.grow_hold,
             grow_orthogonalise: self.grow_orthogonalise,
+            route_compose: self.route_compose,
             class_sim_mean: self.class_sim_mean.clone(),
             class_sim_var: self.class_sim_var.clone(),
             class_sim_n: self.class_sim_n.clone(),
@@ -1810,7 +1830,7 @@ mod tests {
     #[test]
     fn the_same_fact_always_walks_the_same_path() {
         let mut rng = Rng::new(3);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, true, 0.0, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 128, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, true, false, 0.0, &mut rng);
         m.forward(5, 9);
         let a = m.path_edge.clone();
         for t in 0..50 {
@@ -1827,7 +1847,7 @@ mod tests {
     #[test]
     fn different_facts_take_different_paths() {
         let mut rng = Rng::new(5);
-        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, true, 0.0, &mut rng);
+        let mut m = EdgeMemory::new(32, 3, 3, 8, 32, 256, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, true, false, 0.0, &mut rng);
         let mut seen = std::collections::HashSet::new();
         for t in 0..60 {
             m.forward(t, t + 1);
@@ -1839,7 +1859,7 @@ mod tests {
     #[test]
     fn hash_class_ignores_the_stream_entirely() {
         let mut rng = Rng::new(23);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, true, 0.0, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, true, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, true, false, 0.0, &mut rng);
         m.forward(4, 7);
         let a = m.class_used;
         for _ in 0..300 {
@@ -1852,7 +1872,7 @@ mod tests {
     #[test]
     fn the_class_follows_the_stream() {
         let mut rng = Rng::new(7);
-        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, true, 0.0, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 8, 32, 256, 0.2, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, true, false, 0.0, &mut rng);
         for _ in 0..200 {
             m.absorb_token(11);
         }
@@ -1866,7 +1886,7 @@ mod tests {
     #[test]
     fn a_write_only_touches_the_edges_that_were_walked() {
         let mut rng = Rng::new(11);
-        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, true, 0.0, &mut rng);
+        let mut m = EdgeMemory::new(16, 2, 3, 4, 16, 64, 0.01, 0.0, false, false, 8, 3.0, 20000.0, 1, 2.0, 0.1, 0.0, 0.0, false, false, false, 0, 0, 1, true, false, 0.0, &mut rng);
         // Warm the readout first. From a zero readout the first write leaves
         // it rank one along the payload, so dL/dp_H comes out exactly
         // parallel to p_H and the unit-norm projection (I - p p^T) cancels it
@@ -1902,7 +1922,7 @@ mod tests {
         let mut rng = Rng::new(9);
         let mut m = EdgeMemory::new(
             16, 2, 3, 4, 16, 64, 0.01, 0.0, false, true, 4, 3.0, 20000.0, 1, 2.0, 0.1, 0.0,
-            0.0, false, false, false, 0, 0, 1, true, 0.0, &mut rng,
+            0.0, false, false, false, 0, 0, 1, true, false, 0.0, &mut rng,
         );
         for t in 0..40 {
             m.observe_fact(t % 12, (t + 1) % 12, (t + 2) % 12, 0.3);

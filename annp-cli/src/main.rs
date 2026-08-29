@@ -739,6 +739,12 @@ enum Command {
         /// routed to one.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         edge_grow_orth: bool,
+        /// Select each hop's edge from the previous hop's output rather than
+        /// from the original content. Depth is currently in the transform and
+        /// not in the routing: every hop picks its edge with the same fixed
+        /// key, so a fact's path is settled before the walk begins.
+        #[arg(long)]
+        edge_route_compose: bool,
         /// Ceiling on total class slices when capacity is expanded on demand
         /// (0 = fixed budget). Growth then allocates a slice only when a
         /// genuinely novel regime arrives, and the append leaves every
@@ -1155,6 +1161,7 @@ fn main() -> std::io::Result<()> {
             edge_grow_hold,
             edge_ctx_gain,
             edge_grow_orth,
+            edge_route_compose,
             edge_expand,
             edge_gate,
             edge_clip,
@@ -1220,6 +1227,7 @@ fn main() -> std::io::Result<()> {
                 edge_grow_hold,
                 edge_ctx_gain,
                 edge_grow_orth,
+                edge_route_compose,
                 edge_expand,
                 edge_gate,
                 edge_clip,

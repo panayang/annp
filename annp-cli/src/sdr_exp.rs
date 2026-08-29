@@ -1009,6 +1009,8 @@ pub struct SdrConfig {
     pub edge_ctx_gain: f64,
     /// Orthogonalise a new prototype against existing ones.
     pub edge_grow_orth: bool,
+    /// Select each hop's edge from the previous hop's output.
+    pub edge_route_compose: bool,
     /// Share one edge memory across all classes; readout stays per-class.
     pub edge_share: bool,
     /// Add a class-common readout block to the per-class one.
@@ -1280,6 +1282,7 @@ impl ExpertBank {
                     (cfg.edge_grow_hold as f64 * transition).round() as usize
                 },
                 cfg.edge_grow_orth,
+                cfg.edge_route_compose,
                 cfg.edge_ctx_gain,
                 rng,
             );
@@ -3853,6 +3856,7 @@ mod tests {
             edge_expand: 0,
             edge_ctx_gain: 0.0,
             edge_grow_orth: true,
+            edge_route_compose: false,
             edge_share: false,
             edge_share_readout: false,
             edge_posterior: false,
@@ -3948,6 +3952,7 @@ mod tests {
             edge_expand: 0,
             edge_ctx_gain: 0.0,
             edge_grow_orth: true,
+            edge_route_compose: false,
             edge_share: false,
             edge_share_readout: false,
             edge_posterior: false,

@@ -328,10 +328,19 @@ The evaluation itself is unfavourable to the mechanism, and we want that on
 the record. Each run fixes a single gap, and a single gap is best served by
 whichever single time constant happens to match it; a multi-scale context can
 therefore show no advantage under this protocol by construction, because the
-comparison is decided by the evaluation rather than by the code. A mixed-gap
-protocol, cycling horizons within a run, is implemented but not yet run, and
-until it is, these numbers bound the mechanism from below rather than
-characterising it.
+comparison is decided by the evaluation rather than by the code.
+
+Under a mixed-gap protocol that cycles horizons within a run, the sign of the
+effect changes: putting the multi-scale trace into the address is worth
+$+0.67$pp on average against not doing so, where under a single fixed gap the
+same setting bought $+0.40$pp at the long end while costing $0.47$pp at the
+short one. Three seeds and two of three in the favourable direction is far too
+little to establish anything, but it is consistent with the protocol rather than
+the code having decided the earlier comparison. We regard both protocols as
+preliminary: a gap constructed in a synthetic stream fixes what has to be
+carried and for how long, and cannot show what a real dependency structure
+demands. Establishing this needs evaluation on natural language at scale, which
+we have not done.
 
 Whether this is a limit of the mechanism or of this particular probe is not
 settled. Three earlier versions of the same measurement were invalid, each for
@@ -358,9 +367,12 @@ from $3246$ to $9222$, because each fact touches more edges.}
 \end{table}
 
 We do not conclude that depth is unnecessary, and the setup is narrow enough
-that we could not. Multi-hop is the only form of depth this architecture has;
-an earlier version of this comparison was taken while regime separation had
-collapsed; the present one uses a single source, one scale, and a lookup task
+that we could not. Multi-hop is the only form of depth this architecture has,
+and it is depth in the transform rather than in the routing: hop $h+1$
+transforms hop $h$'s output, but every hop selects its edge with the same fixed
+copy of $p_0$, so the sequence of edges a fact visits is settled by its original
+content. An earlier version of this comparison was taken while regime
+separation had collapsed; the present one uses a single source, one scale, and a lookup task
 whose targets are determined entirely by the current fact. A source that
 rewards composition --- where an answer follows from chaining two stored
 relations rather than retrieving one --- is exactly where combinatorial
