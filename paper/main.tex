@@ -458,6 +458,112 @@ The frontier traced by our mechanism and that traced by the monolithic control
 barely overlap in plasticity, so at present only reachability can be compared,
 not position.
 
+\section{Discussion}
+
+\subsection{Why exact context cannot be cheap}
+
+To associate any point in a stream with any other exactly, a system must be
+able to answer for an arbitrary pair, which requires either retaining every
+state and comparing against them --- $O(N)$ memory and $O(N)$ work per query
+--- or precomputing the pairs, $O(N^2)$ in total. Self-attention pays exactly
+this and buys exactness within its window in return
+\citep{vaswani2017attention}. The cost is not an implementation artefact; it is
+what pairwise access costs.
+
+Under constant memory the question changes. Once the stream is longer than what
+the memory can hold distinctly, some pairs must become unanswerable, and the
+design decision is which ones. This is the same shape of decision that
+continual learning already forces on the weights: bounded capacity against an
+unbounded stream means something is given up, and methods differ in what
+\citep{kirkpatrick2017overcoming,rusu2016progressive}. Our mechanism extends
+that choice to the context.
+
+\subsection{A fuzzy background instead of a transcript}
+
+The position we take, and the one we find natural given the biological case, is
+that a learner does not need a transcript of its context. A slowly varying
+state that says \emph{what kind of situation this is} can serve as an anchor
+for retrieval, leaving the identity of individual past items unrecoverable. Our
+context is exactly that: an exponential summary matched against prototypes,
+which conditions retrieval without recording what occurred.
+
+Our measurements track this division cleanly. The mechanism answers ``which
+regime'' well --- regimes separate, and retention exceeds the monolithic
+control by $25$ to $34$ points --- and fails at ``which item occurred'' as soon
+as a cue must survive a gap (\S\ref{sec:longrange}). That is the anchor working
+as an anchor and failing as a record, which is what it is.
+
+We do not claim this is the only division, or the best one. At least four
+alternatives are available and differ in what they keep: sparse retention of a
+few salient items keeps identity and discards time; superposition with
+approximate unbinding keeps many items at graceful degradation
+\citep{plate1995holographic}; outer-product fast weights keep pairs at a
+capacity that scales with $d^2$ \citep{ba2016using,schlag2021linear}; and a
+hybrid in which a fuzzy anchor selects a slice while a small exact buffer
+covers the recent past would give up long-range exactness only. Which of these
+is right is an empirical question we have not settled, and the answer may well
+depend on what the stream is.
+
+\subsection{Where this leaves three familiar problems}
+
+\paragraph{Catastrophic forgetting.}
+Allocation does not solve interference so much as convert it. Where a shared
+representation loses old material as new material overwrites it
+\citep{mccloskey1989catastrophic}, storage that is separated by regime removes
+that channel and substitutes another: retrieval among a growing inventory. The
+substitution appears to be favourable in our measurements --- confusable stored
+targets grow $9.8\times$ while retention falls to $0.70\times$, and the
+distinct predictions made rise rather than collapse --- but it is a
+substitution, not a removal, and the cost reappears as scale.
+
+\paragraph{Lost in the middle.}
+Attention degrades on material by its position in the context
+\citep{liu2024lost}. Content addressing has no position term at all: a fact
+stored early is reached by the same hash as one stored late, so retrieval
+carries no positional decay. What decays instead is regime identification,
+because the context summary is recency-weighted, and what degrades with load is
+retrieval, because the inventory grows. The degradation is therefore moved off
+position and onto inventory and recency, which is a different failure surface
+rather than a smaller one --- a prediction that is testable directly, and that
+we have not tested.
+
+\paragraph{Plasticity and stability.}
+We do not beat the frontier. Our mechanism and the monolithic control barely
+overlap in plasticity: the control saturates near $0.31$ while ours spans
+$0.32$ to $0.92$, so at present the honest statement is about reachability, not
+position. Whether the frontier is extended or merely shifted requires a regime
+where both operate, which we did not construct.
+
+\subsection{Where such a memory might be useful}
+
+The properties that survived suggest applications rather than benchmarks.
+
+\emph{Absorbing new domains after deployment.} Capacity appends without
+disturbing what is stored, allocation needs no task label, and learning is
+single-pass, so a deployed model can take on a new domain without a retraining
+cycle. The exactness of the non-destructiveness matters here more than its
+size: one can state that adding capacity did not change existing behaviour,
+rather than measure that it changed little.
+
+\emph{Targeted deletion.} A regime occupies identifiable slices, so removing
+one is a local operation rather than a retraining problem. This follows from
+the same structure as non-destructive expansion and would be the natural test
+of it; we have not run it, and note only that a monolithic model offers no
+comparable handle.
+
+\emph{Auditable provenance.} Every write's destination is determined by a
+content hash and an inferred regime, both inspectable, so it is possible to say
+which slice serves which material. A learned router offers no equivalent
+account of itself.
+
+\emph{Long-tail material.} Capacity follows emitted content rather than
+vocabulary size, so rare items occupy their own rows instead of being averaged
+into frequent ones --- which is also why we advise against subword
+tokenisation below.
+
+We have tested none of these as applications. They are stated as the uses the
+measured properties would support, not as results.
+
 \section{Architectural variants worth trying}
 
 Each variant below targets a specific measurement in this paper rather than a
