@@ -324,6 +324,15 @@ item}. Placing context into the address recovers roughly a tenth of the gap and
 costs lookup accuracy, consistent with content-only addressing being what
 forbids association in the first place.
 
+The evaluation itself is unfavourable to the mechanism, and we want that on
+the record. Each run fixes a single gap, and a single gap is best served by
+whichever single time constant happens to match it; a multi-scale context can
+therefore show no advantage under this protocol by construction, because the
+comparison is decided by the evaluation rather than by the code. A mixed-gap
+protocol, cycling horizons within a run, is implemented but not yet run, and
+until it is, these numbers bound the mechanism from below rather than
+characterising it.
+
 Whether this is a limit of the mechanism or of this particular probe is not
 settled. Three earlier versions of the same measurement were invalid, each for
 a different reason, and the fourth is the one reported here; placing context
@@ -348,11 +357,15 @@ under-training explanation is excluded: writes per edge \emph{rise} with hops,
 from $3246$ to $9222$, because each fact touches more edges.}
 \end{table}
 
-We do not conclude that depth is unnecessary. Multi-hop is the only form of
-depth this architecture has, an earlier version of this comparison was taken
-while regime separation had collapsed, and the present one is on a single
-source at one scale. Whether combinatorial addressing pays under a source that
-rewards composition is untested.
+We do not conclude that depth is unnecessary, and the setup is narrow enough
+that we could not. Multi-hop is the only form of depth this architecture has;
+an earlier version of this comparison was taken while regime separation had
+collapsed; the present one uses a single source, one scale, and a lookup task
+whose targets are determined entirely by the current fact. A source that
+rewards composition --- where an answer follows from chaining two stored
+relations rather than retrieving one --- is exactly where combinatorial
+addressing would be expected to pay, and we have not built one. What the table
+shows is that paths cost accuracy when nothing requires a path.
 
 \paragraph{Why does retention decline as regimes accumulate?}
 \label{sec:scale}
@@ -385,6 +398,16 @@ retrieval account as the surviving candidate rather than as the finding.
 
 
 
+\paragraph{Does directed forgetting reclaim anything?}
+We cannot say. Every measurement we made of it is confounded. The earlier ones
+ran while a per-domain snapshot keyed by ground truth was reaching the training
+path, and the later one, which added capacity pressure so that a freed slice
+would be worth something, ran while the allocation criterion was collapsing
+every regime into a single class --- so there were no separate slices to
+reclaim in the first place. We report no number for it, and note only that a
+valid test requires contention between regimes for storage \emph{and} a working
+allocator, which we did not have simultaneously.
+
 \paragraph{Does acquiring a regime become cheaper as regimes accumulate?}
 Later regimes do cost less per unit accuracy in our runs, but our measurement
 staggers arrival, and arrival order is itself sufficient to produce the effect:
@@ -411,6 +434,70 @@ cannot.
 The frontier traced by our mechanism and that traced by the monolithic control
 barely overlap in plasticity, so at present only reachability can be compared,
 not position.
+
+\section{Architectural variants worth trying}
+
+Each variant below targets a specific measurement in this paper rather than a
+general intuition.
+
+\paragraph{Bound scoring to the emitted rows.}
+Inference scores all $V$ rows of the live readout slice, while a class holds
+$39$--$41$ occupied rows against a vocabulary of $32768$. Restricting the
+argmax to rows the class has emitted, with the remainder contributing a
+constant, would cut inference cost by nearly three orders of magnitude and
+would make the activation figure of \S\ref{sec:cost} sparse in both halves
+rather than only in the expert half. Nothing about the mechanism resists this;
+it is unimplemented, not difficult.
+
+\paragraph{Address hierarchically to bound the candidate set.}
+The decline with scale tracks the number of confusable stored items rather than
+capacity, misrouting or separation (\S\ref{sec:open}). If that account is
+right, the fix is not more capacity but a smaller candidate set at retrieval:
+a coarse regime code selecting a slice, then a within-slice code over that
+regime's own targets, so that discrimination is against tens of alternatives
+rather than thousands. This predicts that the exponent $\alpha$ should fall
+with the depth of the addressing hierarchy, which is directly testable.
+
+\paragraph{Add a term that stores pairs.}
+A smoothed context can report which regime is active and cannot report which
+item occurred, so no amount of extra timescales will support association across
+a gap. An outer-product term, $M \leftarrow \lambda M + p_t \otimes p_{t-\Delta}$
+retrieved as $Mp$, stores pairs recoverably at a capacity that scales with
+$d^2$ \citep{ba2016using,schlag2021linear}, and is the same algebraic object as
+the edge transform already present. The open question is whether it can sit
+alongside content addressing without dissolving the stability that content
+addressing provides.
+
+\paragraph{Give the router a learned residual.}
+The fixed random hash buys routing consistency of $1.000$ and forgoes load
+balancing and learned specialisation. A learned correction added to the key,
+small enough that a fact's destination remains stable within a regime, would
+recover part of what a gated mixture of experts gets from its router
+\citep{shazeer2017outrageously} without giving up the property that makes
+expansion non-destructive.
+
+\paragraph{Compose across stages rather than re-walking.}
+Multi-hop currently re-applies the same content key at each hop, which is why
+paths cost accuracy on a task where no answer requires a path. A second stage
+addressed on the \emph{output} of the first would compose rather than repeat,
+and would need a source where an answer follows from chaining two stored
+relations. Both the variant and the source are absent here.
+
+\paragraph{A note on tokenisation.}
+We recommend against subword tokenisation for this architecture. Byte-pair
+encoding is designed to flatten the frequency distribution, and this mechanism
+depends on that distribution in two places: allocation splits a class when its
+similarity dispersion rises, which requires regimes to differ in what they
+emit, and capacity follows the count of distinct emitted targets, which
+requires a target to be a unit rather than a sequence. A rare entity split into
+several frequent subwords loses its identity twice over --- its payload becomes
+a sum of common pieces, which collides in the content hash with every other
+entity sharing those pieces, and its target becomes a sequence with no single
+row to occupy. The long tail is exactly where a continual learner has something
+to gain, and subword vocabularies are built to spend it. A word- or
+entity-level vocabulary, or any tokenisation that keeps rare units intact,
+preserves both the Zipf structure the allocator reads and the one-target-one-row
+correspondence the capacity argument relies on.
 
 \section{Limitations}
 
