@@ -5,6 +5,11 @@
 \usepackage{booktabs}
 \usepackage{graphicx}
 \usepackage{microtype}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.16}
+\usepackage{subcaption}
 \usepackage[hidelinks]{hyperref}
 \usepackage{natbib}
 \bibliographystyle{plainnat}
@@ -140,64 +145,266 @@ we quantify the crossover in \S\ref{sec:cost}.
 
 \paragraph{Vocabulary growth.}
 That distinct types grow sublinearly in a Zipf-distributed stream is Heaps' law
-\citep{heaps1978information}; we use it to ask whether allocated capacity tracks
-content, and report that in our generator it does not, for reasons traced to the
-generator itself (\S\ref{sec:scale}).
+\citep{heaps1978information}. We use it to ask whether allocated capacity
+tracks content, and find that our generator does not reproduce the sublinear
+regime, which makes it an unfavourable source for the question
+(\S\ref{sec:capacity}).
 
 \section{Method}
 \label{sec:method}
 
-A fact is a pair $(e,r)$ with target $t$. Token embeddings are fixed random unit
-vectors and are never learned. The payload is
-\begin{equation}
-  p_0 \;=\; \mathrm{normalise}\big(\mathrm{emb}[e] + \mathrm{emb}[r]\big).
-\end{equation}
+\subsection{Notation}
+
+Let $\mathcal{V}$ be the vocabulary, $V=|\mathcal{V}|$, and $d$ the code width.
+The embedding table $\mathrm{E}\in\mathbb{R}^{V\times d}$ has rows drawn
+independently and uniformly from the unit sphere $S^{d-1}$ at construction and
+is \emph{never} updated; $\mathrm{E}_x$ denotes the row of token $x$. Write
+$\nu(x)=x/\lVert x\rVert_2$ for $\ell_2$ normalisation and $\delta_t$ for the
+indicator vector of token $t$.
+
+Storage lives on a small-world ring $G=(\mathcal{N},\mathcal{E})$ with
+$|\mathcal{N}|=n$ nodes: node $u$ has out-neighbours consisting of its two ring
+neighbours plus a fixed number of random shortcuts, giving out-degree $D_u$ and
+$|\mathcal{E}|=M=\sum_u D_u$ directed edges. Every edge $a\in\mathcal{E}$
+carries two objects: a \emph{key} $\kappa_a\in\mathbb{R}^d$, drawn once at
+construction and never updated, and, for each regime class $c$, a learned
+matrix $W^{(c)}_a\in\mathbb{R}^{d\times d}$. Each class $c$ additionally owns a
+readout $R^{(c)}\in\mathbb{R}^{V\times d}$ and a prototype
+$\pi_c\in S^{d-1}$. The number of live classes $C$ is not fixed in advance; it
+grows (\S\ref{sec:allocation}).
+
+A fact is a triple $(e,r,t)\in\mathcal{V}^3$: entity, relation, target. The
+stream is a sequence of tokens $x_1,x_2,\dots$ from which facts are read off,
+seen once each in the order they arrive.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  box/.style={draw, rounded corners=2pt, minimum height=7mm, inner xsep=4pt, align=center},
+  fix/.style={box, fill=black!5},
+  lrn/.style={box, very thick},
+  ar/.style={-{Latex[length=2mm]}, thick},
+  addr/.style={-{Latex[length=2mm]}, thick, dashed},
+  lbl/.style={font=\scriptsize},
+]
+% ---------- legend ----------
+\draw[ar]   (-1.0,2.75) -- (-0.3,2.75);
+\node[lbl,anchor=west] at (-0.25,2.75) {value path (trained)};
+\draw[addr] (-1.0,2.25) -- (-0.3,2.25);
+\node[lbl,anchor=west] at (-0.25,2.25) {address (never trained)};
+
+% ---------- value path ----------
+\node[fix] (er)  at (0,0)    {$(e,r)$};
+\node[fix] (p0)  at (2.4,0)  {$p_0=\nu(\mathrm{E}_e{+}\mathrm{E}_r)$};
+\node[lrn] (w)   at (6.6,0)  {$p\leftarrow\nu\big(p+\tanh(W^{(\gamma)}_{a_h}p)\big)$\\[-2pt]
+                              \textit{\scriptsize $H$ hops}};
+\node[lrn] (rd)  at (10.7,0) {$z=R^{(\gamma)}p_H$};
+\node[fix] (out) at (13.1,0) {$\arg\max$};
+\draw[ar] (er) -- (p0);
+\draw[ar] (p0) -- (w);
+\draw[ar] (w)  -- node[lbl,above]{$p_H$} (rd);
+\draw[ar] (rd) -- (out);
+
+% ---------- factor 1: content selects the edge ----------
+\node[fix] (ring) at (6.6,2.3) {fixed keys $\kappa_a$,\ \ $a_h=\arg\max_a\langle\kappa_a,q\rangle$};
+\draw[addr] (p0.north) -- ++(0,1.35) -| (ring.west);
+\draw[addr] (ring) -- node[lbl,right]{selects edge $a_h$} (w);
+
+% ---------- factor 2: inferred regime selects the slice ----------
+\node[fix] (str) at (0,-2.4)   {stream $x_t$};
+\node[fix] (ctx) at (2.9,-2.4) {$c_t\!=\!(1{-}\rho)c_{t-1}{+}\rho\,\mathrm{E}_{x_t}$};
+\node[fix] (pro) at (8.0,-2.4) {prototypes $\pi_j$,\ \ $\gamma=\arg\max_j\langle\pi_j,c_t\rangle$};
+\draw[ar] (str) -- (ctx);
+\draw[ar] (ctx) -- (pro);
+\draw[addr] (pro.north -| w.south) -- node[lbl,right]{$\gamma$ selects edge slice} (w.south);
+\draw[addr] (pro.east) -| node[lbl,pos=0.72,right]{$\gamma$ selects readout slice} (rd.south);
+
+% ---------- allocation ----------
+\node[fix] (grow) at (8.0,-4.3) {\,append $\pi_{C+1}=\nu(c_t)$,\ $C\!\leftarrow\!C{+}1$\,};
+\draw[ar] ($(pro.south)-(1.7,0)$) -- node[lbl,left]{$\sigma_\gamma/|\mu_\gamma|>\theta$}
+          ($(grow.north)-(1.7,0)$);
+\draw[ar] ($(grow.north)+(1.7,0)$) -- node[lbl,right]{existing slices untouched}
+          ($(pro.south)+(1.7,0)$);
+\end{tikzpicture}
+\caption{The mechanism. Two addressing factors, neither of them learned, decide
+\emph{where} an observation is stored; the two heavy-outlined blocks are the
+only ones holding trained parameters. Content selects the edge, so a fact
+reaches the same transform under every history (\S\ref{sec:addressing}); the
+regime inferred from the stream selects the readout slice, and the edge slice
+too unless the transform is shared, so facts that disagree across regimes never
+share a row. Capacity is appended when a class's own similarity distribution
+disperses, which by \S\ref{sec:exact} leaves every existing offset and value
+untouched.}
+\label{fig:mech}
+\end{figure}
 
 \subsection{Two addressing factors}
+\label{sec:addressing}
 
 \paragraph{Content to edge.}
-Nodes of a small-world ring hold fixed random keys $k_{n,s}$. The walk selects
-$s^\ast=\arg\max_s \langle k_{n,s}, p_0\rangle$ for $H$ hops. Nothing in this
-path is learned, so a fact reaches the same edge under every history and routing
-consistency is $1.000$ by construction.
+The payload and the address are computed from the same tokens but kept
+separate, so that the transform and readout always act on content:
+\begin{equation}
+  p_0 \;=\; \nu\!\left(\mathrm{E}_e + \mathrm{E}_r\right),
+  \qquad
+  q \;=\; \nu\!\left(p_0 + \tfrac{g}{\sqrt{m}}\, P\,\xi_t\right),
+  \label{eq:payload}
+\end{equation}
+where $\xi_t\in\mathbb{R}^m$ is a concatenation of context traces at several
+timescales, $P$ a fixed random projection and $g$ a gain. The main
+configuration uses $g=0$, in which case $q=p_0$ and the address depends on the
+fact alone; $g>0$ is the variant of \S\ref{sec:longrange}. Entry and each hop
+are argmaxes over fixed keys,
+\begin{equation}
+  u_0 \;=\; \arg\max_{u\in\mathcal{N}}\ \langle \kappa_{(u,1)},\, q\rangle,
+  \qquad
+  a_h \;=\; \arg\max_{a\in\mathrm{out}(u_h)}\ \langle \kappa_a,\, q\rangle,
+  \qquad
+  u_{h+1} \;=\; \mathrm{head}(a_h),
+  \label{eq:route}
+\end{equation}
+for $h=0,\dots,H-1$. Since $\kappa$ is fixed and, at $g=0$, $q$ is a
+deterministic function of $(e,r)$, the walked path $(a_0,\dots,a_{H-1})$ is a
+deterministic function of the fact. Two consequences follow without
+measurement: routing consistency --- the fraction of probed facts that return
+to the edges their writes went to --- is exactly $1$, and no amount of
+subsequent learning can move a stored fact's address. We report $1.000$ in the
+tables as a check on the implementation, not as a result.
 
 \paragraph{Regime to readout.}
-A slow exponential average $c$ of stream tokens is matched against prototypes,
-$\gamma = \arg\max_j \langle \pi_j, c\rangle$, selecting a readout slice. No task
-identifier is used anywhere; the mechanism is never told which regime is live.
-
-\subsection{Memory}
-
-The edge transform is shared across regimes and applied residually,
+A single-timescale exponential average of the stream, with rate $\rho$, is
+matched against the prototypes:
 \begin{equation}
-  p \;\leftarrow\; \mathrm{normalise}\big(p + \tanh(E_{\text{edge}}\, p)\big),
+  c_t \;=\; c_{t-1} + \rho\left(\mathrm{E}_{x_t} - c_{t-1}\right),
+  \qquad
+  \gamma_t \;=\; \arg\max_{j\le C}\ \big\langle \pi_j,\, c_t \big\rangle .
+  \label{eq:regime}
 \end{equation}
-while the readout $R_\gamma$ is private per regime and produces logits
-$R_\gamma\, p_H$. The split follows the generative structure rather than
-preference: a payload is built from entity and relation, which are common across
-regimes, whereas targets are exactly what regimes disagree about. Section
-\ref{sec:sharing} confirms this from both directions.
+No task identifier enters anywhere: $\gamma$ is inferred from the stream, and
+the mechanism is never told which regime is live, nor when one ends. The
+prototypes receive no gradient; they are \emph{placed} (\S\ref{sec:allocation}),
+not trained.
+
+\subsection{Memory and forward pass}
+
+The value path applies the selected edge transform residually,
+\begin{equation}
+  p_{h+1} \;=\; \nu\!\Big(p_h + \tanh\!\big(W^{(\gamma)}_{a_h}\, p_h\big)\Big),
+  \qquad h = 0,\dots,H-1,
+  \label{eq:hop}
+\end{equation}
+with $\tanh$ elementwise, and the class readout produces logits
+$z = R^{(\gamma)} p_H \in \mathbb{R}^{V}$, $\hat y = \mathrm{softmax}(z)$.
+
+The split between what is shared and what is private follows the generative
+structure rather than preference. A payload is built from an entity and a
+relation, which are common across regimes, so $W$ can be shared
+($W^{(\gamma)}\equiv W$); targets are exactly what regimes disagree about, so
+$R^{(\gamma)}$ must not be. Section \ref{sec:sharing} confirms this from both
+directions --- by sharing the transform and by sharing the readout.
 
 \subsection{Learning}
 
-Training is online, single-pass and prequential: predict, take the loss, then
-write. There is no replay buffer, no task boundary and no second pass. The
-readout takes a delta-rule step on the target row together with negatives
-sampled from targets that regime has already emitted; gradients propagate back
-along the walked path into the shared transform. Routers receive no gradient.
+Training is online, single-pass and prequential: for each fact the model
+predicts, is charged the loss, and only then writes. There is no replay buffer,
+no task boundary, no epoch and no second pass.
+
+The readout takes a delta-rule step restricted to a \emph{touched set}
+\begin{equation}
+  T \;=\; \{t\} \cup S,
+  \qquad
+  S \sim \mathrm{Unif}^{k}\big(\mathcal{T}_\gamma\big),
+  \qquad
+  R^{(\gamma)}_v \;\mathrel{+}=\; \eta\big(\mathbb{1}[v{=}t] - \hat y_v\big)\, p_H^{\top}
+  \quad \text{for } v \in T,
+  \label{eq:delta}
+\end{equation}
+where $\mathcal{T}_\gamma$ is the set of targets class $\gamma$ has already
+emitted and $k$ the number of sampled negatives ($k=0$ recovers the dense
+update over all $V$ rows). Rows outside $T$ are left \emph{exactly} zero rather
+than nearly zero, which is what makes occupied capacity a measure of stored
+content (\S\ref{sec:capacity}).
+
+The error is then backpropagated along the path that was actually walked, and
+along no other. With $\nabla_{p_H}L = (R^{(\gamma)})^{\top}(\hat y - \delta_t)$,
+each hop is differentiated exactly through the normalisation and the residual
+$\tanh$ block of \eqref{eq:hop}: writing $b_h = W^{(\gamma)}_{a_h}p_h$,
+$u_h = p_h + \tanh(b_h)$ and $\lambda_h = \lVert u_h\rVert$,
+\begin{equation}
+  \nabla_{u_h} L \;=\; \frac{1}{\lambda_h}\Big(I - p_{h+1}p_{h+1}^{\top}\Big)\nabla_{p_{h+1}} L,
+  \qquad
+  \nabla_{b_h} L \;=\; \big(1 - \tanh^2(b_h)\big)\odot \nabla_{u_h} L,
+  \label{eq:back}
+\end{equation}
+\begin{equation}
+  W^{(\gamma)}_{a_h} \;\mathrel{-}=\; \eta\, \nabla_{b_h}L\; p_h^{\top},
+  \qquad
+  \nabla_{p_h} L \;=\; \nabla_{u_h} L + \big(W^{(\gamma)}_{a_h}\big)^{\top} \nabla_{b_h} L .
+  \label{eq:backw}
+\end{equation}
+The gradient reaches neither the keys $\kappa$, nor the prototypes $\pi$, nor
+the embedding table: every quantity that decides \emph{where} an observation
+goes is outside the computational graph. Decay is applied lazily, by carrying a
+per-slice scale and materialising a slice only when it is touched; this is
+algebraically exact, not an approximation, and about $30\times$ faster than
+decaying every weight at every step.
 
 \subsection{Allocation}
 \label{sec:allocation}
 
-A class is split when the dispersion of its own similarity distribution,
-$\sigma_\gamma/|\mu_\gamma|$, exceeds a threshold, and the new prototype is
-placed at the current context. Dispersion is used rather than an outlier test
-because outlier tests fail in two ways we measured: against a global running
-distribution they fail once regimes are numerous, since the distribution becomes
-their mixture; against a class's own distribution they fail because a class
-absorbing more regimes raises its own variance, so the threshold rises exactly
-when splitting becomes necessary. Allocation appends, leaving existing slices at
-their offsets and values.
+Let $\mathrm{sim}_t = \max_j\langle\pi_j,c_t\rangle$ and let $\mu_\gamma$,
+$\sigma^2_\gamma$ be running estimates of its mean and variance conditioned on
+the class $\gamma$ that won. A class is split when its own similarity
+distribution is too dispersed for $\tau$ consecutive steps,
+\begin{equation}
+  \frac{\sigma_\gamma}{\max(|\mu_\gamma|,\epsilon)} \;>\; \theta,
+  \qquad\text{whereupon}\qquad
+  \pi_{C+1} \leftarrow \nu(c_t), \quad C \leftarrow C+1 .
+  \label{eq:grow}
+\end{equation}
+Dispersion is used rather than an outlier test because outlier tests fail in
+two ways we measured. Against a \emph{global} running distribution of
+$\mathrm{sim}$ they fail once regimes are numerous, since that distribution
+becomes their mixture and nothing is unusual relative to it: $8$, $32$, $64$
+and $128$ regimes all collapsed onto one class. Against a class's \emph{own}
+distribution an outlier test fails too, because a class absorbing more regimes
+raises its own variance, so a threshold of the form $\mu_\gamma - \theta
+\sigma_\gamma$ falls exactly when splitting becomes more necessary. Dispersion
+is scale-free in both senses: a class serving one regime has tightly clustered
+similarities whatever the value of $C$.
+
+The new prototype is placed \emph{at} the current context direction. Placing it
+on the residual orthogonal to the existing prototypes --- which an earlier
+version did --- fails for a geometric reason: in high dimension the orthogonal
+residual is nearly orthogonal to the data as well, so the new prototype wins no
+argmax at all. Measured that way, $28$ classes were allocated and all $16$
+regimes still routed to one.
+
+\subsection{Expansion is exact}
+\label{sec:exact}
+
+Both $R$ and $W$ are stored class-major, so class $c$ occupies a contiguous
+block at offset $c\cdot Vd$ (respectively $c\cdot Md^2$). Appending class $C+1$
+therefore changes no offset of any class $j\le C$ and writes no byte inside
+one. Consequently, for any input whose inferred regime satisfies $\gamma\le C$,
+the logits $z=R^{(\gamma)}p_H$ are \emph{bit}-identical before and after
+expansion, since the arithmetic performed is the same on the same operands in
+the same order. This is a property of the layout, and we assert it as a unit
+test on weights and logits rather than estimating it statistically.
+
+\subsection{Cost}
+\label{sec:costmodel}
+
+Per observed token, addressing costs $O\!\left((n + H\bar{D})d\right)$ for the
+argmaxes of \eqref{eq:route} and $O(Cd)$ for \eqref{eq:regime}; the memory
+costs $O(Hd^2)$ for \eqref{eq:hop}; the readout costs $O(Vd)$ to score and
+$O(|T|d)$ to write. None of these depends on how many tokens preceded, which is
+the property of interest: dot-product attention over a context of $N$ tokens
+costs $O(Nd)$ per token for the same function, and the two cross at $N=d$. At
+the configuration used here ($n=16$, $d=32$, $H=1$, $V=4096$) the readout term
+dominates the total, and it is the one that \S\ref{sec:variants} proposes to
+make sparse.
 
 \section{Experimental setup}
 
@@ -219,27 +426,88 @@ results table header and reads the column by name.
 \subsection{Where regimes are distinguishable}
 \label{sec:modea}
 
-\begin{table}[h]
+\begin{figure}[h]
 \centering
-\begin{tabular}{lccc}
-\toprule
-regimes & this work & monolithic & advantage \\
-\midrule
-$8$ & $\mathbf{49.53\%}$ & $15.10\%$ & $+34.43$pp \\
-$16$ & $\mathbf{43.07\%}$ & $12.03\%$ & $+31.04$pp \\
-$32$ & $\mathbf{37.65\%}$ & $12.20\%$ & $+25.45$pp \\
-\bottomrule
-\end{tabular}
-\caption{Mode A; three seeds at eight and sixteen regimes, one at thirty-two.
-The monolithic control sits at the level of a linear baseline without sparse
-coding ($15.30\%$), so the task is not solvable by predicting frequent targets.
-The advantage narrows as regimes accumulate but does not close. We did not
-obtain a monolithic baseline at sixty-four regimes; a single cell costs about
-nine hours here, and the run was lost.}
-\end{table}
+\begin{tikzpicture}
+\begin{axis}[
+  width=9.2cm, height=5.6cm,
+  xmode=log, log basis x=2, xtick={8,16,32,64}, xticklabels={8,16,32,64},
+  xlabel={regimes in the stream}, ylabel={zero-shot retention (\%)},
+  ymin=0, ymax=68, xmin=6.5, xmax=78,
+  ytick={0,20,40,60},
+  grid=major, grid style={black!12},
+  legend cell align=left,
+  legend style={font=\small, draw=black!30, at={(0.98,0.98)}, anchor=north east},
+  tick label style={font=\small}, label style={font=\small},
+]
+\addplot[thick, mark=*, mark size=2pt, error bars/.cd, y dir=both, y explicit]
+  coordinates {(8,49.53) +- (0,2.98) (16,43.07) +- (0,1.31)
+               (32,37.65) +- (0,0.78) (64,34.80) +- (0,0.28)};
+\addlegendentry{this work}
+\addplot[thick, densely dashed, mark=square, mark size=2pt,
+         error bars/.cd, y dir=both, y explicit]
+  coordinates {(8,15.10) +- (0,0.75) (16,12.03) +- (0,1.46) (32,12.20) +- (0,0)};
+\addlegendentry{monolithic control}
+\addplot[dotted, thick, domain=6.5:78, samples=2, forget plot] {15.30};
+\node[anchor=west, font=\scriptsize] at (axis cs:34,17.6) {linear baseline};
+\end{axis}
+\end{tikzpicture}
+\caption{Mode A. Bars are one standard deviation across seeds ($n=3$ at eight
+and sixteen, $n=2$ at thirty-two and sixty-four for this work; $n=3$, $3$, $1$
+for the control). The control sits at the level of a linear baseline without
+sparse coding, so the task is not solvable by predicting frequent targets. The
+sixty-four-regime control was not obtained: a single cell costs about nine
+hours here and the run was lost.}
+\label{fig:scale}
+\end{figure}
+
+Where a regime is identifiable from its own inputs, allocation retains
+$49.53\%$, $43.07\%$ and $37.65\%$ of probed facts at eight, sixteen and
+thirty-two regimes, against $15.10\%$, $12.03\%$ and $12.20\%$ for a monolithic
+sparse-coded control of the same width: advantages of $+34.43$, $+31.04$ and
+$+25.45$ points (Figure~\ref{fig:scale}). The advantage narrows as regimes
+accumulate but does not close over the range we could measure. Both series
+decline, and \S\ref{sec:scale} asks why ours does.
 
 \subsection{Sharing the transform, privatising the readout}
 \label{sec:sharing}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=9.2cm, height=5.4cm,
+  xlabel={seed}, ylabel={zero-shot retention (\%)},
+  xtick={1,2,3,4,5,6}, xmin=0.5, xmax=6.5, ymin=0, ymax=46,
+  grid=major, grid style={black!12},
+  legend style={font=\small, draw=black!30, at={(1.02,1)}, anchor=north west},
+  legend cell align=left,
+  tick label style={font=\small}, label style={font=\small},
+]
+\addplot[thick, mark=*, mark size=2pt, only marks]
+  coordinates {(1,25.3)(2,34.5)(3,40.6)(4,26.7)(5,11.0)(6,38.4)};
+\addlegendentry{shared transform}
+\addplot[thick, mark=square, mark size=2pt, only marks]
+  coordinates {(1,12.4)(2,13.1)(3,20.3)(4,10.2)(5,2.1)(6,19.8)};
+\addlegendentry{fully private}
+\addplot[thick, mark=triangle, mark size=2.6pt, only marks]
+  coordinates {(1,19.4)(2,23.3)(3,20.2)(4,19.9)(5,21.5)(6,23.4)};
+\addlegendentry{monolithic}
+\addplot[gray, forget plot] coordinates {(1,25.3)(1,12.4)};
+\addplot[gray, forget plot] coordinates {(2,34.5)(2,13.1)};
+\addplot[gray, forget plot] coordinates {(3,40.6)(3,20.3)};
+\addplot[gray, forget plot] coordinates {(4,26.7)(4,10.2)};
+\addplot[gray, forget plot] coordinates {(5,11.0)(5,2.1)};
+\addplot[gray, forget plot] coordinates {(6,38.4)(6,19.8)};
+\end{axis}
+\end{tikzpicture}
+\caption{Mode B, twelve regimes, per seed. Absolute retention varies by a
+factor of nearly four across seeds ($11.0$ to $40.6$), which is why the paired
+comparison is the one that carries weight: the vertical connectors are all the
+same sign, $+8.9$ to $+21.4$ points, $6/6$. Against the monolithic control the
+same comparison is $5/6$ and not established.}
+\label{fig:share}
+\end{figure}
 
 \begin{table}[h]
 \centering
@@ -279,6 +547,20 @@ Sampled from emitted targets & $5918/45056$ ($\mathbf{13.1\%}$) & $\mathbf{538}$
 \caption{A $7.6\times$ reduction in occupied capacity at no cost in accuracy.}
 \end{table}
 
+One qualification belongs with this result rather than in the limitations. The
+quantity capacity is supposed to follow is the union of distinct emitted
+targets, and Heaps' law predicts that union to grow sublinearly in a
+Zipf-distributed stream \citep{heaps1978information}. Our generator does not
+produce that: the union measured at eight, sixteen, thirty-two and sixty-four
+regimes is $273$, $534$, $1066$ and $2111$ distinct targets, or $34.2$, $33.4$,
+$33.3$ and $33.0$ per regime --- flat, so the union grows \emph{linearly} in
+regimes. Each regime samples its own entity and target pool, so there is little
+shared vocabulary to amortise, and the sublinear growth that makes allocation
+attractive on natural text is absent by construction. The reading this permits
+is the narrow one: occupancy tracks emitted content rather than vocabulary
+size. Whether that translates into sublinear capacity growth requires a source
+with Heaps' law structure, which ours is not.
+
 \subsection{Expansion does not disturb what is stored}
 \label{sec:expansion}
 
@@ -291,11 +573,53 @@ stored code was written.
 \subsection{Cost per token is independent of context length}
 \label{sec:cost}
 
-Context access costs $H d^2$ per token regardless of sequence length, against
-$Nd$ for attention; the crossover is at $N=d$ and the ratio is $128\times$ at
-$N=4096$. Against ourselves: overall activation is $6.178\%$ of memory
-parameters, of which the edge memory contributes $1024$ and the remainder is the
-readout scoring all $V$ rows. Sparsity currently holds for the expert part only.
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=9.6cm, height=5.4cm, xmode=log, ymode=log, log basis x=2,
+  xlabel={context length $N$ (tokens)},
+  ylabel={multiply--accumulates per token},
+  xmin=8, xmax=8192, ymin=200, ymax=20000000,
+  xtick={8,32,128,512,2048,8192}, xticklabels={8,32,128,512,2048,8192},
+  grid=major, grid style={black!12},
+  legend style={font=\scriptsize, draw=black!30, at={(0.5,-0.26)}, anchor=north},
+  legend columns=3, legend cell align=left,
+  tick label style={font=\small}, label style={font=\small},
+]
+\addplot[thick, domain=8:8192, samples=2] {32*x};
+\addlegendentry{attention over the context, $Nd$}
+\addplot[thick, densely dashed, domain=8:8192, samples=2] {1024};
+\addlegendentry{this work, memory access $Hd^2$}
+\addplot[thick, dotted, domain=8:8192, samples=2] {1048576};
+\addlegendentry{this work, readout scoring $Vd$}
+\addplot[only marks, mark=*, mark size=2pt, forget plot] coordinates {(32,1024)};
+\node[anchor=north west, font=\scriptsize] at (axis cs:36,1024) {crossover $N=d=32$};
+\end{axis}
+\end{tikzpicture}
+\caption{Per-token cost at the configuration behind \S\ref{sec:modea}
+($d=32$, $H=1$, $V=32768$). The memory access is flat in $N$ and crosses
+attention at $N=d$; at $N=4096$ the ratio is $128\times$. The qualification is
+the dotted line: the readout scores all $V$ rows, so it exceeds the memory
+access by a factor of $1024$ and dominates the total. It too is flat in $N$ ---
+the cost is constant in context length, but the constant is set by the dense
+half. Making it follow occupancy instead is the first variant of
+\S\ref{sec:variants}: a class holds $39$--$41$ occupied rows of the $32768$
+scored.}
+\label{fig:cost}
+\end{figure}
+
+Memory access costs $Hd^2$ per token regardless of sequence length, against
+$Nd$ per token for dot-product attention over a context of $N$ tokens; the
+crossover is at $N=d$ and the ratio is $128\times$ at $N=4096$
+(Figure~\ref{fig:cost}). Against ourselves the reading is less flattering. In
+the runs behind \S\ref{sec:modea}, activation is $1{,}049{,}600$ of
+$269{,}547{,}520$ memory parameters per token, or $0.389\%$; but of that
+activation the edge memory accounts for $1{,}024$ and the readout, scoring all
+$V=32768$ rows, for $1{,}048{,}576$. The expert half is sparse and the readout
+half is not, and the half that is not is a thousand times the larger. What is
+constant in context length is the total; what sets that constant is the dense
+half.
 
 \section{Open questions}
 \label{sec:open}
@@ -323,8 +647,13 @@ $64$ & $0.526$ & $8.40\%$ \\
 $256$ & $0.076$ & $6.83\%$ \\
 \bottomrule
 \end{tabular}
-\caption{Paired degradation $+3.27$pp, 5/6 seeds, $p=0.013$. The location of
-the cliff was predicted from the context rate before the run.}
+\caption{Cue remaining is $(1-\rho)^{\text{gap}}$ at the context rate used.
+Paired degradation from gap $1$ to gap $256$ is $+3.27$pp, 5/6 seeds,
+$t(5)=3.81$, $p=0.013$. The location of the cliff was predicted from the
+context rate before the run. Seeds 1--3 and 4--6 were run on different machines
+at the same configuration and differ substantially in level ($5.1$--$9.0$
+against $9.4$--$15.9$ at gap $1$), which is why the comparison is paired within
+seed and the column means should not be read as a level.}
 \end{table}
 
 Exact association under constant memory is information-theoretically
@@ -341,12 +670,17 @@ therefore show no advantage under this protocol by construction, because the
 comparison is decided by the evaluation rather than by the code.
 
 Under a mixed-gap protocol that cycles horizons within a run, the sign of the
-effect changes: putting the multi-scale trace into the address is worth
-$+0.67$pp on average against not doing so, where under a single fixed gap the
-same setting bought $+0.40$pp at the long end while costing $0.47$pp at the
-short one. Three seeds and two of three in the favourable direction is far too
-little to establish anything, but it is consistent with the protocol rather than
-the code having decided the earlier comparison. We regard both protocols as
+effect changes: the strongest context gain we tried is worth $+0.67$pp on
+average against no context in the address ($44.47\%\to45.13\%$, two seeds of
+three in the favourable direction), where under a single fixed gap the same
+setting bought $+0.40$pp at the long end while costing $0.47$pp at the short
+one. We report this as a sign change and nothing more, and three facts about it
+should be read alongside. The intermediate gain was \emph{negative}
+($43.00\%$), so the response is not monotone in the amount of context; the
+spread across seeds, $37.0$ to $52.4$ per cent, is an order of magnitude larger
+than the effect; and three seeds cannot establish a difference of this size.
+What it is consistent with is the protocol rather than the code having decided
+the earlier comparison. We regard both protocols as
 preliminary: a gap constructed in a synthetic stream fixes what has to be
 carried and for how long, and cannot show what a real dependency structure
 demands. Establishing this needs evaluation on natural language at scale, which
@@ -362,18 +696,21 @@ addressing scheme rather than the context code may be the binding constraint.
 
 \begin{table}[h]
 \centering
-\begin{tabular}{ccc}
+\begin{tabular}{cccc}
 \toprule
-hops & zero-shot & occupied rows \\
+hops & seeds & zero-shot & occupied rows \\
 \midrule
-$1$ & $\mathbf{55.15\%}$ & $750$ \\
-$2$ & $46.00\%$ & $737$ \\
-$3$ & $29.63\%$ & $750$ \\
+$1$ & $2$ & $\mathbf{55.15\%}$ & $750$ \\
+$2$ & $1$ & $46.00\%$ & $737$ \\
+$3$ & $3$ & $29.63\%$ & $744$ \\
 \bottomrule
 \end{tabular}
-\caption{Identical occupancy, monotonically worse retention. The
-under-training explanation is excluded: writes per edge \emph{rise} with hops,
-from $3246$ to $9222$, because each fact touches more edges.}
+\caption{Occupancy is the same to within $2\%$ while retention falls by half.
+The seed counts are unequal and small, and the two-hop cell is a single run; on
+the two seeds all three depths share, the ordering is the same ($54.2$, $56.1$
+at one hop against $31.2$, $25.8$ at three). The under-training explanation is
+excluded: writes per edge \emph{rise} with hops, from $3246$ to $9222$, because
+each fact touches more edges.}
 \end{table}
 
 We do not conclude that depth is unnecessary, and the setup is narrow enough
@@ -392,28 +729,87 @@ shows is that paths cost accuracy when nothing requires a path.
 \paragraph{Why does retention decline as regimes accumulate?}
 \label{sec:scale}
 
-\begin{table}[h]
+\begin{figure}[h]
 \centering
-\begin{tabular}{ccccc}
-\toprule
-regimes & zero-shot & occupied & rows/regime & home classes per regime \\
-\midrule
-$8$ & $49.53\%$ & $530$ & $66$ & $0.75$ \\
-$16$ & $43.07\%$ & $1142$ & $71$ & $0.64$ \\
-$32$ & $37.65\%$ & $2412$ & $75$ & $0.70$ \\
-$64$ & $34.80\%$ & $5198$ & $81$ & $0.78$ \\
-\bottomrule
-\end{tabular}
-\caption{Monolithic baselines are available to thirty-two regimes and are
-reported in \S\ref{sec:modea}; the sixty-four-regime cell was not obtained.}
-\end{table}
+\begin{subfigure}[t]{0.48\textwidth}
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=\textwidth, height=5.2cm, xmode=log, ymode=log,
+  xlabel={occupied readout rows}, ylabel={zero-shot retention (\%)},
+  xmin=430, xmax=6400, ymin=30, ymax=58,
+  ytick={30,35,40,45,50}, yticklabels={30,35,40,45,50},
+  xtick={500,1000,2000,5000}, xticklabels={500,1000,2000,5000},
+  log ticks with fixed point,
+  grid=major, grid style={black!12},
+  tick label style={font=\small}, label style={font=\small},
+]
+\addplot[thick, dashed, domain=430:6400, samples=2, forget plot] {131.05*x^(-0.1571)};
+\addplot[only marks, mark=*, mark size=2.2pt, forget plot]
+  coordinates {(530,49.53)(1142,43.07)(2412,37.65)(5198,34.80)};
+\node[anchor=south west, font=\scriptsize] at (axis cs:600,31.5)
+  {$\propto n^{-0.157}$,\ \ $R^2=0.985$};
+\end{axis}
+\end{tikzpicture}
+\caption{Retention against the inventory.}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.48\textwidth}
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=\textwidth, height=5.2cm,
+  xmode=log, log basis x=2, xtick={8,16,32,64}, xticklabels={8,16,32,64},
+  xlabel={regimes}, ylabel={relative to eight regimes},
+  xmin=6.5, xmax=78, ymin=0.6, ymax=1.42,
+  ytick={0.7,0.8,0.9,1.0,1.1,1.2,1.3},
+  grid=major, grid style={black!12},
+  legend style={font=\scriptsize, draw=black!30, at={(0.5,-0.30)}, anchor=north},
+  legend columns=2, legend cell align=left,
+  tick label style={font=\small}, label style={font=\small},
+]
+\addplot[thick, mark=*, mark size=1.8pt]
+  coordinates {(8,1.00)(16,1.08)(32,1.14)(64,1.23)};
+\addlegendentry{capacity per regime}
+\addplot[thick, densely dashed, mark=square, mark size=1.8pt]
+  coordinates {(8,1.00)(16,0.96)(32,0.89)(64,0.96)};
+\addlegendentry{misrouted magnitude}
+\addplot[thick, dotted, mark=triangle, mark size=2.2pt]
+  coordinates {(8,1.00)(16,0.85)(32,0.93)(64,1.04)};
+\addlegendentry{home classes per regime}
+\addplot[thick, mark=diamond, mark size=2.6pt, densely dashdotted]
+  coordinates {(8,1.00)(16,0.87)(32,0.76)(64,0.70)};
+\addlegendentry{zero-shot retention}
+\end{axis}
+\end{tikzpicture}
+\caption{Three candidates flat; retention not.}
+\end{subfigure}
+\caption{Three explanations for the decline are excluded, leaving one. Both
+panels are normalised to the eight-regime value. \textbf{(b)} Capacity per
+regime \emph{rises} ($66\to81$ occupied rows per regime), so this is not
+starvation; misrouted write magnitude is flat ($57.0$, $54.7$, $51.0$, $55.0$
+per cent), so it is not worsening interference; home classes per regime is flat
+($0.75$, $0.64$, $0.70$, $0.78$), so separation does not degrade. Retention is
+the only one of the four that moves. \textbf{(a)} The quantity it moves with is
+the inventory the argmax must discriminate among, which grows $9.8\times$ over
+the same range; against that inventory the decline is close to a power law,
+$\propto n^{-0.157}$ with $R^2=0.985$ on four points. Note that the prediction
+distribution does not collapse: distinct targets predicted rise from $47$ to
+$57$ as accuracy falls, which is what distinguishes a discrimination failure
+from a representational one. Four points and two to three seeds per point are
+too few to fix an exponent; we read the figure as ruling three accounts out,
+not as measuring a law.}
+\label{fig:decline}
+\end{figure}
 
-Three explanations are excluded by the data. Capacity is supplied linearly, so
-this is not starvation. Misrouted write magnitude is $57.0$, $54.7$, $51.0$,
-$55.0$ per cent --- flat --- so it is not worsening interference. Home classes
-per regime is flat, so separation does not degrade. What remains is retrieval:
-confusable stored targets grow $9.8\times$ while accuracy falls to $0.70\times$,
-and distinct predictions rise from $47$ to $57$ rather than collapsing.
+Three explanations are excluded by the data (Figure~\ref{fig:decline}).
+Capacity is supplied faster than linearly in regimes, so this is not
+starvation. Misrouted write magnitude is flat, so it is not worsening
+interference. Home classes per regime is flat, so separation does not degrade.
+What remains is retrieval: the inventory of occupied readout rows --- the set
+the argmax must discriminate among --- grows $9.8\times$ while accuracy falls
+to $0.70\times$, and distinct predictions rise from $47$ to $57$ rather than
+collapsing.
 
 These exclusions constrain the explanation without establishing it, and the
 monolithic baselines beyond sixteen regimes are still running. We state the
@@ -440,10 +836,15 @@ run, so we leave the question open rather than answer it from a measurement
 that cannot distinguish the two (Appendix~\ref{app:arrival}).
 
 \paragraph{Is the decline with scale a power law?}
-Retention falls roughly as $N^{-\alpha}$ with $\alpha \approx 0.16$ over the
-measured range, $N$ being the number of stored items. Whether this exponent is
-a property of the mechanism, and whether stronger addressing rather than more
-capacity moves it, is measurable without new machinery.
+Over the measured range, retention falls as $n^{-\alpha}$ with $\alpha=0.157$
+and $R^2=0.985$, $n$ being the number of occupied readout rows
+(Figure~\ref{fig:decline}a). Four points and two to three seeds per point
+cannot distinguish a power law from any other slowly decaying form, so we
+report the fit as a compact summary of the range measured and not as a law.
+Whether the exponent is a property of the mechanism, and whether stronger
+addressing rather than more capacity moves it, is measurable without new
+machinery: the hierarchical variant of \S\ref{sec:variants} predicts it should
+fall.
 
 \paragraph{What should a constant-memory context retain?}
 Exact association across a gap is information-theoretically unavailable under
@@ -454,9 +855,50 @@ retention of salient items, or superposition with approximate unbinding
 cannot.
 
 \paragraph{Does the plasticity--stability frontier extend or shift?}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=10cm, height=5.6cm,
+  xlabel={plasticity (within-round accuracy at delay $0$)},
+  ylabel={forgetting (bits)},
+  xmin=0, xmax=1.0, ymin=-0.8, ymax=4.5,
+  grid=major, grid style={black!12},
+  legend style={font=\small, draw=black!30, at={(0.98,0.03)}, anchor=south east},
+  legend cell align=left,
+  tick label style={font=\small}, label style={font=\small},
+]
+\addplot[thick, mark=square, mark size=2pt, densely dashed]
+  coordinates {(0.033,0.017)(0.040,0.049)(0.082,0.163)(0.198,0.378)
+               (0.302,0.240)(0.309,-0.418)};
+\addlegendentry{monolithic control}
+\addplot[thick, mark=*, mark size=2pt]
+  coordinates {(0.320,0.321)(0.643,1.250)(0.793,2.500)(0.922,4.014)};
+\addlegendentry{this work}
+\draw[black!40, dotted, thick] (axis cs:0.3145,-0.8) -- (axis cs:0.3145,4.5);
+\end{axis}
+\end{tikzpicture}
+\caption{Each point is one learning rate, two or three seeds, Mode B at twelve
+regimes; the rate sweeps $\eta\in\{0.1,\dots,30\}$ for the control and
+$\{0.1,\dots,3\}$ for ours. The two arms do not overlap in plasticity at all:
+the control saturates at $0.309$ and ours starts at $0.320$, either side of
+the dotted line. Nothing about
+frontier \emph{position} can be read from disjoint supports, which is why we
+report reachability only. Two features are worth stating rather than
+smoothing over: our forgetting grows steeply across our own range, $0.32$ to
+$4.01$ bits, so the high-plasticity end is not free; and the control's
+highest-rate cell has \emph{negative} forgetting, which we do not have an
+account for and treat as a sign that the control is unstable there rather than
+as a stability result.}
+\label{fig:pareto}
+\end{figure}
+
 The frontier traced by our mechanism and that traced by the monolithic control
-barely overlap in plasticity, so at present only reachability can be compared,
-not position.
+do not overlap in plasticity at all (Figure~\ref{fig:pareto}), so at present
+only reachability can be compared, not position. Making the comparison possible
+needs a regime in which both arms operate at the same plasticity, and we did
+not construct one.
 
 \section{Discussion}
 
@@ -733,9 +1175,11 @@ than the multi-hop table above and is therefore not directly comparable to it,
 accuracy falls from $51.43\%$ to $41.03\%$ at two hops and from $35.10\%$ to
 $22.83\%$ at three, so the gap to a single hop widens rather than closes. The
 reason is visible in the same run. Routing consistency, which the fixed key
-guarantees at $1.000$, falls to $0.910$; a fact's path now depends on weights
-that move, so nine per cent of probed facts no longer reach where training left
-them, and that loss outweighs whatever composition buys. Whether a source that
+guarantees at $1.000$, falls to $0.875$ at two hops and $0.740$ at three: a
+fact's path now depends on weights that move, so an eighth and then a quarter
+of probed facts no longer reach where training left them. The loss tracks the
+depth, which is what one would expect if it compounds along the walk rather
+than being a fixed cost, and it outweighs whatever composition buys. Whether a source that
 genuinely requires chaining two stored relations would reverse the balance is
 untested --- on a lookup whose target is fixed by the current fact there is
 nothing for a composed path to find --- so this settles the version we tried
@@ -764,12 +1208,15 @@ evaluated, and a stream we constructed fixes what has to be learned and what
 can be shared, which is precisely what a real corpus would decide for us.
 
 The monolithic control is established at eight, sixteen and thirty-two regimes,
-with one seed at thirty-two and none at sixty-four. It is not parameter-matched
-in either direction: at eight regimes it holds $16.8$M readout weights against
-$11.6$M allocated by our mechanism, of which about $17$K are occupied. The
-comparison is therefore between two models of comparable width rather than of
-equal size, and the occupancy figures should be read as describing our
-mechanism rather than as a like-for-like efficiency claim.
+with one seed at thirty-two and none at sixty-four; our own cells at thirty-two
+and sixty-four have two seeds each. The comparison is not parameter-matched in
+either direction. At eight regimes the control holds a $512\times32768$
+readout, $16.8$M weights, while our mechanism allocated $10$, $11$ and $13$
+class slices across the three seeds --- $327{,}680$ to $425{,}984$ rows, $10.5$M
+to $13.6$M weights --- of which $523$ to $538$ rows, about $17$K weights, are
+occupied. These are two models of comparable width and different size, so the
+occupancy figures describe our mechanism and are not a like-for-like efficiency
+claim against the control.
 
 Cost comparisons between the dense and sampled write paths are not
 commensurable, because write magnitude accumulates over a different number of

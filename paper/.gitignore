@@ -5,3 +5,6 @@
 *.blg
 *.toc
 build*.log
+
+# LaTeX side effects
+texput.log
