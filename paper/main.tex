@@ -163,8 +163,8 @@ $|\mathcal{N}|=n$ nodes: node $u$ has out-neighbours consisting of its two ring
 neighbours plus a fixed number of random shortcuts, giving out-degree $D_u$ and
 $|\mathcal{E}|=M=\sum_u D_u$ directed edges. Every edge $a\in\mathcal{E}$
 carries two objects: a \emph{key} $\kappa_a\in\mathbb{R}^d$, drawn once at
-construction and never updated, and, for each regime class $c$, a learned
-matrix $W^{(c)}_a\in\mathbb{R}^{d\times d}$. Each class $c$ additionally owns a
+construction and never updated, and a learned matrix
+$W_a\in\mathbb{R}^{d\times d}$ shared across regimes. Each class $c$ owns a
 readout $R^{(c)}\in\mathbb{R}^{V\times d}$ and a prototype
 $\pi_c\in S^{d-1}$. The number of live classes $C$ is not fixed in advance; it
 grows (\S\ref{sec:allocation}).
@@ -193,7 +193,7 @@ seen once each in the order they arrive.
 % ---------- value path ----------
 \node[fix] (er)  at (0,0)    {$(e,r)$};
 \node[fix] (p0)  at (2.4,0)  {$p_0=\nu(\mathrm{E}_e{+}\mathrm{E}_r)$};
-\node[lrn] (w)   at (6.6,0)  {$p\leftarrow\nu\big(p+\tanh(W^{(\gamma)}_{a_h}p)\big)$\\[-2pt]
+\node[lrn] (w)   at (6.6,0)  {$p\leftarrow\nu\big(p+\tanh(W_{a_h}\,p)\big)$\\[-2pt]
                               \textit{\scriptsize $H$ hops}};
 \node[lrn] (rd)  at (10.7,0) {$z=R^{(\gamma)}p_H$};
 \node[fix] (out) at (13.1,0) {$\arg\max$};
@@ -213,7 +213,6 @@ seen once each in the order they arrive.
 \node[fix] (pro) at (8.0,-2.4) {prototypes $\pi_j$,\ \ $\gamma=\arg\max_j\langle\pi_j,c_t\rangle$};
 \draw[ar] (str) -- (ctx);
 \draw[ar] (ctx) -- (pro);
-\draw[addr] (pro.north -| w.south) -- node[lbl,right]{$\gamma$ selects edge slice} (w.south);
 \draw[addr] (pro.east) -| node[lbl,pos=0.72,right]{$\gamma$ selects readout slice} (rd.south);
 
 % ---------- allocation ----------
@@ -227,9 +226,9 @@ seen once each in the order they arrive.
 \emph{where} an observation is stored; the two heavy-outlined blocks are the
 only ones holding trained parameters. Content selects the edge, so a fact
 reaches the same transform under every history (\S\ref{sec:addressing}); the
-regime inferred from the stream selects the readout slice, and the edge slice
-too unless the transform is shared, so facts that disagree across regimes never
-share a row. Capacity is appended when a class's own similarity distribution
+regime inferred from the stream selects the readout slice, so facts that
+disagree across regimes never share a row while the transform they pass through
+stays common. Capacity is appended when a class's own similarity distribution
 disperses, which by \S\ref{sec:exact} leaves every existing offset and value
 untouched.}
 \label{fig:mech}
@@ -269,8 +268,8 @@ subsequent learning can move a stored fact's address. We report $1.000$ in the
 tables as a check on the implementation, not as a result.
 
 \paragraph{Regime to readout.}
-A single-timescale exponential average of the stream, with rate $\rho$, is
-matched against the prototypes:
+A slow exponential average of the stream, with rate $\rho$, is matched against
+the prototypes:
 \begin{equation}
   c_t \;=\; c_{t-1} + \rho\left(\mathrm{E}_{x_t} - c_{t-1}\right),
   \qquad
@@ -286,19 +285,19 @@ not trained.
 
 The value path applies the selected edge transform residually,
 \begin{equation}
-  p_{h+1} \;=\; \nu\!\Big(p_h + \tanh\!\big(W^{(\gamma)}_{a_h}\, p_h\big)\Big),
+  p_{h+1} \;=\; \nu\!\Big(p_h + \tanh\!\big(W_{a_h}\, p_h\big)\Big),
   \qquad h = 0,\dots,H-1,
   \label{eq:hop}
 \end{equation}
 with $\tanh$ elementwise, and the class readout produces logits
 $z = R^{(\gamma)} p_H \in \mathbb{R}^{V}$, $\hat y = \mathrm{softmax}(z)$.
 
-The split between what is shared and what is private follows the generative
-structure rather than preference. A payload is built from an entity and a
-relation, which are common across regimes, so $W$ can be shared
-($W^{(\gamma)}\equiv W$); targets are exactly what regimes disagree about, so
-$R^{(\gamma)}$ must not be. Section \ref{sec:sharing} confirms this from both
-directions --- by sharing the transform and by sharing the readout.
+The edge transform is shared across regimes and the readout is not. The split
+follows the generative structure rather than preference: a payload is built
+from an entity and a relation, which are common across regimes, whereas targets
+are exactly what regimes disagree about. Section \ref{sec:sharing} confirms
+this from both directions --- against a fully private variant, and by testing
+the opposite split.
 
 \subsection{Learning}
 
@@ -325,7 +324,7 @@ content (\S\ref{sec:capacity}).
 The error is then backpropagated along the path that was actually walked, and
 along no other. With $\nabla_{p_H}L = (R^{(\gamma)})^{\top}(\hat y - \delta_t)$,
 each hop is differentiated exactly through the normalisation and the residual
-$\tanh$ block of \eqref{eq:hop}: writing $b_h = W^{(\gamma)}_{a_h}p_h$,
+$\tanh$ block of \eqref{eq:hop}: writing $b_h = W_{a_h}p_h$,
 $u_h = p_h + \tanh(b_h)$ and $\lambda_h = \lVert u_h\rVert$,
 \begin{equation}
   \nabla_{u_h} L \;=\; \frac{1}{\lambda_h}\Big(I - p_{h+1}p_{h+1}^{\top}\Big)\nabla_{p_{h+1}} L,
@@ -334,9 +333,9 @@ $u_h = p_h + \tanh(b_h)$ and $\lambda_h = \lVert u_h\rVert$,
   \label{eq:back}
 \end{equation}
 \begin{equation}
-  W^{(\gamma)}_{a_h} \;\mathrel{-}=\; \eta\, \nabla_{b_h}L\; p_h^{\top},
+  W_{a_h} \;\mathrel{-}=\; \eta\, \nabla_{b_h}L\; p_h^{\top},
   \qquad
-  \nabla_{p_h} L \;=\; \nabla_{u_h} L + \big(W^{(\gamma)}_{a_h}\big)^{\top} \nabla_{b_h} L .
+  \nabla_{p_h} L \;=\; \nabla_{u_h} L + \big(W_{a_h}\big)^{\top} \nabla_{b_h} L .
   \label{eq:backw}
 \end{equation}
 The gradient reaches neither the keys $\kappa$, nor the prototypes $\pi$, nor
@@ -355,7 +354,7 @@ distribution is too dispersed for $\tau$ consecutive steps,
 \begin{equation}
   \frac{\sigma_\gamma}{\max(|\mu_\gamma|,\epsilon)} \;>\; \theta,
   \qquad\text{whereupon}\qquad
-  C \leftarrow C+1 .
+  \pi_{C+1} \leftarrow \nu(c_t), \quad C \leftarrow C+1 .
   \label{eq:grow}
 \end{equation}
 Dispersion is used rather than an outlier test because outlier tests fail in
@@ -369,16 +368,16 @@ raises its own variance, so a threshold of the form $\mu_\gamma - \theta
 is scale-free in both senses: a class serving one regime has tightly clustered
 similarities whatever the value of $C$.
 
-The new prototype is derived from the current context direction, and allocation
-appends, leaving existing slices at their offsets and values.
+The new prototype is placed at the current context, and allocation appends,
+leaving existing slices at their offsets and values.
 
 \subsection{Expansion is exact}
 \label{sec:exact}
 
-Both $R$ and $W$ are stored class-major, so class $c$ occupies a contiguous
-block at offset $c\cdot Vd$ (respectively $c\cdot Md^2$). Appending class $C+1$
-therefore changes no offset of any class $j\le C$ and writes no byte inside
-one. Consequently, for any input whose inferred regime satisfies $\gamma\le C$,
+The readout is stored class-major, so class $c$ occupies a contiguous block at
+offset $c\cdot Vd$, and the shared transform carries no class index at all.
+Appending class $C+1$ therefore changes no offset of any class $j\le C$ and
+writes no byte inside one. Consequently, for any input whose inferred regime satisfies $\gamma\le C$,
 the logits $z=R^{(\gamma)}p_H$ are \emph{bit}-identical before and after
 expansion, since the arithmetic performed is the same on the same operands in
 the same order. This is a property of the layout, and we assert it as a unit
