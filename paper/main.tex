@@ -3,6 +3,7 @@
 \usepackage[margin=1in]{geometry}
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
+\usepackage{multirow}
 \usepackage{graphicx}
 \usepackage{microtype}
 \usepackage{tikz}
@@ -224,8 +225,9 @@ carries two objects: a \emph{key} $\kappa_a\in\mathbb{R}^d$, drawn once at
 construction and never updated, and a learned matrix
 $W_a\in\mathbb{R}^{d\times d}$ shared across regimes. Each class $c$ owns a
 readout $R^{(c)}\in\mathbb{R}^{V\times d}$ and a prototype
-$\pi_c\in S^{d-1}$. The number of live classes $C$ is not fixed in advance; it
-grows (\S\ref{sec:allocation}).
+$\pi_c\in S^{d-1}$. The number of live classes $C$ is not fixed in advance. It
+starts at one --- the mechanism is not told how many regimes exist --- and
+grows from the stream (\S\ref{sec:allocation}).
 
 A fact is a triple $(e,r,t)\in\mathcal{V}^3$: entity, relation, target. The
 stream is a sequence of tokens $x_1,x_2,\dots$ from which facts are read off,
@@ -253,8 +255,8 @@ seen once each in the order they arrive.
 \node[fix] (p0)  at (2.4,0)  {$p_0=\nu(\mathrm{E}_e{+}\mathrm{E}_r)$};
 \node[lrn] (w)   at (6.6,0)  {$p\leftarrow\nu\big(p+\tanh(W_{a_h}\,p)\big)$\\[-2pt]
                               \textit{\scriptsize $H$ hops}};
-\node[lrn] (rd)  at (10.7,0) {$z=R^{(\gamma)}p_H$};
-\node[fix] (out) at (13.1,0) {$\arg\max$};
+\node[lrn] (rd)  at (10.9,0) {$z=\big(R^{(\gamma)}{+}R^{\mathrm{sh}}\big)p_H$};
+\node[fix] (out) at (13.8,0) {$\arg\max$};
 \draw[ar] (er) -- (p0);
 \draw[ar] (p0) -- (w);
 \draw[ar] (w)  -- node[lbl,above]{$p_H$} (rd);
@@ -262,7 +264,7 @@ seen once each in the order they arrive.
 
 % ---------- factor 1: content selects the edge ----------
 \node[fix] (ring) at (6.6,2.3) {fixed keys $\kappa_a$,\ \ $a_h=\arg\max_a\langle\kappa_a,q\rangle$};
-\draw[addr] (p0.north) -- ++(0,1.35) -| (ring.west);
+\draw[addr] (p0.north) -- ++(0,1.35) -| node[lbl,pos=0.25,above]{$q$} (ring.west);
 \draw[addr] (ring) -- node[lbl,right]{selects edge $a_h$} (w);
 
 % ---------- factor 2: inferred regime selects the slice ----------
@@ -288,7 +290,8 @@ regime inferred from the stream selects the readout slice, so facts that
 disagree across regimes never share a row while the transform they pass through
 stays common. Capacity is appended when a class's own similarity distribution
 disperses, which by \S\ref{sec:exact} leaves every existing offset and value
-untouched.}
+untouched. The routing key $q$ equals $p_0$ in every configuration reported
+here; $R^{\mathrm{sh}}$ holds the rows more than one class has emitted.}
 \label{fig:mech}
 \end{figure}
 
@@ -458,6 +461,15 @@ expansion, since the arithmetic performed is the same on the same operands in
 the same order. This is a property of the layout, and we assert it as a unit
 test on weights and logits rather than estimating it statistically.
 
+Two distinct things are called growth here and should be kept apart. Allocation
+raises the live count $C$ within a block of slices reserved at construction,
+which is what happens in every run reported below. Appending \emph{beyond} that
+reservation is a separate code path, enabled by a flag that is off in these
+runs, and it is the one the exactness argument and the unit test concern. The
+reservation is a ceiling on how far allocation can go, not a statement about
+how much capacity is used: what the occupancy figures of \S\ref{sec:capacity}
+measure is how much of it is written to.
+
 \subsection{Cost}
 \label{sec:costmodel}
 
@@ -484,6 +496,54 @@ Evaluation is zero-shot retention of probed facts under a frozen memory, with
 the probe restoring the context it needs and returning the state it displaced.
 All figures in this paper are extracted by a single parser that anchors on the
 results table header and reads the column by name.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{llll}
+\toprule
+& symbol & flag & value \\
+\midrule
+\multirow{7}{*}{source}
+ & --- & \texttt{-{}-mode} & \texttt{a} \\
+ & --- & \texttt{-{}-domains} & $8$ \\
+ & $V$ & \texttt{-{}-vocab} & $16384$ \\
+ & --- & \texttt{-{}-facts-per-domain} & $150$ \\
+ & --- & \texttt{-{}-span-tokens} / \texttt{-{}-rounds} & $4000$ / $6$ \\
+ & $s$ & \texttt{-{}-zipf-s} / \texttt{-{}-hub-ratio} & $1.0$ / $0.10$ \\
+ & --- & \texttt{-{}-target-zipf} & on \\
+\midrule
+\multirow{2}{*}{control}
+ & --- & \texttt{-{}-d-sdr} / \texttt{-{}-k-active} & $512$ / $16$ \\
+ & --- & \texttt{-{}-d-input} / \texttt{-{}-m-in} & $32$ / $8$ \\
+\midrule
+\multirow{9}{*}{mechanism}
+ & $n$ & \texttt{-{}-edge-nodes} & $16$ \\
+ & --- & \texttt{-{}-edge-shortcuts} & $2$ (default) \\
+ & $d$ & \texttt{-{}-edge-dim} & $32$ \\
+ & $H$ & \texttt{-{}-edge-hops} & varied per experiment \\
+ & --- & \texttt{-{}-edge-classes} / \texttt{-{}-edge-init-classes} & $64$ / $1$ \\
+ & $\theta$, $\tau$ & \texttt{-{}-edge-grow-k} / \texttt{-{}-edge-grow-hold} & $0.05$ / $2$ \\
+ & --- & \texttt{-{}-edge-grow-orth} & off \\
+ & --- & \texttt{-{}-edge-share} / \texttt{-{}-edge-share-readout} & on / on \\
+ & $k$ & \texttt{-{}-edge-neg-samples} & $32$ \\
+\midrule
+\multirow{2}{*}{off}
+ & $g$ & \texttt{-{}-edge-ctx-gain}, \texttt{-{}-edge-forget} & $0$, $0$ \\
+ & --- & \texttt{-{}-edge-posterior}, \texttt{-{}-edge-hash-class}, & \\
+ & --- & \texttt{-{}-edge-gate}, \texttt{-{}-edge-clip}, \texttt{-{}-edge-expand} & off / $0$ \\
+\bottomrule
+\end{tabular}
+\caption{The configuration of the routing comparison, given in full as a
+reference point; each result elsewhere names the parameters it varies. The
+learning rate is $\eta=1.0$ and the elastic-weight baseline is disabled. Four
+entries decide how the equations of \S\ref{sec:method} should be read:
+\texttt{-{}-edge-ctx-gain}$\,=0$ makes $q=p_0$, so the address is a function of
+the fact alone; \texttt{-{}-edge-forget}$\,=0$ means nothing decays;
+\texttt{-{}-edge-grow-orth} off means a new prototype is placed at the context
+rather than on its orthogonal residual; and \texttt{-{}-edge-share} makes the
+transform common to all classes, so the edge memory carries no class index.}
+\end{table}
 
 \section{Results}
 
