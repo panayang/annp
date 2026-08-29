@@ -15,7 +15,8 @@
 \usepackage{natbib}
 \bibliographystyle{plainnat}
 
-\title{Content-Addressed Continual Memory with On-Demand Capacity}
+\title{Trading Interference for Retrieval Difficulty:\\
+{\large A Content-Addressed Continual Memory with On-Demand Capacity}}
 
 \author{%
   Xinyu Yang\\
@@ -29,33 +30,33 @@
 \maketitle
 
 \begin{abstract}
-We study a continual-learning memory in which storage is addressed by content,
-capacity is allocated on demand from the stream without task identifiers, and
-new capacity is appended without perturbing anything already stored. On a
-relational stream whose regimes are distinguishable from their inputs, the
-mechanism retains $49.5\%$ of probed facts zero-shot against $15.1\%$ for a
-monolithic sparse-coded control of the same width, which is itself at the level
-of a linear baseline; the advantage narrows from $34$ to $25$ points between
-eight and thirty-two regimes without closing. Sharing the payload transform
-across regimes while keeping per-regime readouts adds $16.4$ points over a
-fully private variant (six seeds, $p<0.001$). Allocating readout rows only for
-targets a regime actually emits reduces occupied capacity by $7.6\times$ at no
-cost in accuracy, and appending capacity leaves existing weights byte-identical
-and existing predictions bit-identical.
+A learner with bounded parameters and an unbounded stream must give something
+up: regularisation gives up plasticity, training on regardless gives up the
+past. A third option is to \emph{allocate}, giving distinct regimes distinct
+storage, and the standing objection is that adding parameters per task defers
+the problem rather than solving it. We take that objection seriously by
+building the most committed version of allocation we could --- storage
+addressed by content through a fixed random map, so no later learning can move
+where a fact lives; regimes inferred online with no task identifier, boundary
+or replay; and capacity appended rather than resized, so adding storage leaves
+existing weights and predictions bit-identical --- and asking what it buys.
 
-We give equal space to the readings we could not turn into results, and hold
-them open rather than assert them. It carries nothing between facts beyond a
-single-timescale context, and retention falls as a cue is separated from its
-query; on this source we did not observe multi-hop routing or a composing
-address paying for the capacity they occupy, though the source is a lookup task
-that asks nothing of a path and cannot show what a composing one would buy;
-retention declines as regimes accumulate, with capacity starvation, worsening
-misrouting and failing separation each excluded by measurement, leaving
-retrieval difficulty as the surviving account and several untried remedies that
-follow from it. We report these as measurements whose
-interpretation is unsettled because, in the course of this study, six
-measurements that read as findings turned out to have been produced by the
-measurement rather than the mechanism.
+Our reading is that allocation does not remove interference so much as
+\emph{convert} it, trading destruction of old material for difficulty in
+retrieving among more of it. We argue this is the better failure, because
+retrieval difficulty is non-destructive and answerable by addressing better
+while interference is answerable only by spending parameters; we report the
+exchange rate we measured and the mitigations it implies. The same commitment
+has a price: an address fixed by content is precisely what keeps context out of
+retrieval.
+
+On a synthetic relational stream the mechanism retains substantially more than
+a monolithic control where regimes are distinguishable, allocates capacity in
+proportion to emitted content rather than vocabulary size, and holds per-token
+cost independent of context length. Other readings came out flat and we report
+them as open: six measurements in this study that read as results proved to
+have been produced by the measurement rather than the mechanism, and a
+synthetic source cannot exhibit what it was not built to contain.
 \end{abstract}
 
 \section{Introduction}
@@ -577,15 +578,16 @@ transform common to all classes, so the edge memory carries no class index.}
          error bars/.cd, y dir=both, y explicit]
   coordinates {(8,15.10) +- (0,0.75) (16,12.03) +- (0,1.46) (32,12.20) +- (0,0)};
 \addlegendentry{monolithic control}
-\addplot[dotted, thick, domain=6.5:78, samples=2, forget plot] {15.30};
+\addplot[dotted, thick, domain=6.5:78, samples=2, forget plot] {14.80};
 \node[anchor=west, font=\scriptsize] at (axis cs:34,17.6) {linear baseline};
 \end{axis}
 \end{tikzpicture}
 \caption{Mode A. Bars are one standard deviation across seeds ($n=3$ at eight
 and sixteen, $n=2$ at thirty-two and sixty-four for this work; $n=3$, $3$, $1$
 for the control). The control sits at the level of a linear baseline without
-sparse coding, so the task is not solvable by predicting frequent targets. The
-sixty-four-regime control was not obtained: a single cell costs about nine
+sparse coding, so the task is not solvable by predicting frequent targets; the
+dotted line is that baseline at eight regimes, $14.80\%$ over the same three
+seeds. The sixty-four-regime control was not obtained: a single cell costs about nine
 hours here and the run was lost.}
 \label{fig:scale}
 \end{figure}
@@ -850,8 +852,9 @@ $3$ & $3$ & $29.63\%$ & $744$ \\
 The seed counts are unequal and small, and the two-hop cell is a single run; on
 the two seeds all three depths share, the ordering is the same ($54.2$, $56.1$
 at one hop against $31.2$, $25.8$ at three). Under-training is excluded as an
-explanation: writes per edge \emph{rise} with hops, from $3246$ to $9222$,
-because each fact touches more edges.}
+explanation: writes per edge \emph{rise} with depth, averaging $3152$, $6432$
+and $8965$ at one, two and three hops over roughly the same $24$--$26$ live
+edges, because each fact touches more of them.}
 \end{table}
 
 We do not conclude that depth is unnecessary; the setup is narrow enough that
