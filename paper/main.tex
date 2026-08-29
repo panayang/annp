@@ -102,31 +102,67 @@ declining as regimes accumulate.
 
 \paragraph{Continual learning.}
 Catastrophic interference in distributed representations
-\citep{mccloskey1989catastrophic,french1999catastrophic} motivates three broad
-families \citep{parisi2019continual,delange2021continual}: regularisation
-\citep{kirkpatrick2017overcoming}, rehearsal, and architectural expansion
-\citep{rusu2016progressive,yoon2018lifelong}. Our mechanism is architectural,
-but differs from prior expansion methods in that it requires no task boundary to
-decide when to expand; the decision is made from the dispersion of an inferred
-regime's own statistics. Task-free continual learning
-\citep{aljundi2019task} shares this aim.
+\citep{mccloskey1989catastrophic,ratcliff1990connectionist,french1999catastrophic}
+motivates three broad families \citep{parisi2019continual,delange2021continual}.
+Regularisation slows change on weights estimated to matter
+\citep{kirkpatrick2017overcoming,zenke2017continual,li2017learning}; rehearsal
+replays or distils stored exemplars
+\citep{rebuffi2017icarl,lopezpaz2017gradient,chaudhry2019tiny}; architectural
+expansion gives new material new parameters
+\citep{rusu2016progressive,yoon2018lifelong}. Our mechanism is architectural
+but requires no task boundary to decide when to expand: the decision comes from
+the dispersion of an inferred regime's own statistics, which places it in the
+task-free setting \citep{aljundi2019task} and, in the taxonomy of
+\citet{vandeven2019three}, in the hardest scenario, where neither a task label
+nor a task boundary is supplied at training or at test time. The idea that
+separating storage is a solution rather than an evasion is older than the
+deep-learning literature on it: complementary learning systems argue that a
+fast, sparse, pattern-separating store is what makes slow cortical
+consolidation survivable \citep{mcclelland1995why,kumaran2016what}.
 
-\paragraph{Conditional computation.}
+\paragraph{Conditional computation and routing.}
 Structurally the mechanism is a single-layer, top-1 sparsely-gated mixture of
-experts \citep{shazeer2017outrageously,fedus2022switch} whose router is a fixed
-random hash rather than a learned gate, and whose expert count grows. We treat
-the unlearned router as a limitation to be reported rather than a feature: it
-forgoes load balancing and learned specialisation, and it is precisely what
-prevents context from influencing retrieval (\S\ref{sec:longrange}).
+experts \citep{jacobs1991adaptive,bengio2013estimating,shazeer2017outrageously,fedus2022switch}
+whose expert count grows. Its router is the unusual part. Learned gates need
+load-balancing losses and can collapse; the alternatives replace learning with
+a rule --- a balanced assignment problem \citep{lewis2021base}, or a fixed
+hash of the token \citep{roller2021hash}, which is the closest prior work to
+what we do and reports that a fixed hash is competitive with a learned gate.
+We differ in what the fixed rule buys and what it costs. Hashing there is a
+way to avoid the pathologies of a learned gate; here it is a
+\emph{stability} guarantee, because an address that cannot move is an address
+no subsequent learning can invalidate. The cost is the same in both cases and
+we report it as a limitation rather than a feature: no load balancing, no
+learned specialisation, and --- specific to a continual setting --- no way for
+context to influence retrieval (\S\ref{sec:longrange}).
 
 \paragraph{Addressable and distributed memory.}
 Content-addressed storage with sparse codes follows sparse distributed memory
 \citep{kanerva1988sparse} and hyperdimensional computing
-\citep{kanerva2009hyperdimensional}. Recoverable association of \emph{pairs},
-which a smoothed context summary cannot provide, is available through
-holographic reduced representations \citep{plate1995holographic} or fast-weight
-outer products \citep{ba2016using,schlag2021linear}; we identify this as the
-missing ingredient rather than claim it.
+\citep{kanerva2009hyperdimensional}, whose capacity arguments descend from
+associative networks \citep{hopfield1982neural} and, in their modern
+attention-equivalent form, from \citet{ramsauer2021hopfield}. Differentiable
+external memories \citep{weston2015memory,graves2016hybrid} learn both what to
+store and where; we learn only the former, which is what makes the address
+stable and also what forbids the mechanism from learning a better one.
+Recoverable association of \emph{pairs}, which a smoothed context summary
+cannot provide, is available through holographic reduced representations
+\citep{plate1995holographic} or fast-weight outer products
+\citep{schmidhuber1992learning,ba2016using,schlag2021linear}; we identify this
+as the missing ingredient rather than claim it.
+
+\paragraph{Non-parametric and retrieval memory.}
+An alternative to storing knowledge in weights is to retrieve it at inference
+from an external store, either by nearest neighbours over cached representations
+\citep{khandelwal2020generalization} or by retrieving text
+\citep{guu2020realm,lewis2020retrieval,borgeaud2022improving}. This shares our
+premise that new knowledge should not require gradient updates to a shared
+representation, and differs in where the burden falls: a retrieval corpus grows
+in storage and search cost but needs no allocation policy, whereas we pay an
+allocation decision and a growing candidate set in exchange for a store that is
+written online, in one pass, and is itself the model. The retrieval-difficulty
+scaling we report (\S\ref{sec:scale}) is the analogue of the index-size problem
+in that literature.
 
 \paragraph{Consolidation across timescales.}
 Cascades of variables at multiple timescales
@@ -137,14 +173,36 @@ consolidation and as input context, and report both outcomes.
 \paragraph{Attention and its costs.}
 Self-attention \citep{vaswani2017attention} pays $O(N)$ per token in context
 access and degrades on material in the middle of long contexts
-\citep{liu2024lost}. A content-addressed memory pays a cost independent of $N$;
-we quantify the crossover in \S\ref{sec:cost}.
+\citep{liu2024lost}. A large literature reduces that cost by sparsifying or
+linearising the attention pattern
+\citep{beltagy2020longformer,katharopoulos2020transformers,tay2022efficient},
+and recent state-space models achieve constant per-token cost with a
+recurrent state \citep{gu2023mamba}. Our mechanism sits with the latter in
+cost profile and differs in what the constant-size state is for: a state-space
+model compresses the sequence into a vector that the network learns to read,
+while here the constant-size summary is used only to \emph{address}, and what
+is retrieved comes from a store that grows with content rather than from the
+summary itself. We quantify the crossover in \S\ref{sec:cost}.
 
-\paragraph{Vocabulary growth.}
-That distinct types grow sublinearly in a Zipf-distributed stream is Heaps' law
-\citep{heaps1978information}; we use it to ask whether allocated capacity tracks
-content, and report that in our generator it does not, for reasons traced to the
-generator itself (\S\ref{sec:scale}).
+\paragraph{Vocabulary growth and tokenisation.}
+That distinct types grow sublinearly in a Zipf-distributed stream
+\citep{zipf1949human,piantadosi2014zipf} is Heaps' law
+\citep{heaps1978information}. We use it to ask whether allocated capacity
+tracks content, and find that our generator does not reproduce the sublinear
+regime, which makes it an unfavourable source for the question
+(\S\ref{sec:capacity}). Subword vocabularies
+\citep{sennrich2016neural} are constructed to flatten exactly the frequency
+structure this mechanism reads, and are known to be a suboptimal segmentation
+for pretraining on other grounds as well \citep{bostrom2020byte}; we return to
+this in \S\ref{sec:variants}.
+
+\paragraph{Evaluation protocol.}
+We evaluate prequentially --- predict, take the loss, then write
+\citep{dawid1984present} --- which is standard for stream learning
+\citep{gama2013evaluating} and has the property that no example is ever scored
+after it has been trained on \citep{blier2018description}. In a single-pass
+setting this is the only protocol under which a retention number means what it
+appears to mean.
 
 \section{Method}
 \label{sec:method}
@@ -289,8 +347,15 @@ The value path applies the selected edge transform residually,
   \qquad h = 0,\dots,H-1,
   \label{eq:hop}
 \end{equation}
-with $\tanh$ elementwise, and the class readout produces logits
-$z = R^{(\gamma)} p_H \in \mathbb{R}^{V}$, $\hat y = \mathrm{softmax}(z)$.
+with $\tanh$ elementwise. Rows are owned exclusively: a target emitted by more
+than one class is held in a block $R^{\mathrm{sh}}$ common to all of them,
+every other target in the live class's own block. Scoring reads both,
+\begin{equation}
+  z \;=\; \big(R^{(\gamma)} + R^{\mathrm{sh}}\big)\, p_H \;\in\; \mathbb{R}^{V},
+  \qquad \hat y = \mathrm{softmax}(z),
+  \label{eq:logits}
+\end{equation}
+while a write goes to exactly one of the two, so no target is stored twice.
 
 The edge transform is shared across regimes and the readout is not. The split
 follows the generative structure rather than preference: a payload is built
@@ -301,8 +366,9 @@ the opposite split.
 
 \subsection{Learning}
 
-Training is online, single-pass and prequential: for each fact the model
-predicts, is charged the loss, and only then writes. There is no replay buffer,
+Training is online, single-pass and prequential
+\citep{dawid1984present,gama2013evaluating}: for each fact the model predicts,
+is charged the loss, and only then writes. There is no replay buffer,
 no task boundary, no epoch and no second pass.
 
 The readout takes a delta-rule step restricted to a \emph{touched set}
@@ -316,8 +382,9 @@ The readout takes a delta-rule step restricted to a \emph{touched set}
   \label{eq:delta}
 \end{equation}
 where $\mathcal{T}_\gamma$ is the set of targets class $\gamma$ has already
-emitted and $k$ the number of sampled negatives ($k=0$ recovers the dense
-update over all $V$ rows). Rows outside $T$ are left \emph{exactly} zero rather
+emitted and $k$ the number of sampled negatives, drawn with replacement by a
+deterministic counter-based generator and with the target itself discarded
+($k=0$ recovers the dense update over all $V$ rows). Rows outside $T$ are left \emph{exactly} zero rather
 than nearly zero, which is what makes occupied capacity a measure of stored
 content (\S\ref{sec:capacity}).
 
@@ -340,17 +407,25 @@ $u_h = p_h + \tanh(b_h)$ and $\lambda_h = \lVert u_h\rVert$,
 \end{equation}
 The gradient reaches neither the keys $\kappa$, nor the prototypes $\pi$, nor
 the embedding table: every quantity that decides \emph{where} an observation
-goes is outside the computational graph. Decay is applied lazily, by carrying a
-per-slice scale and materialising a slice only when it is touched, which is
-algebraically exact rather than an approximation.
+goes is outside the computational graph.
+
+Two implementation points affect how the equations above should be read. The
+weight update of \eqref{eq:backw} is applied in place before $\nabla_{p_h}L$ is
+formed, so the backward signal passes through the post-update matrix rather
+than the one used in the forward pass. And the mechanism supports a decay term,
+applied lazily by carrying a per-slice scale and materialising a slice only
+when it is touched --- algebraically exact rather than an approximation --- but
+it is set to zero throughout the experiments reported here, so nothing decays
+in any measurement below.
 
 \subsection{Allocation}
 \label{sec:allocation}
 
 Let $\mathrm{sim}_t = \max_j\langle\pi_j,c_t\rangle$ and let $\mu_\gamma$,
 $\sigma^2_\gamma$ be running estimates of its mean and variance conditioned on
-the class $\gamma$ that won. A class is split when its own similarity
-distribution is too dispersed for $\tau$ consecutive steps,
+the class $\gamma$ that won. Once both the global and the per-class estimates
+have accumulated a minimum number of observations, a class is split when its
+own similarity distribution is too dispersed for $\tau$ consecutive steps,
 \begin{equation}
   \frac{\sigma_\gamma}{\max(|\mu_\gamma|,\epsilon)} \;>\; \theta,
   \qquad\text{whereupon}\qquad
@@ -737,7 +812,8 @@ retrieval must discriminate among.
   memories, each with its own allocator, keeps any one inventory bounded while
   total capacity grows with the number of shards --- a mixture of experts whose
   experts are memories rather than layers
-  \citep{shazeer2017outrageously,fedus2022switch}. Growth then adds shards
+  \citep{shazeer2017outrageously,fedus2022switch}, routed by a rule rather than
+  a learned gate as in \citet{roller2021hash}. Growth then adds shards
   rather than enlarging a single candidate set, so the exponent becomes a
   property of shard size instead of a property of everything ever learned. The
   cost is a second routing decision that can be wrong, and the open question is
@@ -939,7 +1015,8 @@ rather than the idea.
 
 \paragraph{A note on tokenisation.}
 We recommend against subword tokenisation for this architecture. Byte-pair
-encoding is designed to flatten the frequency distribution, and this mechanism
+encoding \citep{sennrich2016neural} is designed to flatten the frequency
+distribution, and this mechanism
 depends on that distribution in two places: allocation splits a class when its
 similarity dispersion rises, which requires regimes to differ in what they
 emit, and capacity follows the count of distinct emitted targets, which
@@ -950,8 +1027,11 @@ entity sharing those pieces, and its target becomes a sequence with no single
 row to occupy. The long tail is exactly where a continual learner has something
 to gain, and subword vocabularies are built to spend it. A word- or
 entity-level vocabulary, or any tokenisation that keeps rare units intact,
-preserves both the Zipf structure the allocator reads and the one-target-one-row
-correspondence the capacity argument relies on.
+preserves both the Zipf structure the allocator reads
+\citep{zipf1949human,piantadosi2014zipf} and the one-target-one-row
+correspondence the capacity argument relies on. That subword segmentation is
+suboptimal has been argued on unrelated grounds \citep{bostrom2020byte}; our
+objection is specific to a mechanism that allocates by emitted content.
 
 \section{Limitations}
 
@@ -1043,6 +1123,182 @@ with its predecessors, and a ratio below one cannot on its own be read as
 amortisation.
 
 \begin{thebibliography}{99}
+
+\bibitem[Beltagy et al.(2020)]{beltagy2020longformer}
+I.~Beltagy, M.~E. Peters, and A.~Cohan.
+\newblock Longformer: The long-document transformer.
+\newblock \emph{arXiv:2004.05150}, 2020.
+
+\bibitem[Bengio et al.(2013)]{bengio2013estimating}
+Y.~Bengio, N.~L\'{e}onard, and A.~Courville.
+\newblock Estimating or propagating gradients through stochastic neurons for
+conditional computation.
+\newblock \emph{arXiv:1308.3432}, 2013.
+
+\bibitem[Blier and Ollivier(2018)]{blier2018description}
+L.~Blier and Y.~Ollivier.
+\newblock The description length of deep learning models.
+\newblock In \emph{NeurIPS}, 2018.
+
+\bibitem[Borgeaud et al.(2022)]{borgeaud2022improving}
+S.~Borgeaud, A.~Mensch, J.~Hoffmann, et~al.
+\newblock Improving language models by retrieving from trillions of tokens.
+\newblock In \emph{ICML}, 2022.
+
+\bibitem[Bostrom and Durrett(2020)]{bostrom2020byte}
+K.~Bostrom and G.~Durrett.
+\newblock Byte pair encoding is suboptimal for language model pretraining.
+\newblock In \emph{Findings of EMNLP}, 2020.
+
+\bibitem[Chaudhry et al.(2019)]{chaudhry2019tiny}
+A.~Chaudhry, M.~Rohrbach, M.~Elhoseiny, T.~Ajanthan, P.~K. Dokania, P.~H.~S.
+Torr, and M.~Ranzato.
+\newblock On tiny episodic memories in continual learning.
+\newblock \emph{arXiv:1902.10486}, 2019.
+
+\bibitem[Dawid(1984)]{dawid1984present}
+A.~P. Dawid.
+\newblock Present position and potential developments: Some personal views.
+Statistical theory: The prequential approach.
+\newblock \emph{Journal of the Royal Statistical Society A}, 147(2):278--292,
+1984.
+
+\bibitem[Gama et al.(2013)]{gama2013evaluating}
+J.~Gama, R.~Sebasti\~{a}o, and P.~P. Rodrigues.
+\newblock On evaluating stream learning algorithms.
+\newblock \emph{Machine Learning}, 90(3):317--346, 2013.
+
+\bibitem[Graves et al.(2016)]{graves2016hybrid}
+A.~Graves, G.~Wayne, M.~Reynolds, et~al.
+\newblock Hybrid computing using a neural network with dynamic external memory.
+\newblock \emph{Nature}, 538:471--476, 2016.
+
+\bibitem[Gu and Dao(2023)]{gu2023mamba}
+A.~Gu and T.~Dao.
+\newblock Mamba: Linear-time sequence modeling with selective state spaces.
+\newblock \emph{arXiv:2312.00752}, 2023.
+
+\bibitem[Guu et al.(2020)]{guu2020realm}
+K.~Guu, K.~Lee, Z.~Tung, P.~Pasupat, and M.-W. Chang.
+\newblock {REALM}: Retrieval-augmented language model pre-training.
+\newblock In \emph{ICML}, 2020.
+
+\bibitem[Hopfield(1982)]{hopfield1982neural}
+J.~J. Hopfield.
+\newblock Neural networks and physical systems with emergent collective
+computational abilities.
+\newblock \emph{PNAS}, 79(8):2554--2558, 1982.
+
+\bibitem[Jacobs et al.(1991)]{jacobs1991adaptive}
+R.~A. Jacobs, M.~I. Jordan, S.~J. Nowlan, and G.~E. Hinton.
+\newblock Adaptive mixtures of local experts.
+\newblock \emph{Neural Computation}, 3(1):79--87, 1991.
+
+\bibitem[Katharopoulos et al.(2020)]{katharopoulos2020transformers}
+A.~Katharopoulos, A.~Vyas, N.~Pappas, and F.~Fleuret.
+\newblock Transformers are {RNN}s: Fast autoregressive transformers with linear
+attention.
+\newblock In \emph{ICML}, 2020.
+
+\bibitem[Khandelwal et al.(2020)]{khandelwal2020generalization}
+U.~Khandelwal, O.~Levy, D.~Jurafsky, L.~Zettlemoyer, and M.~Lewis.
+\newblock Generalization through memorization: Nearest neighbor language models.
+\newblock In \emph{ICLR}, 2020.
+
+\bibitem[Kumaran et al.(2016)]{kumaran2016what}
+D.~Kumaran, D.~Hassabis, and J.~L. McClelland.
+\newblock What learning systems do intelligent agents need? Complementary
+learning systems theory updated.
+\newblock \emph{Trends in Cognitive Sciences}, 20(7):512--534, 2016.
+
+\bibitem[Lewis et al.(2020)]{lewis2020retrieval}
+P.~Lewis, E.~Perez, A.~Piktus, et~al.
+\newblock Retrieval-augmented generation for knowledge-intensive {NLP} tasks.
+\newblock In \emph{NeurIPS}, 2020.
+
+\bibitem[Lewis et al.(2021)]{lewis2021base}
+M.~Lewis, S.~Bhosale, T.~Dettmers, N.~Goyal, and L.~Zettlemoyer.
+\newblock {BASE} layers: Simplifying training of large, sparse models.
+\newblock In \emph{ICML}, 2021.
+
+\bibitem[Li and Hoiem(2017)]{li2017learning}
+Z.~Li and D.~Hoiem.
+\newblock Learning without forgetting.
+\newblock \emph{IEEE TPAMI}, 40(12):2935--2947, 2017.
+
+\bibitem[Lopez-Paz and Ranzato(2017)]{lopezpaz2017gradient}
+D.~Lopez-Paz and M.~Ranzato.
+\newblock Gradient episodic memory for continual learning.
+\newblock In \emph{NeurIPS}, 2017.
+
+\bibitem[McClelland et al.(1995)]{mcclelland1995why}
+J.~L. McClelland, B.~L. McNaughton, and R.~C. O'Reilly.
+\newblock Why there are complementary learning systems in the hippocampus and
+neocortex.
+\newblock \emph{Psychological Review}, 102(3):419--457, 1995.
+
+\bibitem[Piantadosi(2014)]{piantadosi2014zipf}
+S.~T. Piantadosi.
+\newblock Zipf's word frequency law in natural language: A critical review and
+future directions.
+\newblock \emph{Psychonomic Bulletin \& Review}, 21(5):1112--1130, 2014.
+
+\bibitem[Ramsauer et al.(2021)]{ramsauer2021hopfield}
+H.~Ramsauer, B.~Sch\"{a}fl, J.~Lehner, et~al.
+\newblock Hopfield networks is all you need.
+\newblock In \emph{ICLR}, 2021.
+
+\bibitem[Ratcliff(1990)]{ratcliff1990connectionist}
+R.~Ratcliff.
+\newblock Connectionist models of recognition memory: Constraints imposed by
+learning and forgetting functions.
+\newblock \emph{Psychological Review}, 97(2):285--308, 1990.
+
+\bibitem[Rebuffi et al.(2017)]{rebuffi2017icarl}
+S.-A. Rebuffi, A.~Kolesnikov, G.~Sperl, and C.~H. Lampert.
+\newblock {iCaRL}: Incremental classifier and representation learning.
+\newblock In \emph{CVPR}, 2017.
+
+\bibitem[Roller et al.(2021)]{roller2021hash}
+S.~Roller, S.~Sukhbaatar, A.~Szlam, and J.~Weston.
+\newblock Hash layers for large sparse models.
+\newblock In \emph{NeurIPS}, 2021.
+
+\bibitem[Schmidhuber(1992)]{schmidhuber1992learning}
+J.~Schmidhuber.
+\newblock Learning to control fast-weight memories: An alternative to dynamic
+recurrent networks.
+\newblock \emph{Neural Computation}, 4(1):131--139, 1992.
+
+\bibitem[Sennrich et al.(2016)]{sennrich2016neural}
+R.~Sennrich, B.~Haddow, and A.~Birch.
+\newblock Neural machine translation of rare words with subword units.
+\newblock In \emph{ACL}, 2016.
+
+\bibitem[Tay et al.(2022)]{tay2022efficient}
+Y.~Tay, M.~Dehghani, D.~Bahri, and D.~Metzler.
+\newblock Efficient transformers: A survey.
+\newblock \emph{ACM Computing Surveys}, 55(6):1--28, 2022.
+
+\bibitem[van de Ven and Tolias(2019)]{vandeven2019three}
+G.~M. van~de Ven and A.~S. Tolias.
+\newblock Three scenarios for continual learning.
+\newblock \emph{arXiv:1904.07734}, 2019.
+
+\bibitem[Weston et al.(2015)]{weston2015memory}
+J.~Weston, S.~Chopra, and A.~Bordes.
+\newblock Memory networks.
+\newblock In \emph{ICLR}, 2015.
+
+\bibitem[Zenke et al.(2017)]{zenke2017continual}
+F.~Zenke, B.~Poole, and S.~Ganguli.
+\newblock Continual learning through synaptic intelligence.
+\newblock In \emph{ICML}, 2017.
+
+\bibitem[Zipf(1949)]{zipf1949human}
+G.~K. Zipf.
+\newblock \emph{Human Behavior and the Principle of Least Effort}.
+\newblock Addison-Wesley, 1949.
 
 \bibitem[Aljundi et al.(2019)]{aljundi2019task}
 R.~Aljundi, K.~Kelchtermans, and T.~Tuytelaars.
