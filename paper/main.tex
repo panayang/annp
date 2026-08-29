@@ -219,13 +219,15 @@ results table header and reads the column by name.
 regimes & this work & monolithic & advantage \\
 \midrule
 $8$ & $\mathbf{49.53\%}$ & $15.10\%$ & $+34.43$pp \\
-$16$ & $\mathbf{43.07\%}$ & $12.50\%$ & $+30.57$pp \\
+$16$ & $\mathbf{43.07\%}$ & $12.85\%$ & $+30.22$pp \\
+$32$ & $\mathbf{37.65\%}$ & $12.20\%$ & $+25.45$pp \\
 \bottomrule
 \end{tabular}
-\caption{Mode A, three seeds at eight regimes and one at sixteen. The
-monolithic control sits at the level of a linear baseline without sparse coding
-($15.30\%$), confirming the task is not solvable by predicting frequent
-targets. Baselines at $32$ and $64$ regimes are still running.}
+\caption{Mode A; three seeds at eight regimes, two at sixteen, one at
+thirty-two. The monolithic control sits at the level of a linear baseline
+without sparse coding ($15.30\%$), so the task is not solvable by predicting
+frequent targets. The advantage narrows as regimes accumulate but does not
+close. The baseline at sixty-four regimes is still running.}
 \end{table}
 
 \subsection{Sharing the transform, privatising the readout}
@@ -488,12 +490,24 @@ recover part of what a gated mixture of experts gets from its router
 \citep{shazeer2017outrageously} without giving up the property that makes
 expansion non-destructive.
 
-\paragraph{Compose across stages rather than re-walking.}
-Multi-hop currently re-applies the same content key at each hop, which is why
-paths cost accuracy on a task where no answer requires a path. A second stage
-addressed on the \emph{output} of the first would compose rather than repeat,
-and would need a source where an answer follows from chaining two stored
-relations. Both the variant and the source are absent here.
+\paragraph{Let the address compose, not only the value.}
+The value path already composes: hop $h+1$ transforms hop $h$'s output and
+gradients flow along the walked chain. What repeats is the \emph{address} ---
+every hop selects its edge with the same fixed copy of $p_0$, so the sequence
+of edges a fact visits is settled before the walk begins.
+
+We implemented the obvious remedy, copying the transformed payload into the
+routing key after each hop so that hop $h+1$ selects from hop $h$'s output, and
+it makes matters worse: $51.43\%$ to $41.03\%$ at two hops and $35.10\%$ to
+$22.83\%$ at three, widening rather than closing the gap to a single hop. The
+reason is visible in the same run. Routing consistency, which the fixed key
+guarantees at $1.000$, falls to $0.910$; a fact's path now depends on weights
+that move, so nine per cent of probed facts no longer reach where training left
+them, and that loss outweighs whatever composition buys. Whether a source that
+genuinely requires chaining two stored relations would reverse the balance is
+untested --- on a lookup whose target is fixed by the current fact there is
+nothing for a composed path to find --- so this settles the version we tried
+rather than the idea.
 
 \paragraph{A note on tokenisation.}
 We recommend against subword tokenisation for this architecture. Byte-pair
