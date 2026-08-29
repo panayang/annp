@@ -211,6 +211,7 @@ results table header and reads the column by name.
 \section{Results}
 
 \subsection{Where regimes are distinguishable}
+\label{sec:modea}
 
 \begin{table}[h]
 \centering
@@ -219,15 +220,16 @@ results table header and reads the column by name.
 regimes & this work & monolithic & advantage \\
 \midrule
 $8$ & $\mathbf{49.53\%}$ & $15.10\%$ & $+34.43$pp \\
-$16$ & $\mathbf{43.07\%}$ & $12.85\%$ & $+30.22$pp \\
+$16$ & $\mathbf{43.07\%}$ & $12.03\%$ & $+31.04$pp \\
 $32$ & $\mathbf{37.65\%}$ & $12.20\%$ & $+25.45$pp \\
 \bottomrule
 \end{tabular}
-\caption{Mode A; three seeds at eight regimes, two at sixteen, one at
-thirty-two. The monolithic control sits at the level of a linear baseline
-without sparse coding ($15.30\%$), so the task is not solvable by predicting
-frequent targets. The advantage narrows as regimes accumulate but does not
-close. The baseline at sixty-four regimes is still running.}
+\caption{Mode A; three seeds at eight and sixteen regimes, one at thirty-two.
+The monolithic control sits at the level of a linear baseline without sparse
+coding ($15.30\%$), so the task is not solvable by predicting frequent targets.
+The advantage narrows as regimes accumulate but does not close. We did not
+obtain a monolithic baseline at sixty-four regimes; a single cell costs about
+nine hours here, and the run was lost.}
 \end{table}
 
 \subsection{Sharing the transform, privatising the readout}
@@ -396,7 +398,8 @@ $32$ & $37.65\%$ & $2412$ & $75$ & $0.70$ \\
 $64$ & $34.80\%$ & $5198$ & $81$ & $0.78$ \\
 \bottomrule
 \end{tabular}
-\caption{Monolithic baselines beyond eight regimes are in progress.}
+\caption{Monolithic baselines are available to thirty-two regimes and are
+reported in \S\ref{sec:modea}; the sixty-four-regime cell was not obtained.}
 \end{table}
 
 Three explanations are excluded by the data. Capacity is supplied linearly, so
