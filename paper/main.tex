@@ -13,7 +13,7 @@
 
 \author{%
   Xinyu Yang\\
-  \texttt{guangjianyang@gmail.com}
+  \texttt{pana.yang@hotmail.com}
 }
 
 \date{\today}
@@ -84,9 +84,10 @@ declining as regimes accumulate.
   \item A non-destructiveness property, verified exactly rather than
   statistically: appending capacity leaves stored weights and predictions
   unchanged bit for bit (\S\ref{sec:expansion}).
-  \item Negative results with their explanations excluded by measurement rather
-  than argument: multi-hop addressing, cross-gap association, and the source of
-  degradation at scale (\S\ref{sec:negative}).
+  \item Measurements of what the mechanism does not currently do --- cross-gap
+  association, multi-hop addressing, and retention as regimes accumulate ---
+  reported with the alternative explanations we could exclude, and left open
+  where we could not (\S\ref{sec:open}).
 \end{enumerate}
 
 \section{Related work}
@@ -213,17 +214,18 @@ results table header and reads the column by name.
 
 \begin{table}[h]
 \centering
-\begin{tabular}{lc}
+\begin{tabular}{lccc}
 \toprule
-Mode A, eight regimes & zero-shot retention \\
+regimes & this work & monolithic & advantage \\
 \midrule
-This work & $\mathbf{49.53\%}$ \\
-Monolithic, parameter-matched & $15.00\%$ \\
-Linear, no sparse coding & $15.30\%$ \\
+$8$ & $\mathbf{49.53\%}$ & $15.10\%$ & $+34.43$pp \\
+$16$ & $\mathbf{43.07\%}$ & $12.50\%$ & $+30.57$pp \\
 \bottomrule
 \end{tabular}
-\caption{The monolithic control performs at the level of a linear baseline,
-confirming the task is not solvable by predicting frequent targets.}
+\caption{Mode A, three seeds at eight regimes and one at sixteen. The
+monolithic control sits at the level of a linear baseline without sparse coding
+($15.30\%$), confirming the task is not solvable by predicting frequent
+targets. Baselines at $32$ and $64$ regimes are still running.}
 \end{table}
 
 \subsection{Sharing the transform, privatising the readout}
@@ -285,10 +287,15 @@ $N=4096$. Against ourselves: overall activation is $6.178\%$ of memory
 parameters, of which the edge memory contributes $1024$ and the remainder is the
 readout scoring all $V$ rows. Sparsity currently holds for the expert part only.
 
-\section{What the architecture does not do}
-\label{sec:negative}
+\section{Open questions}
+\label{sec:open}
 
-\subsection{Association across a gap}
+Every negative reading in this study that we examined closely turned out, at
+least once, to be produced by the measurement rather than by the mechanism
+(Appendix~\ref{app:invalidated}). We therefore report the following as
+measurements whose interpretation is unsettled, rather than as properties of
+the architecture.
+\paragraph{Can the mechanism associate across a gap?}
 \label{sec:longrange}
 
 Nothing is carried between facts beyond a single-timescale context, so a cue
@@ -317,7 +324,13 @@ item}. Placing context into the address recovers roughly a tenth of the gap and
 costs lookup accuracy, consistent with content-only addressing being what
 forbids association in the first place.
 
-\subsection{Multi-hop addressing}
+Whether this is a limit of the mechanism or of this particular probe is not
+settled. Three earlier versions of the same measurement were invalid, each for
+a different reason, and the fourth is the one reported here; placing context
+into the address recovers roughly a tenth of the gap, which suggests the
+addressing scheme rather than the context code may be the binding constraint.
+
+\paragraph{Does multi-hop addressing ever pay?}
 
 \begin{table}[h]
 \centering
@@ -335,7 +348,13 @@ under-training explanation is excluded: writes per edge \emph{rise} with hops,
 from $3246$ to $9222$, because each fact touches more edges.}
 \end{table}
 
-\subsection{Retention declines as regimes accumulate}
+We do not conclude that depth is unnecessary. Multi-hop is the only form of
+depth this architecture has, an earlier version of this comparison was taken
+while regime separation had collapsed, and the present one is on a single
+source at one scale. Whether combinatorial addressing pays under a source that
+rewards composition is untested.
+
+\paragraph{Why does retention decline as regimes accumulate?}
 \label{sec:scale}
 
 \begin{table}[h]
@@ -360,6 +379,39 @@ per regime is flat, so separation does not degrade. What remains is retrieval:
 confusable stored targets grow $9.8\times$ while accuracy falls to $0.70\times$,
 and distinct predictions rise from $47$ to $57$ rather than collapsing.
 
+These exclusions constrain the explanation without establishing it, and the
+monolithic baselines beyond sixteen regimes are still running. We state the
+retrieval account as the surviving candidate rather than as the finding.
+
+
+
+\paragraph{Does acquiring a regime become cheaper as regimes accumulate?}
+Later regimes do cost less per unit accuracy in our runs, but our measurement
+staggers arrival, and arrival order is itself sufficient to produce the effect:
+a regime arriving late enters a system whose transform and prototypes are
+already shaped. Separating order from content requires a design we have not
+run, so we leave the question open rather than answer it from a measurement
+that cannot distinguish the two (Appendix~\ref{app:arrival}).
+
+\paragraph{Is the decline with scale a power law?}
+Retention falls roughly as $N^{-\alpha}$ with $\alpha \approx 0.16$ over the
+measured range, $N$ being the number of stored items. Whether this exponent is
+a property of the mechanism, and whether stronger addressing rather than more
+capacity moves it, is measurable without new machinery.
+
+\paragraph{What should a constant-memory context retain?}
+Exact association across a gap is information-theoretically unavailable under
+constant memory, so the design question is what to keep. A multi-scale average
+answers \emph{which regime} and cannot answer \emph{which item}. Sparse
+retention of salient items, or superposition with approximate unbinding
+\citep{plate1995holographic,ba2016using}, keeps identity where an average
+cannot.
+
+\paragraph{Does the plasticity--stability frontier extend or shift?}
+The frontier traced by our mechanism and that traced by the monolithic control
+barely overlap in plasticity, so at present only reachability can be compared,
+not position.
+
 \section{Limitations}
 
 Results are on a synthetic relational source; no natural-language corpus is
@@ -368,9 +420,9 @@ pending at larger scales. Cost comparisons between the dense and sampled write
 paths are not commensurable, because write magnitude accumulates over a
 different number of rows in each. The private and shared arms differ in
 parameter count, which strengthens the accuracy comparison but confounds
-comparisons of cost. Savings, in the sense of a later regime costing less to
-acquire, is observed in all arms including the control and is therefore not yet
-attributable to the mechanism.
+comparisons of cost. Whether acquiring a regime becomes cheaper as regimes accumulate is not
+settled here: our measurement staggers arrival, and arrival order alone can
+produce the effect (Appendix~\ref{app:arrival}).
 
 \section{Conclusion}
 
@@ -384,6 +436,7 @@ gap, and the cost of that trade is measured here rather than asserted.
 \appendix
 
 \section{Measurements invalidated during this study}
+\label{app:invalidated}
 
 Six measurements were invalidated after collection and re-run. Three were
 probe-side leaks in which a per-domain snapshot keyed by ground truth handed the
@@ -401,6 +454,35 @@ instruments that survived --- write locality by time since regime change,
 occupancy against emitted content, allocation timing against regime boundaries
 --- are reported alongside the results because they are what made the failures
 visible.
+
+\section{Arrival order and the cost of a late regime}
+\label{app:arrival}
+
+Measuring whether a later regime is cheaper to acquire requires staggered
+arrival, and staggering introduces a confound we record here for the benefit of
+anyone running the same measurement.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+ & shared transform & private \\
+\midrule
+Mode A, staggered arrival & $0.754$ & $0.820$ \\
+Mode B, disjoint targets, staggered arrival & $0.442$ & $0.505$ \\
+Mode A, no staggering (index only) & $1.199$ & $1.207$ \\
+\bottomrule
+\end{tabular}
+\caption{Cost of the late regimes relative to the early ones; below one means
+a late regime is cheaper. Three seeds per control.}
+\end{table}
+
+Mode B's targets are disjoint across regimes by construction, so nothing there
+can be amortised, yet the ratio is lower than in Mode A. Removing the
+staggering removes the effect. A regime arriving late therefore benefits from
+entering an already-shaped system, independently of whether it shares content
+with its predecessors, and a ratio below one cannot on its own be read as
+amortisation.
 
 \begin{thebibliography}{99}
 
