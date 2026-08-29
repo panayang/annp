@@ -355,26 +355,22 @@ distribution is too dispersed for $\tau$ consecutive steps,
 \begin{equation}
   \frac{\sigma_\gamma}{\max(|\mu_\gamma|,\epsilon)} \;>\; \theta,
   \qquad\text{whereupon}\qquad
-  \pi_{C+1} \leftarrow \nu(c_t), \quad C \leftarrow C+1 .
+  C \leftarrow C+1 .
   \label{eq:grow}
 \end{equation}
 Dispersion is used rather than an outlier test because outlier tests fail in
 two ways we measured. Against a \emph{global} running distribution of
 $\mathrm{sim}$ they fail once regimes are numerous, since that distribution
-becomes their mixture and nothing is unusual relative to it, and every regime
-collapses onto one class. Against a class's \emph{own}
-distribution an outlier test fails too, because a class absorbing more regimes
+becomes their mixture and nothing is unusual relative to it. Against a class's
+\emph{own} distribution an outlier test fails too, because a class absorbing
+more regimes
 raises its own variance, so a threshold of the form $\mu_\gamma - \theta
 \sigma_\gamma$ falls exactly when splitting becomes more necessary. Dispersion
 is scale-free in both senses: a class serving one regime has tightly clustered
 similarities whatever the value of $C$.
 
-The new prototype is placed \emph{at} the current context direction. Placing it
-on the residual orthogonal to the existing prototypes --- which an earlier
-version did --- fails for a geometric reason: in high dimension the orthogonal
-residual is nearly orthogonal to the data as well, so the new prototype wins no
-argmax at all, so classes are allocated while every regime still routes to
-one.
+The new prototype is derived from the current context direction, and allocation
+appends, leaving existing slices at their offsets and values.
 
 \subsection{Expansion is exact}
 \label{sec:exact}
